@@ -5,6 +5,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 app = FastAPI(title=settings.PROJECT_NAME)
 
+
 # ── CORS ──────────────────────────────────────────────────────────────────────
 # Allowed origins are driven by the ALLOWED_ORIGINS env variable.
 # During development the default includes localhost:3000 and localhost:8000.
