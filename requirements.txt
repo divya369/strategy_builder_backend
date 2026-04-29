@@ -1,0 +1,16 @@
+fastapi
+uvicorn
+sqlalchemy
+alembic
+psycopg2-binary
+pydantic[email]
+pandas
+numpy
+
+# Auth & Security
+python-jose[cryptography]
+bcrypt
+python-multipart
+
+# Required for Pydantic's EmailStr validation
+email-validator

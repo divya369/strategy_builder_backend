@@ -1,0 +1,9 @@
+start-dev.bat
+venv
+scripts
+frontend
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
