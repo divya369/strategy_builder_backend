@@ -1,10 +1,16 @@
 """
 Application configuration.
-All settings are read from environment variables with safe dev defaults.
-Override in production via environment variables or a .env file.
+All settings are loaded from a .env file (via python-dotenv) and can be
+overridden by real environment variables.  No secrets are hardcoded.
 """
 import os
 from pathlib import Path
+
+from dotenv import load_dotenv
+
+# Load .env from project root  (screener-builder/.env)
+_env_path = Path(__file__).resolve().parents[2] / ".env"
+load_dotenv(_env_path)
 
 
 class Settings:
@@ -12,8 +18,7 @@ class Settings:
 
     # ── Primary App DB (screeners, users, backtest results) ──────────────────
     POSTGRES_USER: str     = os.getenv("POSTGRES_USER", "postgres")
-    # POSTGRES_PASSWORD: str = os.getenv("POSTGRES_PASSWORD", "dasnadas0369")
-    POSTGRES_PASSWORD: str = os.getenv("POSTGRES_PASSWORD", "postgres36")
+    POSTGRES_PASSWORD: str = os.getenv("POSTGRES_PASSWORD", "")
     POSTGRES_SERVER: str   = os.getenv("POSTGRES_SERVER", "localhost")
     POSTGRES_PORT: str     = os.getenv("POSTGRES_PORT", "5432")
     POSTGRES_DB: str       = os.getenv("POSTGRES_DB", "screener_backtest_db")
@@ -23,7 +28,7 @@ class Settings:
     EQUITY_OHLC_DB: str = os.getenv("EQUITY_OHLC_DB", "equity_ohlc")
 
     # ── Security ──────────────────────────────────────────────────────────────
-    SECRET_KEY: str = os.getenv("SECRET_KEY", "dev-only-insecure-key-change-in-production")
+    SECRET_KEY: str = os.getenv("SECRET_KEY", "")
 
     # ── CORS ──────────────────────────────────────────────────────────────────
     ALLOWED_ORIGINS: list = os.getenv(
@@ -33,18 +38,11 @@ class Settings:
     # ── CSV Data Paths ────────────────────────────────────────────────────────
     # Index constituent CSVs:  one file per index, e.g. "NIFTY 500.csv"
     #   Format: dates as column headers, stock symbols as row values
-    # When deploying to server, override via environment variable.
-    INDEX_CSV_DIR: str = os.getenv(
-        "INDEX_CSV_DIR",
-        r"D:\PycharmProjects\Nifty_Index\tanmay_data"
-    )
+    INDEX_CSV_DIR: str = os.getenv("INDEX_CSV_DIR", "")
 
     # Screener CSVs: one file per trading day, e.g. "2024-04-16_screener.csv"
     #   Format: flat CSV with tradingsymbol + all indicator columns
-    SCREENER_CSV_DIR: str = os.getenv(
-        "SCREENER_CSV_DIR",
-        r"D:\PycharmProjects\New folder\common_screener\screener_data\common_screener"
-    )
+    SCREENER_CSV_DIR: str = os.getenv("SCREENER_CSV_DIR", "")
 
     # ── Equity DB column config ───────────────────────────────────────────────
     # Columns expected in every equity_ohlc per-symbol table
