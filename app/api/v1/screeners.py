@@ -82,7 +82,6 @@ def get_my_screeners(user_id: str, db: Session = Depends(get_db)):
     )
     return [{"id": str(s.id), "name": s.name, "description": s.description, "version_number": max_v or 0} for s, max_v in rows]
 
-@router.post("", response_model=ScreenerVersionResponse)
 @router.post("/", response_model=ScreenerVersionResponse)
 def create_screener(screener_in: ScreenerCreate, db: Session = Depends(get_db)):
     screener = screener_service.create_screener(db, screener_in, screener_in.user_id)

@@ -54,7 +54,7 @@ class ScreenerVersionCreate(BaseModel):
 
 class ScreenerVersionResponse(BaseModel):
     screener_id: uuid.UUID
-    # name: str
+    name: str
     version_id: uuid.UUID
     version_number: int
     message: str
