@@ -87,7 +87,7 @@ def create_screener(screener_in: ScreenerCreate, db: Session = Depends(get_db)):
     screener = screener_service.create_screener(db, screener_in, screener_in.user_id)
     version_in = ScreenerVersionCreate(description="Initial version", universe=screener_in.universe, filters=screener_in.filters, ranking=screener_in.ranking, rebalance=screener_in.rebalance)
     version = screener_version_service.create_version(db, screener.id, version_in, 1)
-    return {"screener_id": screener.id, "name": screener.name, "version_id": version.id, "version_number": version.version_number, "message": "Screener created successfully"}
+    return {"screener_id": screener.id, "version_id": version.id, "version_number": version.version_number, "message": "Screener created successfully"}
 
 @router.post("/{screener_id}/versions", response_model=ScreenerVersionResponse)
 def create_screener_version(screener_id: uuid.UUID, version_in: ScreenerVersionCreate, db: Session = Depends(get_db)):
