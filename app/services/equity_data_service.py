@@ -16,6 +16,7 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
+from app.core.benchmark_registry import resolve_benchmark_table
 
 logger = logging.getLogger(__name__)
 
@@ -80,10 +81,13 @@ def get_benchmark_ohlc(
     """
     Fetch daily close prices for a benchmark index (e.g. "NIFTY_500").
     Benchmark tables live in the same equity_ohlc DB as stock tables.
+    The index_name from the frontend is resolved to the actual DB table name
+    via the benchmark_registry mapping.
     Returns DataFrame with columns: date, close.
     """
-    # Benchmark table name matches CSV filename exactly (e.g. "NIFTY 500" with space)
-    table = _quote(index_name)
+    # Resolve frontend name → actual DB table name
+    table_name = resolve_benchmark_table(index_name)
+    table = _quote(table_name)
     sql = text(f"""
         SELECT
             {_quote(_DATE_COL)}  AS date,

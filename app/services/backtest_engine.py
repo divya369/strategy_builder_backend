@@ -62,7 +62,7 @@ class BacktestEngineService:
         wrh       = request_data.get("wrh", 40)
         universe_cfg   = request_data.get("universe", {})
         benchmark_symbol = (
-            universe_cfg.get("value", "NIFTY 200").replace("_", " ")
+            universe_cfg.get("value", "NIFTY 200")
             if universe_cfg.get("type") == "index" else "NIFTY 200"
         )
 
@@ -271,7 +271,7 @@ class BacktestEngineService:
             wrh             = run_record.wrh
             total_cost_rate = (float(run_record.transaction_cost_bps) + float(run_record.slippage_bps)) / 10000.0
             initial_capital = float(run_record.initial_capital)
-            bm_sym          = (run_record.benchmark_symbol or "NIFTY 200").replace("_", " ")
+            bm_sym          = run_record.benchmark_symbol or "NIFTY 200"
 
             # ── Need universe/filters/ranking from screener version ───────────
             from app.models.screener import ScreenerVersion

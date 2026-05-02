@@ -86,18 +86,22 @@ FILTER_CONFIG_MAP: Dict[str, dict] = {
         "dbKey": "volume_rupees",
         "operators": [">=", "<=", ">", "<", "=="],
         "sortable": True,
-        "sortGroup": "Fundamentals",
+        "sortGroup": "Liquidity",
     },
     "price": {
-        "label": "Price",
+        "label": "Price(Close)",
         "type": "metric_value",
         "dbKey": "close",
         "operators": [">=", "<=", ">", "<", "=="],
+        "sortable": True,
+        "sortGroup": "Fundamentals",
     },
     "volume": {
         "label": "Volume (in rupees)",
         "type": "metric_value",
         "operators": [">=", "<=", ">", "<", "=="],
+        "sortable": True,
+        "sortGroup": "Liquidity",
     },
     "beta": {
         "label": "Beta",
@@ -135,12 +139,23 @@ FILTER_CONFIG_MAP: Dict[str, dict] = {
 
 # ── Extra sort-only fields (not filters, just sortable columns) ──────────────
 EXTRA_SORT_FIELDS: List[dict] = [
-    {"value": "price",              "label": "Price (Close)",      "group": "Fundamentals"},
-    {"value": "volume",             "label": "Volume",             "group": "Fundamentals"},
-    {"value": "median_volume_rupees","label": "Median Volume",     "group": "Fundamentals"},
-    {"value": "1y_volatility",      "label": "Volatility 1Y",     "group": "Risk"},
+    {"value": "1y_volatility",      "label": "Volatility 1 Year",     "group": "Risk"},
     {"value": "away_from_ath",      "label": "Away from ATH (%)",  "group": "Technical"},
-    {"value": "away_from_1y_high",  "label": "Away from 1Y High",  "group": "Technical"},
+    {"value": "away_from_1y_high",  "label": "Away from 1 Year High",  "group": "Technical"},
+    {"value": "average_sharpe_12_9_6_3_months",      "label": "Avg Sharpe Return 12 9 6 3 months",  "group": "Returns"},
+    {"value": "average_sharpe_12_6_3_months",      "label": "Avg Sharpe Return 12 6 3 months",  "group": "Returns"},
+    {"value": "average_sharpe_12_3_months",      "label": "Avg Sharpe Return 12 3 months",  "group": "Returns"},
+    {"value": "average_sharpe_6_3_months",      "label": "Avg Sharpe Return 6 3 months",  "group": "Returns"},
+    {"value": "average_return_12_9_6_3_months",      "label": "Avg Return 12 9 6 3 months",  "group": "Returns"},
+    {"value": "average_return_12_6_3_months",      "label": "Avg Return 12 6 3 months",  "group": "Returns"},
+    {"value": "average_return_12_3_months",      "label": "Avg Return 12 3 months",  "group": "Returns"},
+    {"value": "average_return_6_3_1_months",      "label": "Avg Return 6 3 1 months",  "group": "Returns"},
+    {"value": "roc_12m_minus_1m_pct",      "label": "Return 12 minus 1 months",  "group": "Technical"},
+    {"value": "roc_12m_minus_2m_pct",      "label": "Return 12 minus 2 months",  "group": "Technical"},
+    {"value": "1y_sharpe_return_per_beta",      "label": "Sharpe Return 1 Year per Beta",  "group": "Risk-Adjusted Returns"},
+    {"value": "avg_sharpe_12_9_6_3_per_beta",      "label": "Avg Sharpe Return 12 9 6 3 per Beta",  "group": "Risk-Adjusted Returns"},
+    {"value": "avg_sharpe_of_12_6_3_per_beta",      "label": "Avg Sharpe Return 12 6 3 per Beta",  "group": "Risk-Adjusted Returns"},
+    {"value": "avg_sharpe_of_12_6_per_beta",      "label": "Avg Sharpe Return 12 6 per Beta",  "group": "Risk-Adjusted Returns"},
 ]
 
 
