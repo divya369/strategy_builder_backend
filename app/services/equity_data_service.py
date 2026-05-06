@@ -17,6 +17,7 @@ from sqlalchemy.orm import Session
 
 from app.core.config import settings
 from app.core.benchmark_registry import resolve_benchmark_table
+from app.core.symbol_registry import resolve_stock_symbol
 
 logger = logging.getLogger(__name__)
 
@@ -42,10 +43,13 @@ def get_stock_ohlc(
 ) -> pd.DataFrame:
     """
     Fetch daily OHLC for a single stock symbol from equity_ohlc.
+    Old/renamed symbols are resolved to the current name via symbol_registry.
     Returns DataFrame with columns: date, open, close.
     Returns empty DataFrame if the table does not exist or has no data in range.
     """
-    table = _quote(symbol)
+    # Resolve old/renamed symbols to current DB table name
+    table_symbol = resolve_stock_symbol(symbol)
+    table = _quote(table_symbol)
     sql = text(f"""
         SELECT
             {_quote(_DATE_COL)}  AS date,
