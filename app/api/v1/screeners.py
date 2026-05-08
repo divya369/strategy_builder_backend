@@ -7,10 +7,11 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import func as sa_func
 from sqlalchemy.orm import Session
 
+from datetime import datetime, timezone
 from app.core.database import get_db
 from app.core.filter_registry import FILTER_CONFIG_MAP, EXTRA_SORT_FIELDS
 from app.core.backtest_metric_formatter import format_metric_value
-from app.schemas.screener import ScreenerCreate, ScreenerVersionResponse, ScreenerVersionCreate, FilterConfig
+from app.schemas.screener import ScreenerCreate, ScreenerVersionResponse, ScreenerVersionCreate, FilterConfig,ScreenerNewVersionResponse
 from app.services.screener_service import screener_service
 from app.services.screener_version_service import screener_version_service
 from app.services.screener_execution_service import screener_execution_service
@@ -18,9 +19,11 @@ from app.services import csv_data_service
 from app.models.screener import ScreenerVersion, Screener
 from app.models.backtest import BacktestRun
 from app.models.result import BacktestSummary
-from app.api.deps import SYSTEM_USER_ID
+from zoneinfo import ZoneInfo
 
 router = APIRouter()
+
+IST = ZoneInfo("Asia/Kolkata")
 
 # ── Filter config & sort options come from app.core.filter_registry ──────────
 
@@ -89,7 +92,7 @@ def create_screener(screener_in: ScreenerCreate, db: Session = Depends(get_db)):
     version = screener_version_service.create_version(db, screener.id, version_in, 1)
     return {"screener_id": screener.id, "name": screener.name, "version_id": version.id, "version_number": version.version_number, "message": "Screener created successfully"}
 
-@router.post("/{screener_id}/versions", response_model=ScreenerVersionResponse)
+@router.post("/{screener_id}/versions", response_model=ScreenerNewVersionResponse)
 def create_screener_version(screener_id: uuid.UUID, version_in: ScreenerVersionCreate, db: Session = Depends(get_db)):
     screener = db.query(Screener).filter(Screener.id == screener_id).first()
     if not screener:
@@ -100,7 +103,7 @@ def create_screener_version(screener_id: uuid.UUID, version_in: ScreenerVersionC
 
 @router.delete("/{screener_id}")
 def delete_screener(screener_id: uuid.UUID, db: Session = Depends(get_db)):
-    screener = screener_service.soft_delete_screener(db, screener_id, SYSTEM_USER_ID)
+    screener = screener_service.soft_delete_screener(db, screener_id)
     if not screener:
         raise HTTPException(status_code=404, detail="Screener not found")
     return {"success": True, "message": "Screener deleted successfully", "data": {"id": str(screener.id), "is_active": screener.is_active, "deleted_at": screener.deleted_at.isoformat() if screener.deleted_at else None}}
@@ -108,7 +111,10 @@ def delete_screener(screener_id: uuid.UUID, db: Session = Depends(get_db)):
 @router.get("/{screener_id}/versions")
 def get_screener_versions(screener_id: uuid.UUID, db: Session = Depends(get_db)):
     versions = db.query(ScreenerVersion).filter(ScreenerVersion.screener_id == screener_id).order_by(ScreenerVersion.version_number.desc()).all()
-    return [{"id": str(v.id), "version_number": v.version_number, "created_at": v.created_at} for v in versions]
+    return [{"id": str(v.id), "version_number": v.version_number, "created_at":  v.created_at
+                .replace(tzinfo=timezone.utc)   # if DB time is UTC naive
+                .astimezone(IST)
+                .isoformat()} for v in versions]
 
 @router.get("/{screener_id}/versions/{version_id}/backtests")
 def get_version_backtests(screener_id: uuid.UUID, version_id: uuid.UUID, db: Session = Depends(get_db)):
@@ -158,6 +164,16 @@ def get_screener_detail(screener_id: uuid.UUID, vid: uuid.UUID = None, db: Sessi
         for f in (version.filters_json or [])
     ]
 
+    # Enrich universe with start_date from CSV
+    universe = dict(version.universe_json) if version.universe_json else {}
+    uni_type = (universe.get("type") or "ALL").upper()
+    if uni_type == "ALL":
+        screener_dates = csv_data_service.get_available_screener_dates()
+        universe["start_date"] = str(screener_dates[0]) if screener_dates else None
+    else:
+        oldest = csv_data_service.get_index_start_date(universe.get("value", ""))
+        universe["start_date"] = str(oldest) if oldest else None
+
     return {
         "id": str(screener.id),
         "name": screener.name,
@@ -166,7 +182,7 @@ def get_screener_detail(screener_id: uuid.UUID, vid: uuid.UUID = None, db: Sessi
         "version_id": str(version.id),
         "is_latest": is_latest,
         "filters": clean_filters,
-        "universe": version.universe_json,
+        "universe": universe,
         "ranking": version.ranking_json,
     }
 

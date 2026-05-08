@@ -13,7 +13,7 @@ class ScreenerService:
     def get_screener(self, db: Session, screener_id: uuid.UUID) -> Screener:
         return db.query(Screener).filter(Screener.id == screener_id).first()
 
-    def soft_delete_screener(self, db: Session, screener_id: uuid.UUID, user_id: uuid.UUID = None) -> Screener:
+    def soft_delete_screener(self, db: Session, screener_id: uuid.UUID) -> Screener:
         screener = db.query(Screener).filter(Screener.id == screener_id).first()
         if not screener: return None
         if not screener.is_active: return screener

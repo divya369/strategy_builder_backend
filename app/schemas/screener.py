@@ -52,12 +52,20 @@ class ScreenerVersionCreate(BaseModel):
     ranking: Optional[RankingConfig] = None
     rebalance: Optional[RebalanceConfig] = None
 
-class ScreenerVersionResponse(BaseModel):
+
+
+
+
+
+
+class ScreenerNewVersionResponse(BaseModel):
     screener_id: uuid.UUID
-    name: str
     version_id: uuid.UUID
     version_number: int
     message: str
+
+class ScreenerVersionResponse(ScreenerNewVersionResponse):
+    name: str
 
 class ScreenerResponse(BaseModel):
     id: uuid.UUID

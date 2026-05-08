@@ -55,3 +55,8 @@ def get_index_constituents(index_name: str, as_of_date: date) -> List[str]:
     Returns empty list if index not found.
     """
     return _index_reader.get_constituents(index_name, as_of_date)
+
+
+def get_index_start_date(index_name: str) -> Optional[date]:
+    """Return the oldest date available in the index CSV (first column date)."""
+    return _index_reader.get_oldest_date(index_name)

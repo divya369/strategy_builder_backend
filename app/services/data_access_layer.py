@@ -242,6 +242,14 @@ class CsvIndexConstituentReader(IndexConstituentReader):
                 return self._df_cache[index_name][1]
             return None
 
+    def get_oldest_date(self, index_name: str) -> Optional[date]:
+        """Return the oldest date column from the index CSV, or None if unavailable."""
+        df = self._load(index_name)
+        if df is None or df.empty:
+            return None
+        oldest_ts = min(df.columns)
+        return oldest_ts.date()
+
     def get_constituents(self, index_name: str, as_of_date: date) -> List[str]:
         df = self._load(index_name)
         if df is None or df.empty:
