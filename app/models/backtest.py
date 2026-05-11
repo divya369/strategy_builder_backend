@@ -51,30 +51,7 @@ class BacktestRun(Base):
 
     # Result relationships
     summary = relationship("BacktestSummary", back_populates="run", uselist=False, cascade="all, delete-orphan")
-    daily_navs = relationship("BacktestDailyNav", back_populates="run", cascade="all, delete-orphan")
-    rebalance_events = relationship("BacktestRebalanceEvent", back_populates="run", cascade="all, delete-orphan")
-    rebalance_constituents = relationship("BacktestRebalanceConstituent", back_populates="run", cascade="all, delete-orphan")
     holding_periods = relationship("BacktestHoldingPeriod", back_populates="run", cascade="all, delete-orphan")
-    drawdown_episodes = relationship("BacktestDrawdownEpisode", back_populates="run", cascade="all, delete-orphan")
-    monthly_returns = relationship("BacktestMonthlyReturn", back_populates="run", cascade="all, delete-orphan")
-
-
-class BacktestRebalanceConstituent(Base):
-    """Per-rebalance-date basket membership: which symbols were BUY / RETAIN / SELL."""
-    __tablename__ = "backtest_rebalance_constituent"
-
-    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    backtest_run_id = Column(UUID(as_uuid=True), ForeignKey("backtest_run.id", ondelete="CASCADE"), nullable=False, index=True)
-    rebalance_date = Column(Date, nullable=False, index=True)
-    symbol = Column(String(50), nullable=False, index=True)
-    rank_position = Column(Integer, nullable=True)
-    action = Column(String(10), nullable=False)        # BUY / RETAIN / SELL
-    target_weight = Column(Numeric(18, 8), nullable=False)
-    is_new_entry = Column(Boolean, nullable=False, default=False)
-    is_retained = Column(Boolean, nullable=False, default=False)
-    is_exited = Column(Boolean, nullable=False, default=False)
-
-    run = relationship("BacktestRun", back_populates="rebalance_constituents")
 
 
 class BacktestHoldingPeriod(Base):
@@ -90,11 +67,12 @@ class BacktestHoldingPeriod(Base):
     entry_rank = Column(Integer, nullable=True)
     entry_price = Column(Numeric(18, 8), nullable=False)
     exit_price = Column(Numeric(18, 8), nullable=True)
-    entry_weight = Column(Numeric(18, 8), nullable=False)
-    exit_weight = Column(Numeric(18, 8), nullable=True)
+    qty = Column(Integer, nullable=False, default=0)
     holding_days = Column(Integer, nullable=True)
     gross_return = Column(Numeric(18, 8), nullable=True)
     net_return = Column(Numeric(18, 8), nullable=True)
+    cost_drag = Column(Numeric(18, 8), nullable=True)
+    pnl_abs = Column(Numeric(18, 8), nullable=True)
     exit_reason = Column(String(50), nullable=True)  # NOT_IN_TOP_N / END_OF_BACKTEST
 
     run = relationship("BacktestRun", back_populates="holding_periods")

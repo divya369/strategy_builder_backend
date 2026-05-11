@@ -6,7 +6,7 @@ from app.core.backtest_metric_formatter import format_metric_value
 from app.schemas.backtest import CustomBacktestRequest
 from app.services.backtest_engine import backtest_engine_service, _backtest_executor
 from app.models.backtest import BacktestRun
-from app.models.result import BacktestSummary, BacktestDailyNav
+from app.models.result import BacktestSummary
 from app.models.screener import Screener, ScreenerVersion
 
 
@@ -48,13 +48,14 @@ def get_backtest_result(run_id: uuid.UUID, db: Session = Depends(get_db)):
 
     summary = db.query(BacktestSummary).filter(BacktestSummary.backtest_run_id == run_id).first()
 
-    equity_curve = db.query(BacktestDailyNav).filter(BacktestDailyNav.backtest_run_id == run_id).order_by(BacktestDailyNav.trade_date).all()
+    # Read chart data from JSONB instead of querying backtest_daily_nav table
+    daily_nav_data = summary.daily_nav_json or [] if summary else []
 
-    chart_data = [{"time": str(e.trade_date), "value": round(float(e.portfolio_nav_net),2), "drawdown": round(float(e.drawdown) * 100, 2)} for e in equity_curve] if equity_curve else []
+    chart_data = [{"time": e["trade_date"], "value": round(e["portfolio_nav_net"], 2), "drawdown": round(e["drawdown"] * 100, 2)} for e in daily_nav_data]
 
     benchmark_curve = []
-    if equity_curve and any(e.benchmark_nav is not None for e in equity_curve):
-        benchmark_curve = [{"time": str(e.trade_date), "value": round(float(e.benchmark_nav), 2)} for e in equity_curve if e.benchmark_nav is not None]
+    if daily_nav_data and any(e.get("benchmark_nav") is not None for e in daily_nav_data):
+        benchmark_curve = [{"time": e["trade_date"], "value": round(e["benchmark_nav"], 2)} for e in daily_nav_data if e.get("benchmark_nav") is not None]
 
     metrics = {}
     if summary and summary.metrics_json:
@@ -66,7 +67,7 @@ def get_backtest_result(run_id: uuid.UUID, db: Session = Depends(get_db)):
             "volatility": format_metric_value(m.get("volatility"), "%"),
             "sharpe": format_metric_value(m.get("sharpe"), ""),
             "max_drawdown": format_metric_value(m.get("max_drawdown"), "%"),
-            "final_nav": round(float(equity_curve[-1].portfolio_nav_net), 2) if equity_curve else 0.0,
+            "final_nav": round(daily_nav_data[-1]["portfolio_nav_net"], 2) if daily_nav_data else 0.0,
         }
 
     return {"run_name": run.run_name, "status": run.status, "initial_capital": float(run.initial_capital), "metrics": metrics, "equity_curve": chart_data, "benchmark_curve": benchmark_curve}

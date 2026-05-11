@@ -26,8 +26,9 @@ import pandas as pd
 from sqlalchemy.orm import Session
 
 from app.core.database import SessionLocal, EquitySessionLocal
-from app.models.backtest import BacktestHoldingPeriod, BacktestRebalanceConstituent, BacktestRun
-from app.models.result import BacktestDailyNav, BacktestDrawdownEpisode, BacktestMonthlyReturn, BacktestRebalanceEvent, BacktestSummary
+from app.models.backtest import BacktestHoldingPeriod, BacktestRun
+from app.models.result import BacktestSummary
+from app.core.symbol_registry import resolve_stock_symbol
 from app.services import csv_data_service
 from app.services import equity_data_service
 from app.services.screener_execution_service import screener_execution_service
@@ -288,7 +289,6 @@ class BacktestEngineService:
                 run_record.status = "FAILED"; run_record.error_message = "No rebalance dates found."; app_db.commit(); return
 
             # ── Run screener on each rebalance date ───────────────────────────
-            all_baskets: List[BacktestRebalanceConstituent] = []
             basket_plan: List[dict] = []
             previous_basket_symbols: set = set()
             fetch_limit = max(portfolio_size, wrh)
@@ -298,7 +298,16 @@ class BacktestEngineService:
                     universe_json=universe_json, filters_json=filters_json,
                     ranking_json=ranking_json, limit=fetch_limit, offset=0, target_date=b_date
                 )
-                all_eligible     = [r["symbol"] for r in results]
+                # ── Normalize symbols to canonical (current) names ────────
+                raw_eligible = [r["symbol"] for r in results]
+                seen_syms = set()
+                all_eligible = []
+                for raw_sym in raw_eligible:
+                    canonical = resolve_stock_symbol(raw_sym)
+                    if canonical not in seen_syms:
+                        seen_syms.add(canonical)
+                        all_eligible.append(canonical)
+
                 rank_map         = {sym: idx + 1 for idx, sym in enumerate(all_eligible)}
                 eligible_symbols = all_eligible[:portfolio_size]
 
@@ -311,22 +320,13 @@ class BacktestEngineService:
                 sold_symbols     = sorted(previous_basket_symbols - set(new_basket))
                 buy_symbols      = [s for s in new_basket if s not in previous_basket_symbols]
                 retained_symbols = [s for s in new_basket if s in previous_basket_symbols]
-                target_weight    = (1.0 / portfolio_size) if new_basket else 0.0
 
                 basket_plan.append({"date": b_date, "rank_map": rank_map, "basket": new_basket, "sold_symbols": sold_symbols, "buy_symbols": buy_symbols, "retained_symbols": retained_symbols})
 
-                for sym in sold_symbols:
-                    all_baskets.append(BacktestRebalanceConstituent(backtest_run_id=run_record.id, rebalance_date=b_date, symbol=sym, rank_position=rank_map.get(sym, 999), action="SELL", target_weight=0.0, is_exited=True))
-                for sym in new_basket:
-                    is_retained = sym in previous_basket_symbols
-                    all_baskets.append(BacktestRebalanceConstituent(backtest_run_id=run_record.id, rebalance_date=b_date, symbol=sym, rank_position=rank_map.get(sym, 999), action="RETAIN" if is_retained else "BUY", target_weight=target_weight, is_new_entry=not is_retained, is_retained=is_retained))
-
                 previous_basket_symbols = set(new_basket)
 
-            app_db.bulk_save_objects(all_baskets); app_db.commit()
-
             # ── Load price data from equity_ohlc ──────────────────────────────
-            used_symbols = sorted({obj.symbol for obj in all_baskets if obj.target_weight > 0 or obj.action == "SELL"})
+            used_symbols = sorted({sym for plan in basket_plan for sym in plan["basket"] + plan["sold_symbols"]})
             if not used_symbols:
                 run_record.status = "FAILED"; run_record.error_message = "No eligible symbols."; app_db.commit(); return
 
@@ -356,7 +356,7 @@ class BacktestEngineService:
             realized_holding_periods: List[int] = []
             holding_period_objects: List[BacktestHoldingPeriod] = []
             rebalance_events_payload: List[dict] = []
-            daily_nav_objects: List[BacktestDailyNav] = []
+            daily_nav_list: List[dict] = []
             prev_nav_net_abs = prev_nav_gross_abs = float(initial_capital)
             running_peak_norm = 100.0
 
@@ -390,7 +390,9 @@ class BacktestEngineService:
                         entry_p = pos.get("entry_price", 0.0)
                         gross_ret = (sell_px / entry_p - 1.0) if entry_p > 0 else None
                         net_ret = (gross_ret - total_cost_rate) if gross_ret is not None else None
-                        holding_period_objects.append(BacktestHoldingPeriod(backtest_run_id=run_record.id, symbol=symbol, entry_date=pos["entry_date"], exit_date=current_date, entry_rank=pos.get("entry_rank"), holding_days=holding_days, entry_price=entry_p, exit_price=sell_px, entry_weight=pos.get("entry_weight", 0.0), exit_weight=float(gross_sale / (event_value_before_abs or prev_nav_net_abs)) if (event_value_before_abs or prev_nav_net_abs) > 0 else 0.0, gross_return=gross_ret, net_return=net_ret, exit_reason="NOT_IN_TOP_N"))
+                        hp_cost_drag = (pos["qty"] * entry_p + pos["qty"] * sell_px) * total_cost_rate / 2.0
+                        hp_pnl_abs = (pos["qty"] * sell_px) - (pos["qty"] * entry_p) - hp_cost_drag
+                        holding_period_objects.append(BacktestHoldingPeriod(backtest_run_id=run_record.id, symbol=symbol, entry_date=pos["entry_date"], exit_date=current_date, entry_rank=pos.get("entry_rank"), holding_days=holding_days, entry_price=entry_p, exit_price=sell_px, qty=pos["qty"], gross_return=gross_ret, net_return=net_ret, cost_drag=hp_cost_drag, pnl_abs=hp_pnl_abs, exit_reason="NOT_IN_TOP_N"))
                         del holdings[symbol]
 
                     retained_count = sum(1 for s in plan["retained_symbols"] if s in holdings)
@@ -414,7 +416,7 @@ class BacktestEngineService:
                             if total_needed > net_cash or qty <= 0: continue
                             net_cash -= total_needed; gross_cash -= gross_buy
                             day_cost_abs += buy_cost; cumulative_cost_abs += buy_cost; day_trade_notional += gross_buy; added_count += 1
-                            holdings[symbol] = {"qty": qty, "entry_date": current_date, "entry_rank": rank_map_now.get(symbol), "entry_price": buy_px, "last_close": self._lookup_px(close_px, current_date, symbol) or buy_px, "entry_weight": float(gross_buy / (event_value_before_abs or prev_nav_net_abs)) if (event_value_before_abs or prev_nav_net_abs) > 0 else 0.0}
+                            holdings[symbol] = {"qty": qty, "entry_date": current_date, "entry_rank": rank_map_now.get(symbol), "entry_price": buy_px, "last_close": self._lookup_px(close_px, current_date, symbol) or buy_px}
 
                     event_value_after_abs = net_cash + self._valuation(holdings, current_date, open_px, close_px)
                     event_turnover = (day_trade_notional / (event_value_before_abs or prev_nav_net_abs)) if (event_value_before_abs or prev_nav_net_abs) > 0 else 0.0
@@ -436,10 +438,10 @@ class BacktestEngineService:
                 drawdown = (nav_net_norm / running_peak_norm - 1.0) if running_peak_norm > 0 else 0.0
                 daily_cost_ratio = (day_cost_abs / prev_nav_net_abs) if prev_nav_net_abs > 0 else 0.0
 
-                daily_nav_objects.append(BacktestDailyNav(backtest_run_id=run_record.id, trade_date=current_date, portfolio_return_gross=float(daily_return_gross), portfolio_return_net=float(daily_return_net), portfolio_nav_gross=float(nav_gross_norm), portfolio_nav_net=float(nav_net_norm), benchmark_return=bm_ret_by_date.get(current_date), benchmark_nav=bm_nav_by_date.get(current_date), running_peak_nav=float(running_peak_norm), drawdown=float(drawdown), daily_turnover=float(event_turnover), daily_cost=float(daily_cost_ratio)))
+                daily_nav_list.append({"trade_date": str(current_date), "portfolio_return_gross": float(daily_return_gross), "portfolio_return_net": float(daily_return_net), "portfolio_nav_gross": float(nav_gross_norm), "portfolio_nav_net": float(nav_net_norm), "benchmark_return": float(bm_ret_by_date[current_date]) if current_date in bm_ret_by_date and bm_ret_by_date[current_date] is not None else None, "benchmark_nav": float(bm_nav_by_date[current_date]) if current_date in bm_nav_by_date and bm_nav_by_date[current_date] is not None else None, "running_peak_nav": float(running_peak_norm), "drawdown": float(drawdown), "daily_turnover": float(event_turnover), "daily_cost": float(daily_cost_ratio)})
                 prev_nav_net_abs = nav_net_abs; prev_nav_gross_abs = nav_gross_abs
 
-            if not daily_nav_objects:
+            if not daily_nav_list:
                 run_record.status = "FAILED"; run_record.error_message = "Simulation produced no NAV rows."; app_db.commit(); return
 
             # ── Close open positions ──────────────────────────────────────────
@@ -448,25 +450,25 @@ class BacktestEngineService:
                 realized_holding_periods.append(holding_days)
                 close_px_val = pos.get("last_close", pos.get("entry_price", 0.0))
                 entry_p = pos.get("entry_price", 0.0)
-                gross_val = pos["qty"] * close_px_val
                 gross_ret_open = (close_px_val / entry_p - 1.0) if entry_p > 0 else None
                 net_ret_open   = (gross_ret_open - total_cost_rate) if gross_ret_open is not None else None
-                holding_period_objects.append(BacktestHoldingPeriod(backtest_run_id=run_record.id, symbol=symbol, entry_date=pos["entry_date"], exit_date=trading_dates[-1], entry_rank=pos.get("entry_rank"), holding_days=holding_days, entry_price=entry_p, exit_price=close_px_val, entry_weight=pos.get("entry_weight", 0.0), exit_weight=float(gross_val / nav_net_abs) if nav_net_abs > 0 else 0.0, gross_return=gross_ret_open, net_return=net_ret_open, exit_reason="END_OF_BACKTEST"))
+                hp_cost_drag = (pos["qty"] * entry_p + pos["qty"] * close_px_val) * total_cost_rate / 2.0
+                hp_pnl_abs = (pos["qty"] * close_px_val) - (pos["qty"] * entry_p) - hp_cost_drag
+                holding_period_objects.append(BacktestHoldingPeriod(backtest_run_id=run_record.id, symbol=symbol, entry_date=pos["entry_date"], exit_date=trading_dates[-1], entry_rank=pos.get("entry_rank"), holding_days=holding_days, entry_price=entry_p, exit_price=close_px_val, qty=pos["qty"], gross_return=gross_ret_open, net_return=net_ret_open, cost_drag=hp_cost_drag, pnl_abs=hp_pnl_abs, exit_reason="END_OF_BACKTEST"))
 
-            app_db.bulk_save_objects(daily_nav_objects)
             if holding_period_objects: app_db.bulk_save_objects(holding_period_objects)
             app_db.commit()
 
-            # ── Rebalance events ──────────────────────────────────────────────
-            rebalance_objects = [BacktestRebalanceEvent(backtest_run_id=run_record.id, rebalance_date=p["rebalance_date"], portfolio_value_before=p["portfolio_value_before"] / initial_capital * 100.0, portfolio_value_after=p["portfolio_value_after"] / initial_capital * 100.0, turnover=p["turnover"], transaction_cost=p["transaction_cost"] / initial_capital, positions_before=p["positions_before"], positions_after=p["positions_after"], added_count=p["added"], dropped_count=p["dropped"], retained_count=p["retained"]) for p in rebalance_events_payload]
-            if rebalance_objects: app_db.bulk_save_objects(rebalance_objects); app_db.commit()
+            # ── Build JSONB lists for rebalance events + constituents ─────────
+            rebalance_events_list = [{"rebalance_date": str(p["rebalance_date"]), "portfolio_value_before": float(p["portfolio_value_before"] / initial_capital * 100.0), "portfolio_value_after": float(p["portfolio_value_after"] / initial_capital * 100.0), "turnover": float(p["turnover"]), "transaction_cost": float(p["transaction_cost"] / initial_capital), "positions_before": p["positions_before"], "positions_after": p["positions_after"], "added_count": p["added"], "dropped_count": p["dropped"], "retained_count": p["retained"]} for p in rebalance_events_payload]
+            constituents_list = [{"date": str(plan["date"]), "buy": plan["buy_symbols"], "sell": plan["sold_symbols"], "retain": plan["retained_symbols"]} for plan in basket_plan]
 
             # ── Summary statistics ────────────────────────────────────────────
-            nav_df = pd.DataFrame([{"trade_date": obj.trade_date, "ret_net": obj.portfolio_return_net, "ret_gross": obj.portfolio_return_gross, "nav_net": obj.portfolio_nav_net, "nav_gross": obj.portfolio_nav_gross, "drawdown": obj.drawdown, "turnover": obj.daily_turnover, "cost": obj.daily_cost} for obj in daily_nav_objects])
+            nav_df = pd.DataFrame(daily_nav_list)
             nav_df["trade_date"] = pd.to_datetime(nav_df["trade_date"])
             nav_df = nav_df.sort_values("trade_date").set_index("trade_date")
-            ret_net = nav_df["ret_net"].astype(float); nav_net = nav_df["nav_net"].astype(float)
-            nav_gross = nav_df["nav_gross"].astype(float); drawdown_series = nav_df["drawdown"].astype(float)
+            ret_net = nav_df["portfolio_return_net"].astype(float); nav_net = nav_df["portfolio_nav_net"].astype(float)
+            nav_gross = nav_df["portfolio_nav_gross"].astype(float); drawdown_series = nav_df["drawdown"].astype(float)
             total_return       = float(nav_net.iloc[-1] / 100.0 - 1.0)
             gross_total_return = float(nav_gross.iloc[-1] / 100.0 - 1.0)
             elapsed_days = max(1, (nav_df.index[-1] - nav_df.index[0]).days)
@@ -488,12 +490,11 @@ class BacktestEngineService:
                 bm_monthly_nav_padded = pd.concat([pd.Series([100.0], index=[bm_monthly_nav.index[0] - pd.offsets.MonthEnd(1)]), bm_monthly_nav])
                 bm_monthly_rets = bm_monthly_nav_padded.pct_change().dropna()
 
-            monthly_objects = []
+            monthly_returns_list = []
             for dt, mret in monthly_rets.items():
                 bm_mret = float(bm_monthly_rets.get(dt, 0.0)) if bm_monthly_rets is not None else None
                 excess_mret = (float(mret) - bm_mret) if bm_mret is not None else float(mret)
-                monthly_objects.append(BacktestMonthlyReturn(backtest_run_id=run_record.id, year=dt.year, month=dt.month, monthly_return=float(mret), benchmark_monthly_return=bm_mret, excess_monthly_return=excess_mret))
-            if monthly_objects: app_db.bulk_save_objects(monthly_objects); app_db.commit()
+                monthly_returns_list.append({"year": dt.year, "month": dt.month, "monthly_return": float(mret), "benchmark_monthly_return": bm_mret, "excess_monthly_return": excess_mret})
 
             positive_month_pct = float((monthly_rets > 0).mean()) if len(monthly_rets) > 0 else 0.0
             best_month = float(monthly_rets.max()) if len(monthly_rets) > 0 else 0.0
@@ -518,7 +519,7 @@ class BacktestEngineService:
                     benchmark_cagr_val = float((bm_nav_arr.iloc[-1] / bm_nav_arr.iloc[0]) ** (365.25 / bm_elapsed) - 1.0)
                     excess_cagr_val = cagr - benchmark_cagr_val
                     bm_ret_arr = bm_nav_arr.pct_change().fillna(0.0)
-                    port_ret_arr = nav_df["ret_net"].reindex(bm_ret_arr.index).fillna(0.0)
+                    port_ret_arr = nav_df["portfolio_return_net"].reindex(bm_ret_arr.index).fillna(0.0)
                     both_nonzero = (port_ret_arr != 0) | (bm_ret_arr != 0)
                     if both_nonzero.sum() > 0:
                         hit_ratio_val = float((port_ret_arr[both_nonzero] > bm_ret_arr[both_nonzero]).mean())
@@ -527,6 +528,11 @@ class BacktestEngineService:
                     down_days = bm_ret_arr < 0
                     if down_days.sum() > 0: downside_cap_val = float(port_ret_arr[down_days].mean() / bm_ret_arr[down_days].mean())
 
+            # ── Drawdowns (JSONB only) ────────────────────────────────────
+            dd_episodes = self._make_drawdown_episodes(nav_net)
+            drawdowns_list = [{"peak_date": str(ep["start_date"]), "trough_date": str(ep["trough_date"]), "recovery_date": str(ep["recovery_date"]) if ep["recovery_date"] else None, "drawdown_pct": float(ep["drawdown"]), "peak_to_trough_days": (ep["trough_date"] - ep["start_date"]).days, "trough_to_recovery_days": (ep["recovery_date"] - ep["trough_date"]).days if ep["recovery_date"] else None, "total_recovery_days": (ep["recovery_date"] - ep["start_date"]).days if ep["recovery_date"] else None} for ep in dd_episodes]
+
+            # ── Summary with JSONB data ───────────────────────────────────
             summary = BacktestSummary(
                 backtest_run_id=run_record.id,
                 metrics_json={
@@ -556,12 +562,13 @@ class BacktestEngineService:
                     "avg_retention_pct": avg_retention_pct,
                     "avg_churn_pct": avg_churn_pct,
                 },
+                daily_nav_json=daily_nav_list,
+                monthly_returns_json=monthly_returns_list,
+                rebalance_events_json=rebalance_events_list,
+                constituents_json=constituents_list,
+                drawdowns_json=drawdowns_list,
             )
             app_db.add(summary)
-
-            dd_episodes = self._make_drawdown_episodes(nav_net)
-            dd_objects = [BacktestDrawdownEpisode(backtest_run_id=run_record.id, peak_date=ep["start_date"], trough_date=ep["trough_date"], recovery_date=ep["recovery_date"], drawdown_pct=ep["drawdown"], peak_to_trough_days=(ep["trough_date"] - ep["start_date"]).days, trough_to_recovery_days=(ep["recovery_date"] - ep["trough_date"]).days if ep["recovery_date"] else None, total_recovery_days=(ep["recovery_date"] - ep["start_date"]).days if ep["recovery_date"] else None) for ep in dd_episodes]
-            if dd_objects: app_db.bulk_save_objects(dd_objects)
 
             run_record.status = "COMPLETED"; run_record.completed_at = datetime.utcnow(); run_record.progress_pct = 100
             app_db.commit()
