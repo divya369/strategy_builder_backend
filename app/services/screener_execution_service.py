@@ -268,9 +268,17 @@ class ScreenerExecutionService:
         limit: int = None,
         offset: int = 0,
         target_date: date = None,
+        universe_date: date = None,
     ) -> Tuple[List[dict], int, Optional[date]]:
         """
         Core execution logic — pure pandas, no DB queries.
+
+        Args:
+            target_date:   Date for screener CSV data (stock metrics/rankings).
+            universe_date: Date for index constituent lookup. Defaults to
+                           target_date when None (live/adhoc screeners). For
+                           backtesting, this is the rebalance date while
+                           target_date is the previous trading day.
 
         Returns: (results_list, total_matches, effective_date)
         """
@@ -283,14 +291,18 @@ class ScreenerExecutionService:
                     detail="No screener CSV data available. Check SCREENER_CSV_DIR setting."
                 )
 
+        # Default universe_date to target_date (live/adhoc screeners)
+        if not universe_date:
+            universe_date = target_date
+
         # 2. Load screener DataFrame for target date
         df = csv_data_service.get_screener_data(target_date)
         if df.empty:
             logger.warning("Screener data empty for date %s", target_date)
             return [], 0, target_date
 
-        # 3. Universe filter
-        df = self._apply_universe_filter(df, universe_json, target_date)
+        # 3. Universe filter (uses universe_date for index constituents)
+        df = self._apply_universe_filter(df, universe_json, universe_date)
         if df.empty:
             return [], 0, target_date
 
@@ -314,7 +326,7 @@ class ScreenerExecutionService:
     # ── Private helpers ───────────────────────────────────────────────────────
 
     def _apply_universe_filter(
-        self, df: pd.DataFrame, universe_json: dict, target_date: date
+        self, df: pd.DataFrame, universe_json: dict, universe_date: date
     ) -> pd.DataFrame:
         if not universe_json:
             return df
@@ -326,9 +338,9 @@ class ScreenerExecutionService:
         if not index_val:
             return df
 
-        constituents = csv_data_service.get_index_constituents(index_val, target_date)
+        constituents = csv_data_service.get_index_constituents(index_val, universe_date)
         if not constituents:
-            logger.warning("No constituents found for index '%s' as of %s", index_val, target_date)
+            logger.warning("No constituents found for index '%s' as of %s", index_val, universe_date)
             return df.iloc[0:0]  # empty, preserving columns
 
         constituents_set = set(constituents)

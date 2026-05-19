@@ -311,7 +311,8 @@ class BacktestEngineService:
                     continue
                 results, _, _ = screener_execution_service._execute_with_params(
                     universe_json=universe_json, filters_json=filters_json,
-                    ranking_json=ranking_json, limit=fetch_limit, offset=0, target_date=prev_date
+                    ranking_json=ranking_json, limit=fetch_limit, offset=0,
+                    target_date=prev_date, universe_date=b_date
                 )
                 # ── Normalize symbols to canonical (current) names ────────
                 raw_eligible = [r["symbol"] for r in results]
