@@ -288,15 +288,30 @@ class BacktestEngineService:
             if not basket_dates:
                 run_record.status = "FAILED"; run_record.error_message = "No rebalance dates found."; app_db.commit(); return
 
+            # ── Pre-build previous-screener-date mapping (one pass) ───────────
+            # For each rebalance date, find the latest screener CSV date
+            # STRICTLY BEFORE it (avoids look-ahead bias).
+            all_csv_dates = csv_data_service.get_available_screener_dates()
+            prev_screener_map: Dict[date, date] = {}
+            for b_date in basket_dates:
+                candidates = [d for d in all_csv_dates if d < b_date]
+                if candidates:
+                    prev_screener_map[b_date] = max(candidates)
+
             # ── Run screener on each rebalance date ───────────────────────────
             basket_plan: List[dict] = []
             previous_basket_symbols: set = set()
             fetch_limit = max(portfolio_size, wrh)
 
             for b_date in basket_dates:
+                # Use PREVIOUS trading day's screener data (not same-day)
+                prev_date = prev_screener_map.get(b_date)
+                if prev_date is None:
+                    logger.warning("No previous screener CSV found for rebalance date %s — skipping", b_date)
+                    continue
                 results, _, _ = screener_execution_service._execute_with_params(
                     universe_json=universe_json, filters_json=filters_json,
-                    ranking_json=ranking_json, limit=fetch_limit, offset=0, target_date=b_date
+                    ranking_json=ranking_json, limit=fetch_limit, offset=0, target_date=prev_date
                 )
                 # ── Normalize symbols to canonical (current) names ────────
                 raw_eligible = [r["symbol"] for r in results]
