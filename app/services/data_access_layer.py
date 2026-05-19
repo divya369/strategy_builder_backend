@@ -227,7 +227,7 @@ class CsvIndexConstituentReader(IndexConstituentReader):
             logger.info("Index CSV modified, reloading: %s", path.name)
 
         try:
-            df = pd.read_csv(path, index_col=0, header=0)
+            df = pd.read_csv(path, header=0)
             # Parse column names as dates
             df.columns = pd.to_datetime(df.columns, errors="coerce")
             df = df.loc[:, df.columns.notna()]  # drop any columns that failed date parse
