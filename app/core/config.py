@@ -44,6 +44,12 @@ class Settings:
     #   Format: flat CSV with tradingsymbol + all indicator columns
     SCREENER_CSV_DIR: str = os.getenv("SCREENER_CSV_DIR", "")
 
+    # ── Celery / Redis ────────────────────────────────────────────────────
+    REDIS_URL: str = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+    CELERY_RESULT_BACKEND: str = os.getenv("CELERY_RESULT_BACKEND", "redis://localhost:6379/1")
+    BACKTEST_STALE_MINUTES: int = int(os.getenv("BACKTEST_STALE_MINUTES", "30"))
+    BACKTEST_HEARTBEAT_SECONDS: int = int(os.getenv("BACKTEST_HEARTBEAT_SECONDS", "30"))
+
     # ── Equity DB column config ───────────────────────────────────────────────
     # Columns expected in every equity_ohlc per-symbol table
     EQUITY_TABLE_DATE_COL: str   = "date"

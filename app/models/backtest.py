@@ -48,6 +48,8 @@ class BacktestRun(Base):
     created_at = Column(DateTime, nullable=False)
     started_at = Column(DateTime, nullable=True)
     completed_at = Column(DateTime, nullable=True)
+    last_heartbeat_at = Column(DateTime, nullable=True)
+    celery_task_id = Column(String(255), nullable=True)
 
     # Result relationships
     summary = relationship("BacktestSummary", back_populates="run", uselist=False, cascade="all, delete-orphan")

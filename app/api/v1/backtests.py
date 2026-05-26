@@ -1,10 +1,11 @@
 import uuid
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
-from app.core.database import get_db, get_equity_db
+from app.core.database import get_db
 from app.core.backtest_metric_formatter import format_metric_value
 from app.schemas.backtest import CustomBacktestRequest
-from app.services.backtest_engine import backtest_engine_service, _backtest_executor
+from app.services.backtest_engine import backtest_engine_service
+from app.tasks.backtest_tasks import run_backtest_task
 from app.models.backtest import BacktestRun
 from app.models.result import BacktestSummary
 from app.models.screener import Screener, ScreenerVersion
@@ -32,13 +33,35 @@ def run_custom_backtest(req: CustomBacktestRequest, db: Session = Depends(get_db
     req_dict.setdefault("transaction_cost_bps", 20.0)
     req_dict.setdefault("slippage_bps", 10.0)
 
-    run_id = backtest_engine_service.submit_backtest(db=db, request_data=req_dict, user_id=user_id, screener_id=screener_id, screener_version_id=screener_version_id)
+    # submit_backtest now returns a BacktestRun ORM object (not just UUID)
+    run_record = backtest_engine_service.submit_backtest(
+        db=db, request_data=req_dict, user_id=user_id,
+        screener_id=screener_id, screener_version_id=screener_version_id
+    )
 
-    run_record = db.query(BacktestRun).filter(BacktestRun.id == run_id).first()
-    if run_record and run_record.status == "RUNNING":
-        _backtest_executor.submit(backtest_engine_service.execute_backtest_background, run_id)
+    # ── Smart dispatch: only enqueue to Celery if not already assigned ────
+    if run_record.status == "COMPLETED":
+        return {
+            "status": "success",
+            "run_id": str(run_record.id),
+            "message": "Existing completed backtest returned.",
+        }
 
-    return {"status": "success", "run_id": str(run_id)}
+    if run_record.status in ("QUEUED", "RUNNING"):
+        # Only submit to Celery if no task is already assigned
+        if not run_record.celery_task_id:
+            task = run_backtest_task.delay(str(run_record.id))
+            run_record.celery_task_id = task.id
+            db.commit()
+
+        return {
+            "status": "success",
+            "run_id": str(run_record.id),
+            "message": "Backtest submitted.",
+        }
+
+    # Fallback (should not normally reach here)
+    return {"status": "success", "run_id": str(run_record.id)}
 
 @router.get("/{run_id}")
 def get_backtest_result(run_id: uuid.UUID, db: Session = Depends(get_db)):

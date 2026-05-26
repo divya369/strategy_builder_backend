@@ -33,6 +33,23 @@ def _seed_system_user():
     finally:
         db.close()
 
+# ── Recover stale RUNNING/QUEUED backtests from previous crashes ──────────────
+@app.on_event("startup")
+def _recover_stale_backtests():
+    from app.core.database import SessionLocal
+    from app.services.backtest_job_service import BacktestJobService
+    import logging
+    logger = logging.getLogger(__name__)
+    db = SessionLocal()
+    try:
+        count = BacktestJobService.recover_stale_running_jobs(db)
+        if count:
+            logger.warning("[Startup Recovery] Marked %d stale backtest jobs as FAILED", count)
+        else:
+            logger.info("[Startup Recovery] No stale backtest jobs found")
+    finally:
+        db.close()
+
 import os
 from fastapi.staticfiles import StaticFiles
 

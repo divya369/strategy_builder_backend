@@ -15,3 +15,7 @@ python-multipart
 
 # Required for Pydantic's EmailStr validation
 email-validator
+
+# Celery + Redis (background backtest execution)
+celery>=5.3
+redis>=5.0

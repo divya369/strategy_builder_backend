@@ -1,0 +1,56 @@
+<!DOCTYPE html>
+<html>
+
+<head>
+    <title>Kite Basket Test</title>
+
+    <script src="https://kite.trade/publisher.js?v=3"></script>
+</head>
+
+<body>
+
+    <button id="basket-btn">
+        Open Basket
+    </button>
+
+    <script>
+
+        document.getElementById("basket-btn").onclick = function () {
+
+            KiteConnect.ready(function () {
+
+                var kite = new KiteConnect("x9n0j9jes6fa1ngy");
+
+                kite.add({
+                    "exchange": "NSE",
+                    "tradingsymbol": "SBIN",
+                    "transaction_type": "BUY",
+                    "quantity": 1,
+                    "order_type": "LIMIT",
+                    "price": 900,
+                    "product": "CNC",
+                    "validity": "DAY",
+                    "tag": "SBIN01"
+                });
+
+                kite.add({
+                    "exchange": "NSE",
+                    "tradingsymbol": "INFY",
+                    "transaction_type": "BUY",
+                    "quantity": 1,
+                    "order_type": "LIMIT",
+                    "price": 1060,
+                    "product": "CNC",
+                    "validity": "DAY",
+                    "tag": "INFY01"
+                });
+
+                kite.connect();
+            });
+        };
+
+    </script>
+
+</body>
+
+</html>

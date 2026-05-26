@@ -9,22 +9,26 @@ Rebalance calendar is computed purely from available screener CSV dates -
 no rebalance_calendar DB table needed.
 
 Screener execution reads from CSV via screener_execution_service.
+
+Execution is triggered by a Celery task (app.tasks.backtest_tasks),
+not by an in-process ThreadPoolExecutor.
 """
-import atexit
 import hashlib
 import json
 import logging
+import time
 import uuid
 from bisect import bisect_left
-from concurrent.futures import ThreadPoolExecutor
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from statistics import median
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from app.core.config import settings
 from app.core.database import SessionLocal, EquitySessionLocal
 from app.models.backtest import BacktestHoldingPeriod, BacktestRun
 from app.models.result import BacktestSummary
@@ -35,9 +39,6 @@ from app.services.screener_execution_service import screener_execution_service
 
 logger = logging.getLogger(__name__)
 
-_backtest_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="backtest")
-atexit.register(_backtest_executor.shutdown, wait=False)
-
 
 class BacktestEngineService:
 
@@ -46,16 +47,65 @@ class BacktestEngineService:
     def _hash(self, data: dict) -> str:
         return hashlib.sha256(json.dumps(data, sort_keys=True, default=str).encode()).hexdigest()
 
-    def submit_backtest(self, db: Session, request_data: dict, user_id, screener_id, screener_version_id) -> uuid.UUID:
+    @staticmethod
+    def _is_stale(run: BacktestRun) -> bool:
+        """Check if a RUNNING/QUEUED run's heartbeat is stale (worker likely dead)."""
+        if not run.last_heartbeat_at:
+            return True  # no heartbeat ever recorded → treat as stale
+        stale_before = datetime.utcnow() - timedelta(
+            minutes=settings.BACKTEST_STALE_MINUTES
+        )
+        return run.last_heartbeat_at < stale_before
+
+    def submit_backtest(self, db: Session, request_data: dict, user_id, screener_id, screener_version_id) -> BacktestRun:
+        """
+        Creates or reuses a BacktestRun record.
+
+        Returns the BacktestRun ORM object (not just UUID) so the API layer
+        can inspect status and celery_task_id for smart dispatch.
+
+        Deduplication logic:
+          - COMPLETED → return as-is
+          - RUNNING/QUEUED with fresh heartbeat → return as-is (still alive)
+          - RUNNING/QUEUED with stale heartbeat → mark FAILED, then retry
+          - FAILED → reset to QUEUED for a clean retry
+        """
         req_hash = self._hash(request_data)
         existing = db.query(BacktestRun).filter(BacktestRun.request_hash == req_hash).first()
-        if existing:
-            if existing.status in ("COMPLETED", "RUNNING", "QUEUED"):
-                logger.info("Reusing existing backtest run %s (status=%s)", existing.id, existing.status)
-                return existing.id
-            if existing.status == "FAILED":
-                db.delete(existing); db.commit()
 
+        if existing:
+            # Already finished successfully
+            if existing.status == "COMPLETED":
+                logger.info("Reusing COMPLETED backtest run %s", existing.id)
+                return existing
+
+            # Still running — check if actually alive
+            if existing.status in ("RUNNING", "QUEUED"):
+                if not self._is_stale(existing):
+                    logger.info("Reusing active backtest run %s (status=%s)", existing.id, existing.status)
+                    return existing
+                # Stale → mark FAILED so we can retry
+                logger.warning("Backtest run %s is stale (heartbeat too old) — marking FAILED", existing.id)
+                existing.status = "FAILED"
+                existing.completed_at = datetime.utcnow()
+                existing.error_message = "Marked FAILED: old job heartbeat is stale."
+                db.commit()
+
+            # FAILED → reset for clean retry (reuse same run_id)
+            if existing.status == "FAILED":
+                logger.info("Resetting FAILED backtest run %s for retry", existing.id)
+                existing.status = "QUEUED"
+                existing.started_at = None
+                existing.completed_at = None
+                existing.last_heartbeat_at = datetime.utcnow()
+                existing.celery_task_id = None
+                existing.error_message = None
+                existing.progress_pct = 0
+                db.commit()
+                db.refresh(existing)
+                return existing
+
+        # ── Create new run ────────────────────────────────────────────────
         from_date = datetime.strptime(request_data["from_date"], "%Y-%m-%d").date()
         to_date   = datetime.strptime(request_data["to_date"],   "%Y-%m-%d").date()
         freq      = request_data.get("frequency", "weekly").lower()
@@ -76,11 +126,23 @@ class BacktestEngineService:
             transaction_cost_bps=float(request_data.get("transaction_cost_bps", 20.0)),
             slippage_bps=float(request_data.get("slippage_bps", 10.0)),
             initial_capital=float(request_data.get("initial_capital", 1_000_000.0)),
-            status="RUNNING", request_hash=req_hash,
-            created_at=datetime.utcnow(), started_at=datetime.utcnow(),
+            status="QUEUED", request_hash=req_hash,
+            created_at=datetime.utcnow(),
+            last_heartbeat_at=datetime.utcnow(),
         )
-        db.add(run); db.commit(); db.refresh(run)
-        return run.id
+        db.add(run)
+
+        try:
+            db.commit()
+            db.refresh(run)
+            return run
+        except IntegrityError:
+            # Race condition: another request inserted the same hash concurrently
+            db.rollback()
+            existing = db.query(BacktestRun).filter(BacktestRun.request_hash == req_hash).first()
+            if existing:
+                return existing
+            raise
 
     # ── Rebalance calendar (pure Python, no DB) ───────────────────────────────
 
@@ -375,8 +437,20 @@ class BacktestEngineService:
             daily_nav_list: List[dict] = []
             prev_nav_net_abs = prev_nav_gross_abs = float(initial_capital)
             running_peak_norm = 100.0
+            _last_heartbeat_time = time.time()
 
             for current_date in trading_dates:
+                # ── Heartbeat: signal that the worker is still alive ───────
+                if time.time() - _last_heartbeat_time >= settings.BACKTEST_HEARTBEAT_SECONDS:
+                    try:
+                        _hb_db = SessionLocal()
+                        from app.services.backtest_job_service import BacktestJobService
+                        BacktestJobService.heartbeat(_hb_db, run_id)
+                    except Exception as hb_exc:
+                        logger.debug("Heartbeat update failed: %s", hb_exc)
+                    finally:
+                        _hb_db.close()
+                    _last_heartbeat_time = time.time()
                 day_cost_abs = day_trade_notional = event_turnover = 0.0
                 positions_before = len(holdings)
                 event_value_before_abs = event_value_after_abs = None
@@ -596,11 +670,13 @@ class BacktestEngineService:
             app_db.rollback()
             try:
                 if run_record:
-                    run_record.status = "FAILED"; run_record.error_message = str(e)
+                    run_record.status = "FAILED"; run_record.error_message = str(e)[:10000]
                     app_db.add(run_record); app_db.commit()
             except Exception as inner_e:
                 app_db.rollback(); logger.error("Failed to update run status: %s", inner_e)
-            raise
+            # Do NOT re-raise: the Celery task wrapper handles error reporting.
+            # Re-raising here would crash the thread/worker silently.
+            return
         finally:
             equity_db.close(); app_db.close()
 
