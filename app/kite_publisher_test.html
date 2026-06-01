@@ -2,55 +2,95 @@
 <html>
 
 <head>
-    <title>Kite Basket Test</title>
-
-    <script src="https://kite.trade/publisher.js?v=3"></script>
+    <title>Kite Offsite 50 Market Basket Test</title>
 </head>
 
 <body>
+    <h2>Kite Offsite 50 Market Basket Test</h2>
 
-    <button id="basket-btn">
-        Open Basket
-    </button>
+    <form method="post" id="basket-form" action="https://kite.zerodha.com/connect/basket">
+        <input type="hidden" name="api_key" value="x9n0j9jes6fa1ngy">
+        <input type="hidden" id="basket" name="data" value="">
+        <button type="submit">Open Zerodha Offsite Basket</button>
+    </form>
 
     <script>
+        const basket = [
+            { tradingsymbol: "SBIN", quantity: 1, ltp_reference: 970 },
+            { tradingsymbol: "INFY", quantity: 2, ltp_reference: 1500 },
+            { tradingsymbol: "TCS", quantity: 1, ltp_reference: 3900 },
+            { tradingsymbol: "RELIANCE", quantity: 1, ltp_reference: 1450 },
+            { tradingsymbol: "HDFCBANK", quantity: 2, ltp_reference: 950 },
 
-        document.getElementById("basket-btn").onclick = function () {
+            { tradingsymbol: "ICICIBANK", quantity: 3, ltp_reference: 1400 },
+            { tradingsymbol: "AXISBANK", quantity: 2, ltp_reference: 1150 },
+            { tradingsymbol: "KOTAKBANK", quantity: 1, ltp_reference: 2150 },
+            { tradingsymbol: "LT", quantity: 1, ltp_reference: 3700 },
+            { tradingsymbol: "ITC", quantity: 5, ltp_reference: 430 },
 
-            KiteConnect.ready(function () {
+            { tradingsymbol: "HINDUNILVR", quantity: 1, ltp_reference: 2400 },
+            { tradingsymbol: "BHARTIARTL", quantity: 2, ltp_reference: 1900 },
+            { tradingsymbol: "BAJFINANCE", quantity: 1, ltp_reference: 9000 },
+            { tradingsymbol: "ASIANPAINT", quantity: 1, ltp_reference: 2500 },
+            { tradingsymbol: "MARUTI", quantity: 1, ltp_reference: 12500 },
 
-                var kite = new KiteConnect("x9n0j9jes6fa1ngy");
+            { tradingsymbol: "SUNPHARMA", quantity: 2, ltp_reference: 1700 },
+            { tradingsymbol: "TITAN", quantity: 1, ltp_reference: 3500 },
+            { tradingsymbol: "ULTRACEMCO", quantity: 1, ltp_reference: 11500 },
+            { tradingsymbol: "NESTLEIND", quantity: 1, ltp_reference: 2300 },
+            { tradingsymbol: "POWERGRID", quantity: 5, ltp_reference: 290 },
 
-                kite.add({
-                    "exchange": "NSE",
-                    "tradingsymbol": "SBIN",
-                    "transaction_type": "BUY",
-                    "quantity": 1,
-                    "order_type": "LIMIT",
-                    "price": 900,
-                    "product": "CNC",
-                    "validity": "DAY",
-                    "tag": "SBIN01"
-                });
+            { tradingsymbol: "NTPC", quantity: 5, ltp_reference: 330 },
+            { tradingsymbol: "ONGC", quantity: 5, ltp_reference: 250 },
+            { tradingsymbol: "COALINDIA", quantity: 4, ltp_reference: 380 },
+            { tradingsymbol: "TATAMOTORS", quantity: 2, ltp_reference: 700 },
+            { tradingsymbol: "M&M", quantity: 1, ltp_reference: 3100 },
 
-                kite.add({
-                    "exchange": "NSE",
-                    "tradingsymbol": "INFY",
-                    "transaction_type": "BUY",
-                    "quantity": 1,
-                    "order_type": "LIMIT",
-                    "price": 1060,
-                    "product": "CNC",
-                    "validity": "DAY",
-                    "tag": "INFY01"
-                });
+            { tradingsymbol: "HCLTECH", quantity: 2, ltp_reference: 1600 },
+            { tradingsymbol: "WIPRO", quantity: 3, ltp_reference: 450 },
+            { tradingsymbol: "TECHM", quantity: 2, ltp_reference: 1500 },
+            { tradingsymbol: "ADANIENT", quantity: 1, ltp_reference: 2500 },
+            { tradingsymbol: "ADANIPORTS", quantity: 2, ltp_reference: 1400 },
 
-                kite.connect();
-            });
-        };
+            { tradingsymbol: "JSWSTEEL", quantity: 2, ltp_reference: 1000 },
+            { tradingsymbol: "TATASTEEL", quantity: 5, ltp_reference: 160 },
+            { tradingsymbol: "HINDALCO", quantity: 3, ltp_reference: 650 },
+            { tradingsymbol: "CIPLA", quantity: 2, ltp_reference: 1500 },
+            { tradingsymbol: "DRREDDY", quantity: 1, ltp_reference: 1300 },
 
+            { tradingsymbol: "EICHERMOT", quantity: 1, ltp_reference: 5000 },
+            { tradingsymbol: "HEROMOTOCO", quantity: 1, ltp_reference: 4500 },
+            { tradingsymbol: "BAJAJ-AUTO", quantity: 1, ltp_reference: 8500 },
+            { tradingsymbol: "BRITANNIA", quantity: 1, ltp_reference: 5000 },
+            { tradingsymbol: "GRASIM", quantity: 1, ltp_reference: 2800 },
+
+            { tradingsymbol: "DIVISLAB", quantity: 1, ltp_reference: 6000 },
+            { tradingsymbol: "APOLLOHOSP", quantity: 1, ltp_reference: 7000 },
+            { tradingsymbol: "BPCL", quantity: 4, ltp_reference: 320 },
+            { tradingsymbol: "INDUSINDBK", quantity: 2, ltp_reference: 800 },
+            { tradingsymbol: "SBILIFE", quantity: 1, ltp_reference: 1800 },
+
+            { tradingsymbol: "HDFCLIFE", quantity: 2, ltp_reference: 750 },
+            { tradingsymbol: "BAJAJFINSV", quantity: 1, ltp_reference: 2000 },
+            { tradingsymbol: "SHRIRAMFIN", quantity: 1, ltp_reference: 650 },
+            { tradingsymbol: "LTIM", quantity: 1, ltp_reference: 5200 },
+            { tradingsymbol: "UPL", quantity: 3, ltp_reference: 650 }
+        ].map((item, index) => ({
+            exchange: "NSE",
+            tradingsymbol: item.tradingsymbol,
+            transaction_type: "BUY",
+            quantity: item.quantity,
+            product: "CNC",
+            order_type: "MARKET",
+            price: 0,
+            validity: "DAY",
+            readonly: false,
+            market_protection: -1,
+            tag: "Z" + String(index + 1).padStart(4, "0")
+        }));
+
+        document.getElementById("basket").value = JSON.stringify(basket);
     </script>
-
 </body>
 
 </html>
