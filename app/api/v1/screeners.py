@@ -43,7 +43,13 @@ def get_sort_options():
             for i, p_label in enumerate(conf["periods"]):
                 p_value = conf["periodValues"][i]
                 label = conf["label"].replace(" (%)", "")
-                dynamic.append({"value": f"{p_value}_{base_key}", "label": f"{label} {p_label}", "group": conf.get("sortGroup","Filter-based"), "description": desc})
+                sort_label = f"{label} {p_label}"
+                # Replace the ## heading in description with the actual sort label
+                sort_desc = desc
+                first_break = desc.find("\n\n")
+                if first_break != -1 and desc.startswith("## "):
+                    sort_desc = f"## {sort_label}" + desc[first_break:]
+                dynamic.append({"value": f"{p_value}_{base_key}", "label": sort_label, "group": conf.get("sortGroup","Filter-based"), "description": sort_desc})
         else:
             dynamic.append({"value": base_key, "label": conf["label"], "group": conf.get("sortGroup","Filter-based"), "description": desc})
     return dynamic + EXTRA_SORT_FIELDS
