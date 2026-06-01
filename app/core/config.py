@@ -29,6 +29,7 @@ class Settings:
 
     # ── Security ──────────────────────────────────────────────────────────────
     SECRET_KEY: str = os.getenv("SECRET_KEY", "")
+    API_KEY: str = os.getenv("API_KEY", "")
 
     # ── CORS ──────────────────────────────────────────────────────────────────
     ALLOWED_ORIGINS: list = os.getenv(

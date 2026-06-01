@@ -38,13 +38,14 @@ def get_sort_options():
         if not conf.get("sortable"):
             continue
         base_key = conf.get("dbKey", key)
+        desc = conf.get("description", "")
         if conf.get("periods") and conf.get("periodValues"):
             for i, p_label in enumerate(conf["periods"]):
                 p_value = conf["periodValues"][i]
                 label = conf["label"].replace(" (%)", "")
-                dynamic.append({"value": f"{p_value}_{base_key}", "label": f"{label} {p_label}", "group": conf.get("sortGroup","Filter-based")})
+                dynamic.append({"value": f"{p_value}_{base_key}", "label": f"{label} {p_label}", "group": conf.get("sortGroup","Filter-based"), "description": desc})
         else:
-            dynamic.append({"value": base_key, "label": conf["label"], "group": conf.get("sortGroup","Filter-based")})
+            dynamic.append({"value": base_key, "label": conf["label"], "group": conf.get("sortGroup","Filter-based"), "description": desc})
     return dynamic + EXTRA_SORT_FIELDS
 
 @router.get("/universes")
