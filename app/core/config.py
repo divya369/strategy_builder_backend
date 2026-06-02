@@ -57,6 +57,27 @@ class Settings:
     EQUITY_TABLE_OPEN_COL: str   = "open"
     EQUITY_TABLE_CLOSE_COL: str  = "close"
 
+    # ── Rate Limiting ─────────────────────────────────────────────────────────
+    RATE_LIMIT_ENABLED: bool = os.getenv("RATE_LIMIT_ENABLED", "true").lower() == "true"
+    RATE_LIMIT_REDIS_URL: str = os.getenv("RATE_LIMIT_REDIS_URL", "redis://localhost:6379/4")
+
+    # IPs that bypass rate limiting entirely (comma-separated)
+    RATE_LIMIT_WHITELISTED_IPS: set = set(
+        ip.strip() for ip in os.getenv("RATE_LIMIT_WHITELISTED_IPS", "").split(",") if ip.strip()
+    )
+
+    # Global default limits
+    RATE_LIMIT_REQUESTS: int = int(os.getenv("RATE_LIMIT_REQUESTS", "100"))
+    RATE_LIMIT_WINDOW_SECONDS: int = int(os.getenv("RATE_LIMIT_WINDOW_SECONDS", "60"))
+
+    # Per-route-prefix limits (0 = use global default)
+    RATE_LIMIT_AUTH_REQUESTS: int = int(os.getenv("RATE_LIMIT_AUTH_REQUESTS", "10"))
+    RATE_LIMIT_AUTH_WINDOW_SECONDS: int = int(os.getenv("RATE_LIMIT_AUTH_WINDOW_SECONDS", "60"))
+    RATE_LIMIT_BACKTESTS_REQUESTS: int = int(os.getenv("RATE_LIMIT_BACKTESTS_REQUESTS", "20"))
+    RATE_LIMIT_BACKTESTS_WINDOW_SECONDS: int = int(os.getenv("RATE_LIMIT_BACKTESTS_WINDOW_SECONDS", "60"))
+    RATE_LIMIT_SCREENERS_REQUESTS: int = int(os.getenv("RATE_LIMIT_SCREENERS_REQUESTS", "50"))
+    RATE_LIMIT_SCREENERS_WINDOW_SECONDS: int = int(os.getenv("RATE_LIMIT_SCREENERS_WINDOW_SECONDS", "60"))
+
     @property
     def sqlalchemy_database_uri(self) -> str:
         return (

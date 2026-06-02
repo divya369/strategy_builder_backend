@@ -6,7 +6,7 @@ import uuid
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import func as sa_func
 from sqlalchemy.orm import Session
-
+from app.core.rate_limiter import rate_limit   
 from datetime import datetime, timezone
 from app.core.database import get_db
 from app.core.filter_registry import FILTER_CONFIG_MAP, EXTRA_SORT_FIELDS
@@ -193,7 +193,7 @@ def get_screener_detail(screener_id: uuid.UUID, vid: uuid.UUID = None, db: Sessi
         "ranking": version.ranking_json,
     }
 
-@router.post("/run-adhoc")
+@router.post("/run-adhoc", dependencies=[Depends(rate_limit(max_requests=10, window_seconds=60))])
 def run_screener_adhoc(payload: ScreenerVersionCreate, limit: int = None, offset: int = 0, db: Session = Depends(get_db)):
     return screener_execution_service.execute_adhoc(
         universe=payload.universe.model_dump(),

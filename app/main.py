@@ -99,6 +99,10 @@ app.add_middleware(
     allow_headers=["Authorization", "Content-Type"],  # Restrict to only required headers
 )
 
+# ── Rate limiting ─────────────────────────────────────────────────────────────
+from app.core.rate_limit_middleware import RateLimitMiddleware
+app.add_middleware(RateLimitMiddleware)
+
 # ── API-key auth ──────────────────────────────────────────────────────────────
 from app.core.auth_middleware import APIKeyMiddleware
 app.add_middleware(APIKeyMiddleware)

@@ -9,11 +9,12 @@ from app.tasks.backtest_tasks import run_backtest_task
 from app.models.backtest import BacktestRun
 from app.models.result import BacktestSummary
 from app.models.screener import Screener, ScreenerVersion
+from app.core.rate_limiter import rate_limit  
 
 
 router = APIRouter()
 
-@router.post("/custom-run")
+@router.post("/custom-run", dependencies=[Depends(rate_limit(max_requests=5, window_seconds=60))])
 def run_custom_backtest(req: CustomBacktestRequest, db: Session = Depends(get_db)):
     user_id = req.user_id
     screener_id = req.screener_id
