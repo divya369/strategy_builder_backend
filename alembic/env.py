@@ -24,7 +24,7 @@ import app.models.screener
 import app.models.backtest
 import app.models.result
 import app.models.user
-import app.models.broker_order
+import app.models.live_investment
 
 target_metadata = Base.metadata
 config.set_main_option("sqlalchemy.url", settings.sqlalchemy_database_uri)

@@ -9,6 +9,7 @@ Start the worker:
     celery -A app.core.celery_app.celery_app worker --loglevel=info --concurrency=1
 """
 from celery import Celery
+from celery.schedules import crontab
 from app.core.config import settings
 
 celery_app = Celery(
@@ -17,6 +18,7 @@ celery_app = Celery(
     backend=settings.CELERY_RESULT_BACKEND,
     include=[
         "app.tasks.backtest_tasks",
+        "app.tasks.live_rebalance_tasks",
     ],
 )
 
@@ -43,4 +45,20 @@ celery_app.conf.update(
 
     # ── Broker ────────────────────────────────────────────────────────────
     broker_connection_retry_on_startup=True,
+
+    # ── Beat schedule (cron) ──────────────────────────────────────────────
+    # Start the beat scheduler:
+    #   celery -A app.core.celery_app.celery_app beat --loglevel=info
+    beat_schedule={
+        # 16:30 IST — Daily MTM: refresh LTP and equity curve for all active strategies
+        "daily-equity-curve-update-1630": {
+            "task": "strategy_builder.daily_equity_curve_update",
+            "schedule": crontab(hour=16, minute=30, day_of_week="mon-fri"),
+        },
+        # 16:45 IST — Rebalance preparation (weekly last / monthly last trading day)
+        "prepare-live-rebalances-1645": {
+            "task": "strategy_builder.prepare_live_rebalances",
+            "schedule": crontab(hour=16, minute=45, day_of_week="mon-fri"),
+        },
+    },
 )

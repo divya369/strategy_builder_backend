@@ -30,6 +30,8 @@ logger = logging.getLogger(__name__)
 
 # ── Paths to bypass (no rate limiting) ────────────────────────────────────────
 BYPASS_PATHS = frozenset({"/docs", "/redoc", "/openapi.json"})
+# Suffixes that should bypass rate limiting (e.g. broker postbacks)
+BYPASS_SUFFIXES = ("/publisher/postback",)
 
 
 class RateLimitMiddleware(BaseHTTPMiddleware):
@@ -50,8 +52,10 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         if not settings.RATE_LIMIT_ENABLED:
             return await call_next(request)
 
-        # ── Bypass OPTIONS and documentation paths ────────────────────────────
+        # ── Bypass OPTIONS, documentation paths, and broker postbacks ─────────
         if request.method == "OPTIONS" or request.url.path in BYPASS_PATHS:
+            return await call_next(request)
+        if any(request.url.path.endswith(s) for s in BYPASS_SUFFIXES):
             return await call_next(request)
 
         # ── Extract client IP ─────────────────────────────────────────────────

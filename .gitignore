@@ -2,6 +2,7 @@ start-dev.bat
 venv
 scripts
 frontend
+tests
 .env
 
 # Python cache

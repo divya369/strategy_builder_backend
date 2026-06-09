@@ -29,6 +29,11 @@ class APIKeyMiddleware(BaseHTTPMiddleware):
         if request.url.path in ("/docs", "/redoc", "/openapi.json"):
             return await call_next(request)
 
+        # Allow Kite Publisher postback through — it has its own security
+        # (checksum verification + client_id lock in the service layer)
+        if request.url.path.endswith("/publisher/postback"):
+            return await call_next(request)
+
         auth_header: str | None = request.headers.get("Authorization")
 
         if not auth_header:
