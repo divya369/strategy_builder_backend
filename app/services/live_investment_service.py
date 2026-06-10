@@ -1579,9 +1579,14 @@ class LiveInvestmentService:
         count = 0
         for strategy in strategies:
             if should_prepare_rebalance(TODAY, strategy.rebalance_frequency):
-                logger.info("[Rebalance] Preparing strategy %s | freq=%s", strategy.id, strategy.rebalance_frequency)
-                LiveInvestmentService.prepare_rebalance(db, strategy.id, TODAY)
-                count += 1
+                try:
+                    logger.info("[Rebalance] Preparing strategy %s | freq=%s", strategy.id, strategy.rebalance_frequency)
+                    LiveInvestmentService.prepare_rebalance(db, strategy.id, TODAY)
+                    count += 1
+                except Exception:
+                    logger.exception("[Rebalance] Error preparing strategy %s", strategy.id)
+                    db.rollback()
+                    continue
         logger.info("[Rebalance] Prepared %d strategies for %s", count, TODAY)
         return count
 
@@ -1645,8 +1650,7 @@ class LiveInvestmentService:
                     update_df_to_db(db, sell_df, LiveSellStock)
                     update_df_to_db(db, circuit_df, LiveCircuitStock)
 
-                # Step 2: Refresh LTP for all active holdings
-                tradelog_df = update_tradelog_ltp(TODAY, f"({strategy.id})", tradelog_df)
+                # Step 2: Save tradelog (LTP already refreshed inside update_tradelog)
                 upsert_df_to_db(db, tradelog_df, LiveTradelog)
 
                 if tradelog_df.empty:

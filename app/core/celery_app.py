@@ -62,3 +62,18 @@ celery_app.conf.update(
         },
     },
 )
+
+
+# ── File-based logging for Celery workers ─────────────────────────────────
+# after_setup_logger fires once per worker process, AFTER Celery sets up
+# its own console/file handlers. setup_logging() only ADDS our daily-folder
+# file handlers — it does not touch Celery's existing handlers.
+
+from celery.signals import after_setup_logger   # noqa: E402
+
+
+@after_setup_logger.connect
+def _on_after_setup_logger(**kwargs):
+    from app.core.logging_config import setup_logging
+    setup_logging()
+

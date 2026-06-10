@@ -79,9 +79,12 @@ class Settings:
     RATE_LIMIT_SCREENERS_WINDOW_SECONDS: int = int(os.getenv("RATE_LIMIT_SCREENERS_WINDOW_SECONDS", "60"))
 
     # ── Broker API Keys ───────────────────────────────────────────────────
+    # Zerodha login credentials (used by daily token refresh cron only)
+    ZERODHA_USER_ID: str = os.getenv("ZERODHA_USER_ID", "")
+    ZERODHA_PASSWORD: str = os.getenv("ZERODHA_PASSWORD", "")
     ZERODHA_API_KEY: str = os.getenv("ZERODHA_API_KEY", "")
     ZERODHA_API_SECRET: str = os.getenv("ZERODHA_API_SECRET", "")
-    ZERODHA_ACCESS_TOKEN: str = os.getenv("ZERODHA_ACCESS_TOKEN", "")
+    ZERODHA_TOTP: str = os.getenv("ZERODHA_TOTP", "")
 
     @property
     def sqlalchemy_database_uri(self) -> str:
