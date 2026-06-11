@@ -524,7 +524,7 @@ def get_strategy_dashboard(live_id: UUID, db: Session = Depends(get_db)):
     # Latest equity curve point
     latest_eq = db.query(LiveEquityCurve).filter(
         LiveEquityCurve.automate_equity_ra_id == live_id,
-    ).order_by(LiveEquityCurve.date.desc()).first()
+    ).order_by(LiveEquityCurve.date.desc(), LiveEquityCurve.total_days.desc()).first()
     latest_equity_curve = None
     if latest_eq:
         latest_equity_curve = EquityCurvePointResponse(
