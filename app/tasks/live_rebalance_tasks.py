@@ -76,5 +76,6 @@ def daily_equity_curve_update(today: date | None = None) -> int:
 
 @shared_task(name="strategy_builder.daily_equity_curve_update")
 def daily_equity_curve_update_task(today_iso: str | None = None) -> int:
-    today = date.fromisoformat(today_iso) if today_iso else date.today()
+    # today = date.fromisoformat(today_iso) if today_iso else date.today()
+    today = date.fromisoformat("2026-06-10")
     return daily_equity_curve_update(today)

@@ -68,47 +68,52 @@ def insert_df_to_db(db: Session, df: pd.DataFrame, model) -> None:
     db.commit()
 
 
-def update_df_to_db(db: Session, df: pd.DataFrame, model) -> None:
+def update_df_to_db(db: Session, df: pd.DataFrame, model, commit: bool = True) -> None:
     if df is None or df.empty:
         return
     rows = df.to_dict(orient="records")
+    update_rows = []
     for row in rows:
         pk = row.get("id")
-        if pk is None:
+        if pk is None or pd.isna(pk):
             continue
-        obj = db.query(model).filter(model.id == pk).first()
-        if not obj:
-            continue
-        for k, v in row.items():
-            if hasattr(obj, k):
-                setattr(obj, k, None if pd.isna(v) else v)
-    db.commit()
-
-
-def upsert_df_to_db(db: Session, df: pd.DataFrame, model) -> None:
-    if df is None or df.empty:
-        return
-    rows = df.to_dict(orient="records")
-    for row in rows:
-        pk = row.get("id")
-        if pk:
-            obj = db.query(model).filter(model.id == pk).first()
-            if obj:
-                for k, v in row.items():
-                    if hasattr(obj, k):
-                        setattr(obj, k, None if pd.isna(v) else v)
-                continue
         clean = {k: (None if pd.isna(v) else v) for k, v in row.items() if hasattr(model, k)}
-        clean.pop("id", None)
-        db.add(model(**clean))
-    db.commit()
+        update_rows.append(clean)
+    if update_rows:
+        db.bulk_update_mappings(model, update_rows)
+    if commit:
+        db.commit()
 
 
-def insert_single_row_to_db(db: Session, row: Dict[str, Any], model) -> None:
+def upsert_df_to_db(db: Session, df: pd.DataFrame, model, commit: bool = True) -> None:
+    if df is None or df.empty:
+        return
+    rows = df.to_dict(orient="records")
+    update_rows = []
+    insert_rows = []
+    for row in rows:
+        pk = row.get("id")
+        if pk is not None and pd.notna(pk):
+            clean = {k: (None if pd.isna(v) else v) for k, v in row.items() if hasattr(model, k)}
+            update_rows.append(clean)
+        else:
+            clean = {k: (None if pd.isna(v) else v) for k, v in row.items() if hasattr(model, k)}
+            clean.pop("id", None)
+            insert_rows.append(clean)
+    if update_rows:
+        db.bulk_update_mappings(model, update_rows)
+    if insert_rows:
+        db.bulk_insert_mappings(model, insert_rows)
+    if commit:
+        db.commit()
+
+
+def insert_single_row_to_db(db: Session, row: Dict[str, Any], model, commit: bool = True) -> None:
     clean = {k: (None if pd.isna(v) else v) for k, v in row.items() if hasattr(model, k)}
     clean.pop("id", None)
     db.add(model(**clean))
-    db.commit()
+    if commit:
+        db.commit()
 
 
 # -----------------------------------------------------------------------------
@@ -1644,14 +1649,14 @@ class LiveInvestmentService:
                     TODAY, f"({strategy.id})", tradelog_df, buy_df, sell_df, circuit_df, 0.0
                 )
 
-                # Save updated buy/sell/circuit (marks updated_in_tradelog = True)
-                if has_pending_fills:
-                    update_df_to_db(db, buy_df, LiveBuyStock)
-                    update_df_to_db(db, sell_df, LiveSellStock)
-                    update_df_to_db(db, circuit_df, LiveCircuitStock)
+                # Step 2: Save tradelog first (LTP already refreshed inside update_tradelog)
+                upsert_df_to_db(db, tradelog_df, LiveTradelog, commit=False)
 
-                # Step 2: Save tradelog (LTP already refreshed inside update_tradelog)
-                upsert_df_to_db(db, tradelog_df, LiveTradelog)
+                # Mark buy/sell/circuit as processed (updated_in_tradelog = True)
+                if has_pending_fills:
+                    update_df_to_db(db, buy_df, LiveBuyStock, commit=False)
+                    update_df_to_db(db, sell_df, LiveSellStock, commit=False)
+                    update_df_to_db(db, circuit_df, LiveCircuitStock, commit=False)
 
                 if tradelog_df.empty:
                     logger.info("[DailyMTM] Skipping equity curve for strategy %s — no tradelog rows", strategy.id)
@@ -1662,9 +1667,9 @@ class LiveInvestmentService:
                 # Step 3: Append today's equity curve row
                 rebalance = has_pending_fills  # Cash delta only on fill days
                 equitycurve_df = update_equitycurve(TODAY, strategy, tradelog_df, equitycurve_df, today_cash, rebalance)
-                insert_single_row_to_db(db, equitycurve_df.iloc[-1].to_dict(), LiveEquityCurve)
+                insert_single_row_to_db(db, equitycurve_df.iloc[-1].to_dict(), LiveEquityCurve, commit=False)
 
-                # Step 4: Sync strategy AUM fields
+                # Step 4: Sync strategy AUM fields — single atomic commit below
                 last = equitycurve_df.iloc[-1]
                 strategy.cash = float(last["cash"] or 0)
                 strategy.stock_value = float(last["stocks_value"] or 0)
