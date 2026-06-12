@@ -86,6 +86,11 @@ class Settings:
     ZERODHA_API_SECRET: str = os.getenv("ZERODHA_API_SECRET", "")
     ZERODHA_TOTP: str = os.getenv("ZERODHA_TOTP", "")
 
+    # ── Email / Notifications (Resend) ────────────────────────────────────
+    RESEND_API_KEY: str = os.getenv("RESEND_API_KEY", "")
+    EMAIL_FROM: str = os.getenv("EMAIL_FROM", "EquityCase <noreply@equitycase.com>")
+    FRONTEND_BASE_URL: str = os.getenv("FRONTEND_BASE_URL", "https://www.equitycase.com")
+
     @property
     def sqlalchemy_database_uri(self) -> str:
         return (

@@ -20,3 +20,8 @@ email-validator
 # Celery + Redis (background backtest execution)
 celery>=5.3
 redis>=5.0
+
+# Email Notifications
+jinja2
+resend
+pytz

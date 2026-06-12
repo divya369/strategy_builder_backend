@@ -180,6 +180,7 @@ def go_live(payload: GoLiveRequest, db: Session = Depends(get_db), _mkt=Depends(
     running_statuses = {
         LiveStatus.PENDING_USER_APPROVAL, LiveStatus.ACTIVE,
         LiveStatus.REBALANCE_READY, LiveStatus.REBALANCE_PENDING_USER_APPROVAL,
+        LiveStatus.REBALANCE_SELL_COMPLETE,
         LiveStatus.EXIT_PENDING_USER_APPROVAL,
     }
     duplicate = db.query(LiveStrategy).filter(
@@ -298,8 +299,13 @@ def prepare_rebalance(live_id: UUID, db: Session = Depends(get_db), _mkt=Depends
 
 
 @router.post("/{live_id}/rebalance/trade-now", response_model=TradeNowResponse)
-def rebalance_trade_now(live_id: UUID, db: Session = Depends(get_db), _mkt=Depends(require_market_open)):
-    basket = LiveInvestmentService.trade_now(db, live_id, "REBALANCE")
+def rebalance_trade_now(
+    live_id: UUID,
+    side: str = Query("SELL", pattern="^(ALL|SELL|BUY)$"),
+    db: Session = Depends(get_db),
+    _mkt=Depends(require_market_open),
+):
+    basket = LiveInvestmentService.trade_now(db, live_id, "REBALANCE", side=side)
     strategy = db.query(LiveStrategy).filter(LiveStrategy.id == live_id).first()
     return TradeNowResponse(
         live_id=live_id,

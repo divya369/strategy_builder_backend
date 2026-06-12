@@ -47,6 +47,39 @@ def prepare_strategy_builder_live_rebalances_task(today_iso: str | None = None) 
     return prepare_strategy_builder_live_rebalances(today)
 
 
+def send_rebalance_reminder_emails(today: date | None = None) -> int:
+    """
+    Run from ~8:30 AM IST cronjob on trading days.
+
+    Re-sends the rebalance notification email to users whose strategies
+    are still in REBALANCE_READY (they haven't executed yet).
+    """
+    setup_logging()
+    today = today or date.today()
+
+    if not is_trading_day(today):
+        rebal_logger.info("[Reminder] %s is a non-trading day, skipping reminders", today)
+        return 0
+
+    rebal_logger.info("[Reminder] Starting send_rebalance_reminder_emails for %s", today)
+    db = SessionLocal()
+    try:
+        count = LiveInvestmentService.send_pending_rebalance_reminders(db, today)
+        rebal_logger.info("[Reminder] Completed — sent %d reminders for %s", count, today)
+        return count
+    except Exception:
+        rebal_logger.exception("[Reminder] Fatal error in send_rebalance_reminder_emails")
+        raise
+    finally:
+        db.close()
+
+
+@shared_task(name="strategy_builder.send_rebalance_reminders")
+def send_rebalance_reminder_emails_task(today_iso: str | None = None) -> int:
+    today = date.fromisoformat(today_iso) if today_iso else date.today()
+    return send_rebalance_reminder_emails(today)
+
+
 def daily_equity_curve_update(today: date | None = None) -> int:
     """
     Run from 16:30 cron/manual job.

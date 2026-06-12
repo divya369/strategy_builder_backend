@@ -47,6 +47,7 @@ from app.models.live_investment import (
 from app.services.screener_execution_service import screener_execution_service
 from app.core.trading_calendar import next_trading_day, should_prepare_rebalance, next_rebalance_prepare_date
 from app.services.broker_publishers import get_publisher_adapter
+from app.core.config import settings
 
 logger = logging.getLogger(__name__)
 
@@ -321,18 +322,30 @@ def build_publisher_payload(strategy: LiveStrategy, buy_df: pd.DataFrame, sell_d
     return adapter.build_payload(strategy=strategy, buy_df=buy_df, sell_df=sell_df)
 
 
-def assign_publisher_tags(db: Session, strategy: LiveStrategy, basket_type: str) -> LivePublisherBasket:
+def assign_publisher_tags(db: Session, strategy: LiveStrategy, basket_type: str, side: str = "ALL") -> LivePublisherBasket:
     """Equivalent of 09:15 direct order placement, but only creates broker-specific Publisher/offsite payload.
 
     Important broker lock rule:
     - Strategy already has broker_account_id / broker / broker_account_label locked from Go Live.
     - Rebalance and Exit never accept broker selection again.
     - This function always uses the locked broker adapter.
+
+    side parameter (only used for REBALANCE basket_type):
+    - "ALL"  — include both buy and sell orders (default, used by INITIAL/EXIT)
+    - "SELL" — include only sell orders (rebalance step 1)
+    - "BUY"  — include only buy orders (rebalance step 2, after sells complete)
     """
+    # Resolve the effective basket_type for storage (e.g., REBALANCE_SELL, REBALANCE_BUY)
+    effective_basket_type = basket_type
+    if basket_type == "REBALANCE" and side in ("SELL", "BUY"):
+        effective_basket_type = f"REBALANCE_{side}"
+
     # Guard: prevent double Trade Now — return existing pending basket if any
+    # Must check by effective_basket_type so BUY request doesn't return old SELL basket
     existing_basket = db.query(LivePublisherBasket).filter(
         LivePublisherBasket.automate_equity_ra_id == strategy.id,
         LivePublisherBasket.status == "PENDING_USER_APPROVAL",
+        LivePublisherBasket.basket_type == effective_basket_type,
     ).order_by(LivePublisherBasket.created_at.desc()).first()
     if existing_basket:
         return existing_basket
@@ -357,6 +370,28 @@ def assign_publisher_tags(db: Session, strategy: LiveStrategy, basket_type: str)
                 sell_df.at[i, "publisher_tag"] = _publisher_tag(strategy.id, "SELL", int(row["id"]))
         update_df_to_db(db, sell_df, LiveSellStock)
 
+    # ── Side filtering for split rebalance ────────────────────────────────
+    if side == "SELL":
+        buy_df = buy_df.iloc[0:0]  # Empty — only sell orders in this basket
+    elif side == "BUY":
+        # Guard: BUY side only allowed after all sell orders are complete
+        # Check for any sell orders that are NOT in a terminal state
+        # (broker_status is NULL means not yet sent/no postback received)
+        pending_sell = db.query(LiveSellStock).filter(
+            LiveSellStock.automate_equity_ra_id == strategy.id,
+            LiveSellStock.updated_in_tradelog == False,
+            or_(
+                LiveSellStock.broker_status.is_(None),
+                ~LiveSellStock.broker_status.in_(["COMPLETE", "REJECTED", "CANCELLED"]),
+            ),
+        ).count()
+        if pending_sell > 0:
+            raise HTTPException(
+                status_code=400,
+                detail="Please complete sell orders before placing buy orders.",
+            )
+        sell_df = sell_df.iloc[0:0]  # Empty — only buy orders in this basket
+
     payload = build_publisher_payload(strategy, buy_df, sell_df)
     if not payload.get("basket") and not payload.get("orders"):
         raise HTTPException(status_code=400, detail="No pending orders available for Publisher basket.")
@@ -365,16 +400,16 @@ def assign_publisher_tags(db: Session, strategy: LiveStrategy, basket_type: str)
         automate_equity_ra_id=strategy.id,
         broker_account_id=getattr(strategy, "broker_account_id", None),
         broker=strategy.broker,
-        basket_key=f"{str(strategy.id)[:8]}-{basket_type}-{uuid.uuid4().hex[:8]}",
-        basket_type=basket_type,
+        basket_key=f"{str(strategy.id)[:8]}-{effective_basket_type}-{uuid.uuid4().hex[:8]}",
+        basket_type=effective_basket_type,
         status="PENDING_USER_APPROVAL",
         publisher_payload=payload,
     )
     db.add(basket)
 
-    if basket_type == "REBALANCE":
+    if effective_basket_type in ("REBALANCE", "REBALANCE_SELL", "REBALANCE_BUY"):
         strategy.status = LiveStatus.REBALANCE_PENDING_USER_APPROVAL
-    elif basket_type == "EXIT":
+    elif effective_basket_type == "EXIT":
         strategy.status = LiveStatus.EXIT_PENDING_USER_APPROVAL
     else:
         strategy.status = LiveStatus.PENDING_USER_APPROVAL
@@ -1071,16 +1106,102 @@ def _delete_unapproved_preview_rows(db: Session, strategy_id, *, include_sell: b
     db.commit()
 
 
-def _validate_trade_now_status(strategy: LiveStrategy, basket_type: str) -> None:
-    expected = {
-        "INITIAL": {LiveStatus.PREVIEW_READY, LiveStatus.ALL_REJECTED},
-        "REBALANCE": {LiveStatus.REBALANCE_READY},
-        "EXIT": {LiveStatus.EXIT_PENDING_USER_APPROVAL},
-    }.get((basket_type or "INITIAL").upper(), set())
+def _validate_trade_now_status(strategy: LiveStrategy, basket_type: str, side: str = "ALL") -> None:
+    if basket_type == "REBALANCE" and side == "BUY":
+        expected = {LiveStatus.REBALANCE_SELL_COMPLETE, LiveStatus.REBALANCE_READY}
+    elif basket_type == "REBALANCE" and side == "SELL":
+        expected = {LiveStatus.REBALANCE_READY}
+    else:
+        expected = {
+            "INITIAL": {LiveStatus.PREVIEW_READY, LiveStatus.ALL_REJECTED},
+            "REBALANCE": {LiveStatus.REBALANCE_READY},
+            "EXIT": {LiveStatus.EXIT_PENDING_USER_APPROVAL},
+        }.get((basket_type or "INITIAL").upper(), set())
     if expected and strategy.status not in expected:
         current = strategy.status.value if hasattr(strategy.status, "value") else str(strategy.status)
         expected_str = ", ".join(s.value for s in expected)
         raise HTTPException(status_code=400, detail=f"Cannot create {basket_type} basket when status={current}. Expected one of: {expected_str}.")
+
+
+# -----------------------------------------------------------------------------
+# Notification helpers
+# -----------------------------------------------------------------------------
+
+def _gather_and_notify_rebalance(db: Session, strategy: LiveStrategy, TODAY: date) -> None:
+    """
+    Gather rebalance details from buy/sell tables and fire notification.
+    This is fire-and-forget — failures are logged but never raised.
+    """
+    try:
+        from app.models.user import User
+        from app.services.notifications import notify_all
+
+        user = db.query(User).filter(User.id == strategy.user_id).first()
+        if not user or not user.email:
+            logger.warning("[Notify] No user/email found for strategy %s — skipping notification", strategy.id)
+            return
+
+        # Sells = stocks being REMOVED in this rebalance
+        sells = db.query(LiveSellStock).filter(
+            LiveSellStock.automate_equity_ra_id == strategy.id,
+            LiveSellStock.date == TODAY,
+            LiveSellStock.updated_in_tradelog == False,
+        ).all()
+
+        # Buys = stocks being ADDED in this rebalance
+        buys = db.query(LiveBuyStock).filter(
+            LiveBuyStock.automate_equity_ra_id == strategy.id,
+            LiveBuyStock.date == TODAY,
+            LiveBuyStock.updated_in_tradelog == False,
+            or_(LiveBuyStock.order_id.is_(None), LiveBuyStock.order_id == ""),
+        ).all()
+
+        changes = []
+        for sell in sells:
+            changes.append({
+                "tradingsymbol": sell.tradingsymbol,
+                "action": "SELL",
+                "qty": int(sell.qty),
+            })
+        for buy in buys:
+            changes.append({
+                "tradingsymbol": buy.tradingsymbol,
+                "action": "BUY",
+                "qty": int(buy.qty),
+            })
+
+        if not changes:
+            logger.info("[Notify] No buy/sell changes for strategy %s — skipping notification", strategy.id)
+            return
+
+        from datetime import datetime
+        import pytz
+        ist = pytz.timezone("Asia/Kolkata")
+        
+        # Execution date from DB — show "Today" if email is sent on the execution day itself
+        if strategy.next_rebalance_date and strategy.next_rebalance_date == TODAY:
+            rebalance_date = "Today"
+        elif strategy.next_rebalance_date:
+            rebalance_date = strategy.next_rebalance_date.strftime("%d %b %Y")
+        else:
+            rebalance_date = ""
+        timestamp = datetime.now(ist).strftime("%d %b %Y, %I:%M %p IST")
+
+        dashboard_url = f"{settings.FRONTEND_BASE_URL}/live-investment/{strategy.id}"
+
+        notify_all(
+            "send_rebalance_ready",
+            user_email=user.email,
+            user_name=user.full_name,
+            strategy_name=strategy.strategy_name or "Unnamed Strategy",
+            strategy_id=str(strategy.id),
+            changes=changes,
+            dashboard_url=dashboard_url,
+            timestamp=timestamp,
+            rebalance_date=rebalance_date,
+        )
+    except Exception:
+        logger.exception("[Notify] Rebalance notification failed for strategy %s — non-blocking", strategy.id)
 
 
 # -----------------------------------------------------------------------------
@@ -1136,7 +1257,7 @@ class LiveInvestmentService:
             subscription_active=False,
             status=LiveStatus.DRAFT,
             start_date=TODAY,
-            next_rebalance_date=next_rebalance_prepare_date(TODAY, rebalance_frequency),
+            next_rebalance_date=next_trading_day(next_rebalance_prepare_date(TODAY, rebalance_frequency)),
             filters_json=version.filters_json,
             universe_json=version.universe_json,
             ranking_json=version.ranking_json,
@@ -1177,11 +1298,11 @@ class LiveInvestmentService:
         return strategy
 
     @staticmethod
-    def trade_now(db: Session, strategy_id, basket_type: str = "INITIAL") -> LivePublisherBasket:
+    def trade_now(db: Session, strategy_id, basket_type: str = "INITIAL", side: str = "ALL") -> LivePublisherBasket:
         strategy = db.query(LiveStrategy).filter(LiveStrategy.id == strategy_id).first()
         if not strategy:
             raise HTTPException(status_code=404, detail="Live strategy not found")
-        _validate_trade_now_status(strategy, basket_type)
+        _validate_trade_now_status(strategy, basket_type, side)
 
         # Auto-retry for ALL_REJECTED: clean up old rejected rows + regenerate fresh buy rows
         if strategy.status == LiveStatus.ALL_REJECTED and basket_type == "INITIAL":
@@ -1199,7 +1320,7 @@ class LiveInvestmentService:
             )
             insert_df_to_db(db, buy_df, LiveBuyStock)
 
-        return assign_publisher_tags(db, strategy, basket_type)
+        return assign_publisher_tags(db, strategy, basket_type, side)
 
     @staticmethod
     def prepare_rebalance(db: Session, strategy_id, TODAY: Optional[date] = None) -> LiveStrategy:
@@ -1207,6 +1328,10 @@ class LiveInvestmentService:
         strategy = db.query(LiveStrategy).filter(LiveStrategy.id == strategy_id).first()
         if not strategy:
             raise HTTPException(status_code=404, detail="Live strategy not found")
+        if strategy.status in {LiveStatus.REBALANCE_SELL_COMPLETE, LiveStatus.REBALANCE_PENDING_USER_APPROVAL}:
+            # Sell basket already sent/completed — buy/sell rows already exist.
+            # Just return the strategy so frontend can render the preview page.
+            return strategy
         if strategy.status not in {LiveStatus.ACTIVE, LiveStatus.REBALANCE_READY}:
             raise HTTPException(status_code=400, detail=f"Strategy must be ACTIVE or REBALANCE_READY to prepare rebalance. Current status={strategy.status.value}")
         _delete_unapproved_preview_rows(db, strategy.id, include_sell=True)
@@ -1233,6 +1358,10 @@ class LiveInvestmentService:
         strategy.status = LiveStatus.REBALANCE_READY
         db.commit()
         db.refresh(strategy)
+
+        # Fire-and-forget rebalance notification (email)
+        _gather_and_notify_rebalance(db, strategy, TODAY)
+
         return strategy
 
     @staticmethod
@@ -1528,8 +1657,16 @@ class LiveInvestmentService:
                     # Stay in EXIT_PENDING so user can retry exit
                     pass  # status stays EXIT_PENDING_USER_APPROVAL
                 elif previous_status == LiveStatus.REBALANCE_PENDING_USER_APPROVAL:
-                    # Go back to REBALANCE_READY so user can retry
-                    strategy.status = LiveStatus.REBALANCE_READY
+                    # Go back to appropriate retry status based on basket type
+                    if latest_basket and latest_basket.basket_type == "REBALANCE_SELL":
+                        # Sell basket all rejected → go back to REBALANCE_READY so user can retry sell
+                        strategy.status = LiveStatus.REBALANCE_READY
+                    elif latest_basket and latest_basket.basket_type == "REBALANCE_BUY":
+                        # Buy basket all rejected → go back to REBALANCE_SELL_COMPLETE so user can retry buy
+                        strategy.status = LiveStatus.REBALANCE_SELL_COMPLETE
+                    else:
+                        # Old-style REBALANCE (ALL) basket → go back to REBALANCE_READY
+                        strategy.status = LiveStatus.REBALANCE_READY
                 else:
                     # Initial basket — go to ALL_REJECTED (user can retry Trade Now)
                     strategy.status = LiveStatus.ALL_REJECTED
@@ -1538,10 +1675,16 @@ class LiveInvestmentService:
             elif previous_status == LiveStatus.EXIT_PENDING_USER_APPROVAL:
                 strategy.status = LiveStatus.EXITED
                 strategy.subscription_active = False
+            elif latest_basket and latest_basket.basket_type == "REBALANCE_SELL":
+                # Sell basket complete → transition to REBALANCE_SELL_COMPLETE (enable Buy button)
+                strategy.status = LiveStatus.REBALANCE_SELL_COMPLETE
+                logger.info("[Postback] REBALANCE_SELL complete | strategy=%s — now awaiting BUY basket",
+                            strategy.id)
             else:
+                # INITIAL, REBALANCE (ALL), REBALANCE_BUY, EXIT — go to ACTIVE
                 strategy.status = LiveStatus.ACTIVE
                 strategy.subscription_active = True
-                strategy.next_rebalance_date = next_rebalance_prepare_date(TODAY, strategy.rebalance_frequency)
+                strategy.next_rebalance_date = next_trading_day(next_rebalance_prepare_date(TODAY, strategy.rebalance_frequency))
 
             # Update Publisher basket status
             if latest_basket:
@@ -1593,6 +1736,31 @@ class LiveInvestmentService:
                     db.rollback()
                     continue
         logger.info("[Rebalance] Prepared %d strategies for %s", count, TODAY)
+        return count
+
+    @staticmethod
+    def send_pending_rebalance_reminders(db: Session, TODAY: Optional[date] = None) -> int:
+        """Morning reminder — re-send rebalance email for strategies still in REBALANCE_READY.
+
+        Run this from a cronjob at ~8:30 AM IST on trading days.
+        It finds all strategies where the user hasn't executed the rebalance yet
+        and sends them the same notification email as a reminder.
+        """
+        TODAY = TODAY or date.today()
+        strategies = db.query(LiveStrategy).filter(
+            LiveStrategy.status == LiveStatus.REBALANCE_READY,
+            LiveStrategy.subscription_active == True,
+        ).all()
+        count = 0
+        for strategy in strategies:
+            try:
+                logger.info("[Reminder] Sending rebalance reminder for strategy %s", strategy.id)
+                _gather_and_notify_rebalance(db, strategy, TODAY)
+                count += 1
+            except Exception:
+                logger.exception("[Reminder] Error sending reminder for strategy %s", strategy.id)
+                continue
+        logger.info("[Reminder] Sent %d rebalance reminders for %s", count, TODAY)
         return count
 
     @staticmethod
