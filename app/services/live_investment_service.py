@@ -1131,15 +1131,31 @@ def _gather_and_notify_rebalance(db: Session, strategy: LiveStrategy, TODAY: dat
     """
     Gather rebalance details from buy/sell tables and fire notification.
     This is fire-and-forget — failures are logged but never raised.
+
+    User email is fetched from the equitycase DB (separate from screener_backtest_db)
+    because on the server the users table lives there.
     """
     try:
-        from app.models.user import User
+        from sqlalchemy import text
+        from app.core.database import EquitycaseSessionLocal
         from app.services.notifications import notify_all
 
-        user = db.query(User).filter(User.id == strategy.user_id).first()
-        if not user or not user.email:
-            logger.warning("[Notify] No user/email found for strategy %s — skipping notification", strategy.id)
+        # Fetch user email from equitycase DB (separate database)
+        ec_db = EquitycaseSessionLocal()
+        try:
+            row = ec_db.execute(
+                text("SELECT email FROM users WHERE id = :uid LIMIT 1"),
+                {"uid": str(strategy.user_id)},
+            ).fetchone()
+        finally:
+            ec_db.close()
+
+        if not row or not row.email:
+            logger.warning("[Notify] No user/email found in equitycase DB for user_id %s (strategy %s) — skipping notification", strategy.user_id, strategy.id)
             return
+
+        user_email = row.email
+        user_name = "Investor"  # Fallback since we only pull email now
 
         # Sells = stocks being REMOVED in this rebalance
         sells = db.query(LiveSellStock).filter(
@@ -1191,8 +1207,8 @@ def _gather_and_notify_rebalance(db: Session, strategy: LiveStrategy, TODAY: dat
 
         notify_all(
             "send_rebalance_ready",
-            user_email=user.email,
-            user_name=user.full_name,
+            user_email=user_email,
+            user_name=user_name,
             strategy_name=strategy.strategy_name or "Unnamed Strategy",
             strategy_id=str(strategy.id),
             changes=changes,

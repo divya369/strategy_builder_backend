@@ -27,6 +27,10 @@ class Settings:
     # This is the equity_ohlc database that holds all stock/index price history.
     EQUITY_OHLC_DB: str = os.getenv("EQUITY_OHLC_DB", "equity_ohlc")
 
+    # ── EquityCase main DB (users, auth, broker accounts — read-only from here) ──
+    # On server the users table lives in the equitycase DB, not screener_backtest_db.
+    EQUITYCASE_DB: str = os.getenv("EQUITYCASE_DB", "equitycase")
+
     # ── Security ──────────────────────────────────────────────────────────────
     SECRET_KEY: str = os.getenv("SECRET_KEY", "")
     API_KEY: str = os.getenv("API_KEY", "")
@@ -103,6 +107,13 @@ class Settings:
         return (
             f"postgresql://{self.POSTGRES_USER}:{self.POSTGRES_PASSWORD}"
             f"@{self.POSTGRES_SERVER}:{self.POSTGRES_PORT}/{self.EQUITY_OHLC_DB}"
+        )
+
+    @property
+    def equitycase_database_uri(self) -> str:
+        return (
+            f"postgresql://{self.POSTGRES_USER}:{self.POSTGRES_PASSWORD}"
+            f"@{self.POSTGRES_SERVER}:{self.POSTGRES_PORT}/{self.EQUITYCASE_DB}"
         )
 
 

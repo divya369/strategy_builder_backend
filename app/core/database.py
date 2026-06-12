@@ -35,6 +35,20 @@ equity_engine = create_engine(
 )
 EquitySessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=equity_engine)
 
+# ── EquityCase DB (equitycase) — read-only ────────────────────────────────
+# The main equitycase product DB holds the users table (with email, name)
+# which we query for sending notifications. Read-only from this service.
+equitycase_engine = create_engine(
+    settings.equitycase_database_uri,
+    pool_pre_ping=True,
+    pool_size=3,          # minimal — only used for user email lookups
+    max_overflow=5,
+    pool_timeout=30,
+    pool_recycle=1800,
+    execution_options={"isolation_level": "AUTOCOMMIT"},
+)
+EquitycaseSessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=equitycase_engine)
+
 
 # ── FastAPI dependency helpers ────────────────────────────────────────────────
 
@@ -54,3 +68,17 @@ def get_equity_db():
         yield db
     finally:
         db.close()
+
+
+def get_equitycase_db():
+    """Yields a read-only session for the equitycase DB (user lookups)."""
+    db = EquitycaseSessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+def dispose_engines():
+    engine.dispose()
+    equity_engine.dispose()
+    equitycase_engine.dispose()

@@ -77,6 +77,13 @@ async def lifespan(app: FastAPI):
     except Exception:
         logger.exception("[Shutdown] Error disposing equity DB engine")
 
+    try:
+        from app.core.database import equitycase_engine
+        equitycase_engine.dispose()
+        logger.info("[Shutdown] EquityCase DB engine disposed")
+    except Exception:
+        logger.exception("[Shutdown] Error disposing equitycase DB engine")
+
     # 2. Close Celery app (flushes pending results, closes broker connection)
     try:
         from app.core.celery_app import celery_app
