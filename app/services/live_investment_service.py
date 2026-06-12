@@ -1144,8 +1144,8 @@ def _gather_and_notify_rebalance(db: Session, strategy: LiveStrategy, TODAY: dat
         ec_db = EquitycaseSessionLocal()
         try:
             row = ec_db.execute(
-                text("SELECT email FROM users WHERE id = :uid LIMIT 1"),
-                {"uid": str(strategy.user_id)},
+                text('SELECT email FROM "user" WHERE id = :user_id LIMIT 1'),
+                {"user_id": str(strategy.user_id)},
             ).fetchone()
         finally:
             ec_db.close()

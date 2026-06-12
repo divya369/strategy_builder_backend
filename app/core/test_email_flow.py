@@ -4,7 +4,7 @@ import uuid
 from datetime import date, datetime
 
 # Add the project root to sys.path so we can import 'app'
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')))
 
 from sqlalchemy import text
 from app.core.database import EquitycaseSessionLocal
@@ -20,14 +20,14 @@ def test_email_flow(user_id=None):
             # Query specific user
             print(f"Querying equitycase DB for user_id: {user_id}...")
             row = ec_db.execute(
-                text("SELECT id, email FROM users WHERE id = :uid LIMIT 1"),
-                {"uid": user_id},
+                text('SELECT id, email FROM "user" WHERE id = :user_id LIMIT 1'),
+                {"user_id": user_id},
             ).fetchone()
         else:
             # Pick the first user we can find to test
             print("No user_id provided. Finding the first available user in equitycase DB...")
             row = ec_db.execute(
-                text("SELECT id, email FROM users WHERE email IS NOT NULL LIMIT 1")
+                text('SELECT id, email FROM "user" WHERE email IS NOT NULL LIMIT 1')
             ).fetchone()
             
         if not row:
