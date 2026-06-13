@@ -57,7 +57,18 @@ logger = logging.getLogger(__name__)
 # -----------------------------------------------------------------------------
 
 def model_df(db: Session, model, automate_equity_ra_id) -> pd.DataFrame:
-    q = db.query(model).filter(model.automate_equity_ra_id == automate_equity_ra_id).order_by(model.id.asc())
+    q = db.query(model).filter(model.automate_equity_ra_id == automate_equity_ra_id)
+    # Order chronologically by date when available, NOT by random UUID id.
+    # LiveEquityCurve can have multiple rows on the same date (initial + daily MTM),
+    # so use total_days as secondary sort. Other date-bearing models use date + id.
+    if hasattr(model, "date") and hasattr(model, "total_days"):
+        q = q.order_by(model.date.asc(), model.total_days.asc(), model.id.asc())
+    elif hasattr(model, "date"):
+        q = q.order_by(model.date.asc(), model.id.asc())
+    elif hasattr(model, "buy_date"):
+        q = q.order_by(model.buy_date.asc(), model.id.asc())
+    else:
+        q = q.order_by(model.id.asc())
     return pd.read_sql(q.statement, db.bind)
 
 
