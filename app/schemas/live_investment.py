@@ -60,6 +60,9 @@ class PreviewResponse(BaseModel):
     total_buy_amount: float
     total_sell_amount: float
     remaining_cash: float
+    broker: Optional[str] = None
+    broker_account_label: Optional[str] = None
+    broker_user_id: Optional[str] = None
 
 class TradeNowResponse(BaseModel):
     live_id: UUID

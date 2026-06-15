@@ -41,7 +41,11 @@ class ZerodhaPublisherAdapter(BrokerPublisherAdapter):
         ltp_map: Dict[str, float] = {}
 
         # Build instrument keys: "NSE:RELIANCE", "NSE:INFY", etc.
-        instrument_keys = [f"{exchange}:{sym}" for sym in symbols]
+        # Include the -BE suffix variant to capture Trade-to-Trade stocks as well.
+        instrument_keys = []
+        for sym in symbols:
+            instrument_keys.append(f"{exchange}:{sym}")
+            instrument_keys.append(f"{exchange}:{sym}-BE")
 
         # Chunk to stay within Kite's limit (max 1000, we use 500 for safety)
         for chunk_start in range(0, len(instrument_keys), _KITE_LTP_CHUNK_SIZE):
@@ -61,10 +65,15 @@ class ZerodhaPublisherAdapter(BrokerPublisherAdapter):
                 data = resp.json().get("data", {})
 
                 for inst_key, quote in data.items():
-                    # inst_key = "NSE:RELIANCE" → tradingsymbol = "RELIANCE"
+                    # inst_key = "NSE:RELIANCE" or "NSE:RELIANCE-BE" → tradingsymbol = "RELIANCE"
                     tradingsymbol = inst_key.split(":", 1)[-1] if ":" in inst_key else inst_key
+                    if tradingsymbol.endswith("-BE"):
+                        tradingsymbol = tradingsymbol[:-3]
+                    
                     last_price = quote.get("last_price")
                     if last_price is not None:
+                        # If a stock exists as both EQ and BE (rare), we take whichever returned a price.
+                        # If both returned, they overwrite, but usually only one is active.
                         ltp_map[tradingsymbol] = float(last_price)
 
             except requests.exceptions.RequestException as e:

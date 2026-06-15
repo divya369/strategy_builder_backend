@@ -142,6 +142,9 @@ def _build_preview_response(db: Session, obj: LiveStrategy) -> PreviewResponse:
         total_buy_amount=round(total_buy, 2),
         total_sell_amount=round(total_sell, 2),
         remaining_cash=round(remaining_cash, 2),
+        broker=obj.broker,
+        broker_account_label=obj.broker_account_label,
+        broker_user_id=obj.locked_client_id,
     )
 
 
@@ -296,6 +299,13 @@ def cancel_strategy(live_id: UUID, db: Session = Depends(get_db)):
 def prepare_rebalance(live_id: UUID, db: Session = Depends(get_db), _mkt=Depends(require_market_open)):
     obj = LiveInvestmentService.prepare_rebalance(db, live_id, date.today())
     return _build_preview_response(db, obj)
+
+
+@router.post("/{live_id}/rebalance/skip", response_model=LiveStrategyResponse)
+def skip_empty_rebalance(live_id: UUID, db: Session = Depends(get_db)):
+    """Skip an empty or midway rebalance and return strategy to ACTIVE status."""
+    obj = LiveInvestmentService.skip_empty_rebalance(db, live_id, date.today())
+    return serialize_strategy(obj)
 
 
 @router.post("/{live_id}/rebalance/trade-now", response_model=TradeNowResponse)

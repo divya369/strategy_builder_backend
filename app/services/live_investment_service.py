@@ -1196,8 +1196,7 @@ def _gather_and_notify_rebalance(db: Session, strategy: LiveStrategy, TODAY: dat
             })
 
         if not changes:
-            logger.info("[Notify] No buy/sell changes for strategy %s — skipping notification", strategy.id)
-            return
+            logger.info("[Notify] No buy/sell changes for strategy %s — sending empty notification", strategy.id)
 
         from datetime import datetime
         import pytz
@@ -1348,7 +1347,7 @@ class LiveInvestmentService:
         return assign_publisher_tags(db, strategy, basket_type, side)
 
     @staticmethod
-    def prepare_rebalance(db: Session, strategy_id, TODAY: Optional[date] = None) -> LiveStrategy:
+    def prepare_rebalance(db: Session, strategy_id, TODAY: Optional[date] = None, send_email: bool = False) -> LiveStrategy:
         TODAY = TODAY or date.today()
         strategy = db.query(LiveStrategy).filter(LiveStrategy.id == strategy_id).first()
         if not strategy:
@@ -1385,8 +1384,32 @@ class LiveInvestmentService:
         db.refresh(strategy)
 
         # Fire-and-forget rebalance notification (email)
-        _gather_and_notify_rebalance(db, strategy, TODAY)
+        if send_email:
+            _gather_and_notify_rebalance(db, strategy, TODAY)
 
+        return strategy
+
+    @staticmethod
+    def skip_empty_rebalance(db: Session, strategy_id, TODAY: Optional[date] = None) -> LiveStrategy:
+        TODAY = TODAY or date.today()
+        strategy = db.query(LiveStrategy).filter(LiveStrategy.id == strategy_id).first()
+        if not strategy:
+            raise HTTPException(status_code=404, detail="Live strategy not found")
+        
+        valid_statuses = {
+            LiveStatus.REBALANCE_READY, 
+            LiveStatus.REBALANCE_SELL_COMPLETE,
+            LiveStatus.REBALANCE_PENDING_USER_APPROVAL
+        }
+        if strategy.status not in valid_statuses:
+            current = strategy.status.value if hasattr(strategy.status, "value") else str(strategy.status)
+            raise HTTPException(status_code=400, detail=f"Cannot skip rebalance from status={current}")
+
+        # Reset to active and roll over date
+        strategy.status = LiveStatus.ACTIVE
+        strategy.next_rebalance_date = next_trading_day(next_rebalance_prepare_date(TODAY, strategy.rebalance_frequency))
+        db.commit()
+        db.refresh(strategy)
         return strategy
 
     @staticmethod
@@ -1754,7 +1777,7 @@ class LiveInvestmentService:
             if should_prepare_rebalance(TODAY, strategy.rebalance_frequency):
                 try:
                     logger.info("[Rebalance] Preparing strategy %s | freq=%s", strategy.id, strategy.rebalance_frequency)
-                    LiveInvestmentService.prepare_rebalance(db, strategy.id, TODAY)
+                    LiveInvestmentService.prepare_rebalance(db, strategy.id, TODAY, send_email=True)
                     count += 1
                 except Exception:
                     logger.exception("[Rebalance] Error preparing strategy %s", strategy.id)
@@ -1803,8 +1826,15 @@ class LiveInvestmentService:
         4. Sync strategy AUM fields
         """
         TODAY = TODAY or date.today()
+        # Include stuck rebalance statuses for auto-skip
+        valid_statuses = [
+            LiveStatus.ACTIVE,
+            LiveStatus.REBALANCE_READY,
+            LiveStatus.REBALANCE_SELL_COMPLETE,
+            LiveStatus.REBALANCE_PENDING_USER_APPROVAL
+        ]
         strategies = db.query(LiveStrategy).filter(
-            LiveStrategy.status == LiveStatus.ACTIVE,
+            LiveStrategy.status.in_(valid_statuses),
             LiveStrategy.subscription_active == True,
         ).all()
         count = 0
@@ -1869,6 +1899,18 @@ class LiveInvestmentService:
                 strategy.final_aum = float(last["aum"] or 0)
                 strategy.pnl = float(last["total_pnl"] or 0)
                 strategy.todays_pnl = float(last["strategy_daily_return"] or 0)
+
+                # Step 5: Auto-skip ignored or stuck rebalances
+                stuck_statuses = {
+                    LiveStatus.REBALANCE_READY,
+                    LiveStatus.REBALANCE_SELL_COMPLETE,
+                    LiveStatus.REBALANCE_PENDING_USER_APPROVAL
+                }
+                if strategy.status in stuck_statuses:
+                    logger.info("[Auto-Skip] Strategy %s missed rebalance (status=%s), resetting to ACTIVE", strategy.id, strategy.status.value if hasattr(strategy.status, "value") else strategy.status)
+                    strategy.status = LiveStatus.ACTIVE
+                    strategy.next_rebalance_date = next_trading_day(next_rebalance_prepare_date(TODAY, strategy.rebalance_frequency))
+
                 db.commit()
                 logger.info("[DailyMTM] Updated strategy %s | aum=%.2f | pending_fills=%s",
                             strategy.id, float(strategy.final_aum or 0), has_pending_fills)
