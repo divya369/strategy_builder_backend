@@ -21,7 +21,7 @@ depends_on: Union[str, Sequence[str], None] = None
 def upgrade() -> None:
     """Upgrade schema."""
     with op.get_context().autocommit_block():
-        op.execute("ALTER TYPE livestatus ADD VALUE IF NOT EXISTS 'REBALANCE_SELL_COMPLETE'")
+        op.execute("ALTER TYPE strategy_builder_live_status_enum ADD VALUE IF NOT EXISTS 'REBALANCE_SELL_COMPLETE'")
 
 
 def downgrade() -> None:
