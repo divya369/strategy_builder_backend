@@ -1171,14 +1171,12 @@ def _gather_and_notify_rebalance(db: Session, strategy: LiveStrategy, TODAY: dat
         # Sells = stocks being REMOVED in this rebalance
         sells = db.query(LiveSellStock).filter(
             LiveSellStock.automate_equity_ra_id == strategy.id,
-            LiveSellStock.date == TODAY,
             LiveSellStock.updated_in_tradelog == False,
         ).all()
 
         # Buys = stocks being ADDED in this rebalance
         buys = db.query(LiveBuyStock).filter(
             LiveBuyStock.automate_equity_ra_id == strategy.id,
-            LiveBuyStock.date == TODAY,
             LiveBuyStock.updated_in_tradelog == False,
             or_(LiveBuyStock.order_id.is_(None), LiveBuyStock.order_id == ""),
         ).all()
