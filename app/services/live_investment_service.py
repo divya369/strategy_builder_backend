@@ -353,10 +353,12 @@ def assign_publisher_tags(db: Session, strategy: LiveStrategy, basket_type: str,
 
     # Guard: prevent double Trade Now — return existing pending basket if any
     # Must check by effective_basket_type so BUY request doesn't return old SELL basket
+    # IMPORTANT: Only fetch baskets created TODAY to avoid returning abandoned baskets from past rebalances!
     existing_basket = db.query(LivePublisherBasket).filter(
         LivePublisherBasket.automate_equity_ra_id == strategy.id,
         LivePublisherBasket.status == "PENDING_USER_APPROVAL",
         LivePublisherBasket.basket_type == effective_basket_type,
+        func.date(LivePublisherBasket.created_at) == date.today(),
     ).order_by(LivePublisherBasket.created_at.desc()).first()
     if existing_basket:
         return existing_basket
