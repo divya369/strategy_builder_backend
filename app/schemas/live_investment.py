@@ -32,6 +32,7 @@ class GoLiveRequest(BaseModel):
 
 class LiveStrategyResponse(BaseModel):
     id: UUID
+    version_number: int
     status: str
     strategy_name: str
     portfolio_size: int
@@ -138,7 +139,7 @@ class LiveDashboardResponse(BaseModel):
 
 class LiveStrategyListItem(BaseModel):
     id: UUID
-    screener_version_id: Optional[UUID] = None
+    version_number: int
     status: str
     strategy_name: Optional[str] = None
     broker_user_id: Optional[str] = None

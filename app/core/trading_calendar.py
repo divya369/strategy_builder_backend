@@ -20,7 +20,7 @@ IST = ZoneInfo("Asia/Kolkata")
 
 # NSE market hours: 09:15:00 to 15:19:59
 MARKET_OPEN = time(9, 15, 0)
-MARKET_CLOSE = time(16, 19, 59)
+MARKET_CLOSE = time(17, 19, 59)
 
 
 # ── Mtime-based JSON caching (auto-reloads when file is edited) ────────────

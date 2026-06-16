@@ -87,6 +87,7 @@ def serialize_broker_account(obj: LiveBrokerAccount) -> BrokerAccountResponse:
 def serialize_strategy(obj: LiveStrategy) -> LiveStrategyResponse:
     return LiveStrategyResponse(
         id=obj.id,
+        version_number=obj.screener_version.version_number if obj.screener_version else 0,
         status=obj.status.value if hasattr(obj.status, "value") else str(obj.status),
         strategy_name=obj.strategy_name,
         portfolio_size=obj.portfolio_size,
@@ -388,7 +389,7 @@ def list_strategies(
     return [
         LiveStrategyListItem(
             id=r.id,
-            screener_version_id=r.screener_version_id,
+            version_number=r.screener_version.version_number if r.screener_version else 0,
             status=r.status.value if hasattr(r.status, "value") else str(r.status),
             strategy_name=r.strategy_name,
             broker_user_id=r.locked_client_id,

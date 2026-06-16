@@ -13,6 +13,7 @@ from sqlalchemy import (
     Column, Integer, String, Float, Boolean, Date, DateTime, ForeignKey,
     Enum, Text, text, func, UniqueConstraint
 )
+from sqlalchemy.orm import relationship
 from sqlalchemy.dialects.postgresql import UUID, JSONB
 from app.models.base import Base
 
@@ -80,6 +81,7 @@ class LiveStrategy(Base):
     user_id = Column(UUID(as_uuid=True), nullable=False, index=True)
     screener_id = Column(UUID(as_uuid=True), ForeignKey("screeners.id", ondelete="SET NULL"), nullable=True, index=True)
     screener_version_id = Column(UUID(as_uuid=True), ForeignKey("screener_versions.id", ondelete="SET NULL"), nullable=False, index=True)
+    screener_version = relationship("ScreenerVersion", primaryjoin="LiveStrategy.screener_version_id == ScreenerVersion.id")
 
     # User-provided live params at Go Live time. Do NOT copy these from backtest.
     strategy_name = Column(String(255), nullable=True)
