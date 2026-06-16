@@ -180,10 +180,7 @@ def next_week_last_trading_day(d: date) -> date:
 def next_month_last_trading_day(d: date) -> date:
     """Next monthly rebalance preparation date after d."""
     year = d.year
-    month = d.month + 1
-    if month == 13:
-        year += 1
-        month = 1
+    month = d.month
     while True:
         next_month = month + 1
         next_year = year

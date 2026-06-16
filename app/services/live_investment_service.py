@@ -29,7 +29,7 @@ import pandas as pd
 import numpy as np
 from fastapi import HTTPException
 from sqlalchemy.orm import Session
-from sqlalchemy import or_
+from sqlalchemy import or_, func
 
 from app.core.database import equity_engine
 from app.models.screener import ScreenerVersion
