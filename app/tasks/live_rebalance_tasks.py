@@ -100,6 +100,12 @@ def daily_equity_curve_update(today: date | None = None) -> int:
     try:
         count = LiveInvestmentService.daily_equity_curve_update(db, today)
         mtm_logger.info("[DailyMTM] Completed — updated %d strategies for %s", count, today)
+
+        # Auto-cancel strategies stuck in PENDING_USER_APPROVAL with no fills
+        timeout_count = LiveInvestmentService.auto_timeout_stale_strategies(db, today)
+        if timeout_count:
+            mtm_logger.info("[DailyMTM] Auto-timed-out %d stale PENDING strategies", timeout_count)
+
         return count
     except Exception:
         mtm_logger.exception("[DailyMTM] Fatal error in daily_equity_curve_update")
@@ -113,3 +119,31 @@ def daily_equity_curve_update_task(today_iso: str | None = None) -> int:
     today = date.fromisoformat(today_iso) if today_iso else date.today()
     # today = date.fromisoformat("2026-06-10")
     return daily_equity_curve_update(today)
+
+
+def auto_timeout_stale_strategies(today: date | None = None) -> int:
+    """
+    Run from daily cron (e.g., after daily_equity_curve_update at 16:30).
+
+    Auto-cancels strategies stuck in PENDING_USER_APPROVAL since before today
+    with zero filled orders. This means the user opened Kite but never
+    completed/cancelled the order flow.
+    """
+    setup_logging()
+    today = today or date.today()
+
+    if not is_trading_day(today):
+        mtm_logger.info("[AutoTimeout] %s is a non-trading day, skipping auto-timeout", today)
+        return 0
+
+    mtm_logger.info("[AutoTimeout] Starting auto_timeout_stale_strategies for %s", today)
+    db = SessionLocal()
+    try:
+        count = LiveInvestmentService.auto_timeout_stale_strategies(db, today)
+        mtm_logger.info("[AutoTimeout] Completed — timed out %d strategies for %s", count, today)
+        return count
+    except Exception:
+        mtm_logger.exception("[AutoTimeout] Fatal error in auto_timeout_stale_strategies")
+        raise
+    finally:
+        db.close()

@@ -426,7 +426,9 @@ def assign_publisher_tags(db: Session, strategy: LiveStrategy, basket_type: str,
         strategy.status = LiveStatus.EXIT_PENDING_USER_APPROVAL
     else:
         strategy.status = LiveStatus.PENDING_USER_APPROVAL
-        strategy.subscription_active = True  # Card visible on portfolio page immediately
+        # subscription_active stays False — card appears on portfolio only after
+        # first postback fills (set to True in update_from_postback → ACTIVE).
+        # Dashboard is still accessible by live_id (no subscription_active check).
     db.commit()
     db.refresh(basket)
     return basket
@@ -1128,7 +1130,7 @@ def _validate_trade_now_status(strategy: LiveStrategy, basket_type: str, side: s
         expected = {
             "INITIAL": {LiveStatus.PREVIEW_READY, LiveStatus.ALL_REJECTED},
             "REBALANCE": {LiveStatus.REBALANCE_READY},
-            "EXIT": {LiveStatus.EXIT_PENDING_USER_APPROVAL},
+            "EXIT": {LiveStatus.ACTIVE},
         }.get((basket_type or "INITIAL").upper(), set())
     if expected and strategy.status not in expected:
         current = strategy.status.value if hasattr(strategy.status, "value") else str(strategy.status)
@@ -1346,6 +1348,12 @@ class LiveInvestmentService:
             )
             insert_df_to_db(db, buy_df, LiveBuyStock)
 
+        # Auto-refresh exit sell rows with latest LTP before sending basket
+        # Same pattern as ALL_REJECTED auto-retry above
+        if basket_type == "EXIT":
+            LiveInvestmentService.create_exit_preview(db, strategy_id)
+            db.refresh(strategy)
+
         return assign_publisher_tags(db, strategy, basket_type, side)
 
     @staticmethod
@@ -1420,9 +1428,9 @@ class LiveInvestmentService:
         strategy = db.query(LiveStrategy).filter(LiveStrategy.id == strategy_id).first()
         if not strategy:
             raise HTTPException(status_code=404, detail="Live strategy not found")
-        if strategy.status not in {LiveStatus.ACTIVE, LiveStatus.EXIT_PENDING_USER_APPROVAL}:
+        if strategy.status != LiveStatus.ACTIVE:
             current = strategy.status.value if hasattr(strategy.status, "value") else str(strategy.status)
-            raise HTTPException(status_code=400, detail=f"Exit preview can be generated only from ACTIVE or EXIT_PENDING_USER_APPROVAL. Current status={current}")
+            raise HTTPException(status_code=400, detail=f"Exit preview can be generated only from ACTIVE. Current status={current}")
         _delete_unapproved_preview_rows(db, strategy.id, include_sell=True)
         tradelog_df = model_df(db, LiveTradelog, strategy.id)
         active_df = tradelog_df.loc[tradelog_df["active"] == True] if not tradelog_df.empty else pd.DataFrame()
@@ -1450,7 +1458,11 @@ class LiveInvestmentService:
             })
         if rows:
             insert_df_to_db(db, pd.DataFrame(rows), LiveSellStock)
-        strategy.status = LiveStatus.EXIT_PENDING_USER_APPROVAL
+        # Status stays ACTIVE — only changes to EXIT_PENDING_USER_APPROVAL
+        # when user actually clicks Trade Now (in assign_publisher_tags).
+        # If user goes back, status remains ACTIVE → rebalance works normally.
+        # Orphaned exit sell rows get cleaned up by _delete_unapproved_preview_rows
+        # on next rebalance or next exit preview call.
         db.commit()
         db.refresh(strategy)
         return strategy
@@ -1704,8 +1716,9 @@ class LiveInvestmentService:
                 # ALL orders rejected/cancelled — no fills at all
                 # Transition depends on what basket type was running:
                 if previous_status == LiveStatus.EXIT_PENDING_USER_APPROVAL:
-                    # Stay in EXIT_PENDING so user can retry exit
-                    pass  # status stays EXIT_PENDING_USER_APPROVAL
+                    # All exit orders rejected — go back to ACTIVE so user can retry
+                    # exit/preview → exit/trade-now flow again
+                    strategy.status = LiveStatus.ACTIVE
                 elif previous_status == LiveStatus.REBALANCE_PENDING_USER_APPROVAL:
                     # Go back to appropriate retry status based on basket type
                     if latest_basket and latest_basket.basket_type == "REBALANCE_SELL":
@@ -1833,7 +1846,8 @@ class LiveInvestmentService:
             LiveStatus.ACTIVE,
             LiveStatus.REBALANCE_READY,
             LiveStatus.REBALANCE_SELL_COMPLETE,
-            LiveStatus.REBALANCE_PENDING_USER_APPROVAL
+            LiveStatus.REBALANCE_PENDING_USER_APPROVAL,
+            LiveStatus.EXIT_PENDING_USER_APPROVAL,
         ]
         strategies = db.query(LiveStrategy).filter(
             LiveStrategy.status.in_(valid_statuses),
@@ -1905,13 +1919,17 @@ class LiveInvestmentService:
                 # Step 5: Auto-skip ignored or stuck rebalances
                 stuck_statuses = {
                     LiveStatus.REBALANCE_READY,
-                    LiveStatus.REBALANCE_SELL_COMPLETE,
                     LiveStatus.REBALANCE_PENDING_USER_APPROVAL
                 }
                 if strategy.status in stuck_statuses:
                     logger.info("[Auto-Skip] Strategy %s missed rebalance (status=%s), resetting to ACTIVE", strategy.id, strategy.status.value if hasattr(strategy.status, "value") else strategy.status)
                     strategy.status = LiveStatus.ACTIVE
                     strategy.next_rebalance_date = next_trading_day(next_rebalance_prepare_date(TODAY, strategy.rebalance_frequency))
+
+                # REBALANCE_SELL_COMPLETE: sells were already filled by broker.
+                # Don't auto-skip — user must manually send buy basket or call /rebalance/skip.
+                if strategy.status == LiveStatus.REBALANCE_SELL_COMPLETE:
+                    logger.warning("[Auto-Skip] Strategy %s in REBALANCE_SELL_COMPLETE — sells done but buys pending. NOT auto-skipping.", strategy.id)
 
                 db.commit()
                 logger.info("[DailyMTM] Updated strategy %s | aum=%.2f | pending_fills=%s",
@@ -1924,3 +1942,95 @@ class LiveInvestmentService:
         logger.info("[DailyMTM] Updated %d strategies for %s", count, TODAY)
         return count
 
+    @staticmethod
+    def resolve_account_mismatch(db: Session, strategy_id) -> LiveStrategy:
+        """Resolve ACCOUNT_MISMATCH by re-locking correct client_id and restoring ACTIVE.
+
+        Called when a postback arrived from the wrong broker account.
+        Re-locks the client_id from the broker_account table (the expected one)
+        so the user can retry with the correct account.
+        """
+        strategy = db.query(LiveStrategy).filter(LiveStrategy.id == strategy_id).first()
+        if not strategy:
+            raise HTTPException(status_code=404, detail="Live strategy not found")
+        if strategy.status != LiveStatus.ACCOUNT_MISMATCH:
+            current = strategy.status.value if hasattr(strategy.status, "value") else str(strategy.status)
+            raise HTTPException(status_code=400, detail=f"Can only resolve from ACCOUNT_MISMATCH. Current status={current}")
+
+        # Re-lock client_id from broker_account (the expected one)
+        broker_account = db.query(LiveBrokerAccount).filter(
+            LiveBrokerAccount.id == strategy.broker_account_id,
+        ).first()
+        strategy.locked_client_id = broker_account.broker_user_id if broker_account else None
+        strategy.status = LiveStatus.ACTIVE
+        db.commit()
+        db.refresh(strategy)
+        logger.info("[ResolveMismatch] Strategy %s restored to ACTIVE | locked_client_id=%s",
+                    strategy.id, strategy.locked_client_id)
+        return strategy
+
+    @staticmethod
+    def auto_timeout_stale_strategies(db: Session, TODAY: Optional[date] = None) -> int:
+        """Auto-recover strategies stuck in pending states with no fills.
+
+        Run from the daily cron (alongside daily_equity_curve_update).
+
+        Handles two cases:
+        1. PENDING_USER_APPROVAL (initial) — user never completed Kite flow
+           → auto-cancel (strategy was never activated, no holdings)
+        2. EXIT_PENDING_USER_APPROVAL — user clicked exit trade-now but closed Kite
+           → go back to ACTIVE (strategy has real holdings, needs rebalance/MTM)
+        """
+        TODAY = TODAY or date.today()
+        count = 0
+
+        # Case 1: PENDING_USER_APPROVAL → CANCELLED
+        pending_strategies = db.query(LiveStrategy).filter(
+            LiveStrategy.status == LiveStatus.PENDING_USER_APPROVAL,
+            LiveStrategy.updated_at < TODAY,  # Stuck since before today
+        ).all()
+        for strategy in pending_strategies:
+            filled = db.query(LiveBuyStock).filter(
+                LiveBuyStock.automate_equity_ra_id == strategy.id,
+                LiveBuyStock.actual_qty > 0,
+            ).count()
+            if filled > 0:
+                continue  # Has fills — don't auto-cancel, wait for remaining postbacks
+
+            strategy.status = LiveStatus.CANCELLED
+            strategy.subscription_active = False
+            logger.info("[AutoTimeout] Strategy %s auto-cancelled from PENDING_USER_APPROVAL (no fills, stuck since %s)",
+                        strategy.id, strategy.updated_at)
+            count += 1
+
+        # Case 2: EXIT_PENDING_USER_APPROVAL → ACTIVE
+        exit_pending_strategies = db.query(LiveStrategy).filter(
+            LiveStrategy.status == LiveStatus.EXIT_PENDING_USER_APPROVAL,
+            LiveStrategy.updated_at < TODAY,  # Stuck since before today
+        ).all()
+        for strategy in exit_pending_strategies:
+            # Check if any exit sell orders were filled
+            filled = db.query(LiveSellStock).filter(
+                LiveSellStock.automate_equity_ra_id == strategy.id,
+                LiveSellStock.method == "EXIT",
+                LiveSellStock.actual_qty > 0,
+            ).count()
+            if filled > 0:
+                continue  # Has fills — don't revert, wait for remaining postbacks
+
+            # Clean up orphaned exit sell rows
+            db.query(LiveSellStock).filter(
+                LiveSellStock.automate_equity_ra_id == strategy.id,
+                LiveSellStock.method == "EXIT",
+                LiveSellStock.updated_in_tradelog == False,
+            ).delete(synchronize_session=False)
+
+            strategy.status = LiveStatus.ACTIVE
+            logger.info("[AutoTimeout] Strategy %s restored to ACTIVE from EXIT_PENDING (no fills, stuck since %s)",
+                        strategy.id, strategy.updated_at)
+            count += 1
+
+        if count:
+            db.commit()
+        logger.info("[AutoTimeout] Auto-recovered %d stale strategies", count)
+        return count

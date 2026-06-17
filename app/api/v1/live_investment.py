@@ -192,6 +192,30 @@ def go_live(payload: GoLiveRequest, db: Session = Depends(get_db), _mkt=Depends(
         LiveStrategy.locked_client_id == payload.broker_user_id,
         LiveStrategy.status.in_(running_statuses),
     ).first()
+
+    # If duplicate is PENDING_USER_APPROVAL with zero fills, the user never
+    # completed Kite flow (failed login, closed popup, etc.). Auto-cancel it
+    # so they can retry Go Live without friction.
+    if duplicate and duplicate.status == LiveStatus.PENDING_USER_APPROVAL:
+        filled = db.query(LiveBuyStock).filter(
+            LiveBuyStock.automate_equity_ra_id == duplicate.id,
+            LiveBuyStock.actual_qty > 0,
+        ).count()
+        if filled == 0:
+            # No orders filled — safe to cancel
+            db.query(LiveBuyStock).filter(LiveBuyStock.automate_equity_ra_id == duplicate.id).delete(synchronize_session=False)
+            db.query(LiveSellStock).filter(LiveSellStock.automate_equity_ra_id == duplicate.id).delete(synchronize_session=False)
+            db.query(LiveCircuitStock).filter(LiveCircuitStock.automate_equity_ra_id == duplicate.id).delete(synchronize_session=False)
+            db.query(LivePublisherBasket).filter(
+                LivePublisherBasket.automate_equity_ra_id == duplicate.id,
+                LivePublisherBasket.status == "PENDING_USER_APPROVAL",
+            ).update({"status": "CANCELLED"}, synchronize_session=False)
+            duplicate.status = LiveStatus.CANCELLED
+            duplicate.subscription_active = False
+            db.commit()
+            logger.info("[GoLive] Auto-cancelled stale PENDING strategy %s (0 fills) to allow retry", duplicate.id)
+            duplicate = None  # Clear so the guard below doesn't block
+
     if duplicate:
         raise HTTPException(
             status_code=409,
@@ -348,6 +372,16 @@ def exit_trade_now(live_id: UUID, db: Session = Depends(get_db), _mkt=Depends(re
         broker_account_label=strategy.broker_account_label,
         publisher_payload=basket.publisher_payload,
     )
+
+@router.post("/{live_id}/resolve-mismatch", response_model=LiveStrategyResponse)
+def resolve_account_mismatch(live_id: UUID, db: Session = Depends(get_db)):
+    """Resolve ACCOUNT_MISMATCH and return strategy to ACTIVE.
+
+    Re-locks the correct client_id from the broker_account table.
+    Called when orders were accidentally placed from the wrong broker account.
+    """
+    obj = LiveInvestmentService.resolve_account_mismatch(db, live_id)
+    return serialize_strategy(obj)
 
 
 @router.post("/{live_id}/duplicate", response_model=LiveStrategyResponse)
