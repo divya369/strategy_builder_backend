@@ -166,6 +166,27 @@ class LiveConfig:
 
 
 # -----------------------------------------------------------------------------
+# Live LTP helper — same Kite API used by basket
+# -----------------------------------------------------------------------------
+
+def _fetch_live_ltp(strategy, symbols: list) -> Dict[str, float]:
+    """Fetch real-time LTP using the strategy's broker adapter.
+
+    Returns {tradingsymbol: last_price} dict. Empty dict on failure.
+    Used to show accurate live prices in previews.
+    """
+    if not symbols:
+        return {}
+    try:
+        adapter = get_publisher_adapter(strategy.broker)
+        if hasattr(adapter, 'fetch_ltp_bulk'):
+            return adapter.fetch_ltp_bulk(symbols)
+    except Exception as e:
+        logger.warning("[LiveLTP] Failed to fetch live LTP: %s — falling back to stored prices", e)
+    return {}
+
+
+# -----------------------------------------------------------------------------
 # Screener conversion: Strategy Builder result -> equitycase-compatible screener_df
 # -----------------------------------------------------------------------------
 
@@ -1312,6 +1333,14 @@ class LiveInvestmentService:
         screener_df = get_strategy_builder_screener_df(db, strategy.screener_version_id, strategy.portfolio_size)
         tradelog_df = model_df(db, LiveTradelog, strategy.id)
         buy_screener_df = screener_df.head(strategy.portfolio_size).copy()
+
+        # Overlay live LTP on screener close for accurate preview prices
+        ltp_map = _fetch_live_ltp(strategy, list(buy_screener_df["tradingsymbol"]))
+        if ltp_map:
+            buy_screener_df["close"] = buy_screener_df.apply(
+                lambda row: ltp_map.get(row["tradingsymbol"], row["close"]), axis=1
+            )
+
         buy_df = get_buy_df_investment(
             TODAY, strategy, f"({strategy.id})", buy_screener_df, tradelog_df,
             sell_stock_count=0,
@@ -1377,12 +1406,34 @@ class LiveInvestmentService:
         aum = float(latest.get("aum") or strategy.final_aum or strategy.initial_aum)
         cash = float(latest.get("cash") or strategy.cash or 0.0)
 
+        # Fetch live LTP for both sell (tradelog) and buy (screener) symbols
+        all_symbols = set(screener_df["tradingsymbol"]) if not screener_df.empty else set()
+        if not tradelog_df.empty:
+            active_holdings = tradelog_df.loc[tradelog_df["active"] == True]
+            all_symbols.update(active_holdings["tradingsymbol"])
+        ltp_map = _fetch_live_ltp(strategy, list(all_symbols))
+
+        # Overlay live LTP on tradelog for accurate sell preview prices
+        if ltp_map and not tradelog_df.empty:
+            tradelog_df = tradelog_df.copy()
+            tradelog_df["ltp"] = tradelog_df.apply(
+                lambda row: ltp_map.get(row["tradingsymbol"], row.get("ltp") or 0), axis=1
+            )
+
         sell_df = get_sell_df_investment(TODAY, strategy, f"({strategy.id})", screener_df, tradelog_df, strategy.worst_hold_rank)
         insert_df_to_db(db, sell_df, LiveSellStock)
         amount_to_sell_tomorrow = float(sell_df["amount"].sum()) if not sell_df.empty else 0.0
         cash_available = (cash + (amount_to_sell_tomorrow * 0.80)) * 0.98
+
+        # Overlay live LTP on screener for accurate buy preview prices
+        buy_screener_df = screener_df.head(strategy.portfolio_size).copy()
+        if ltp_map and not buy_screener_df.empty:
+            buy_screener_df["close"] = buy_screener_df.apply(
+                lambda row: ltp_map.get(row["tradingsymbol"], row["close"]), axis=1
+            )
+
         buy_df = get_buy_df_investment(
-            TODAY, strategy, f"({strategy.id})", screener_df.head(strategy.portfolio_size), tradelog_df,
+            TODAY, strategy, f"({strategy.id})", buy_screener_df, tradelog_df,
             sell_stock_count=len(sell_df),
             portfolio_size=strategy.portfolio_size,
             cash_available=cash_available,
@@ -1434,15 +1485,21 @@ class LiveInvestmentService:
         _delete_unapproved_preview_rows(db, strategy.id, include_sell=True)
         tradelog_df = model_df(db, LiveTradelog, strategy.id)
         active_df = tradelog_df.loc[tradelog_df["active"] == True] if not tradelog_df.empty else pd.DataFrame()
+        # Fetch live LTP for exit preview prices
+        exit_symbols = list(active_df["tradingsymbol"]) if not active_df.empty else []
+        ltp_map = _fetch_live_ltp(strategy, exit_symbols)
+
         rows = []
         for _, row in active_df.iterrows():
             remaining_qty = int(row["buy_qty"] or 0) - int(row["sell_qty"] or 0)
             if remaining_qty <= 0:
                 continue
-            price = float(row.get("ltp") or row.get("buy_price") or 0)
+            # Use live LTP if available, fallback to tradelog ltp, then buy_price
+            tradingsymbol = row["tradingsymbol"]
+            price = float(ltp_map.get(tradingsymbol) or row.get("ltp") or row.get("buy_price") or 0)
             rows.append({
                 "automate_equity_ra_id": strategy.id,
-                "tradingsymbol": row["tradingsymbol"],
+                "tradingsymbol": tradingsymbol,
                 "isin": row.get("isin", ""),
                 "date": TODAY,
                 "qty": remaining_qty,
