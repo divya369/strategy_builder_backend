@@ -6,10 +6,8 @@ Same pattern as app.services.broker_publishers.registry:
     notify_all("send_rebalance_ready", **kwargs) → fire on ALL channels
 """
 from __future__ import annotations
-
 import logging
 from typing import Any, Dict
-
 from .base import BaseNotificationChannel
 from .email_channel import EmailNotificationChannel
 

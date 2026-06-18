@@ -10,11 +10,9 @@ All queries here use raw SQL via SQLAlchemy's text() to handle dynamic table nam
 import logging
 from datetime import date
 from typing import List, Optional
-
 import pandas as pd
 from sqlalchemy import text
 from sqlalchemy.orm import Session
-
 from app.core.config import settings
 from app.core.benchmark_registry import resolve_benchmark_table
 from app.core.symbol_registry import resolve_stock_symbol

@@ -18,7 +18,6 @@ Usage:
 Safe to call multiple times — only the first call takes effect.
 """
 from __future__ import annotations
-
 import logging
 from datetime import date
 from pathlib import Path

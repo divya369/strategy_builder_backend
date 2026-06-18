@@ -1,11 +1,10 @@
 import json
 import logging
-from datetime import date
-from typing import Any, Dict, List, Optional
 from uuid import UUID
-from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from datetime import date
 from sqlalchemy.orm import Session
 from app.core.database import get_db
+from typing import Any, Dict, List, Optional
 from app.models.live_investment import (
     LiveStrategy,
     LiveStatus,
@@ -35,8 +34,10 @@ from app.schemas.live_investment import (
     OrderStatusResponse,
     OrderDetail,
 )
-from app.services.live_investment_service import LiveInvestmentService
 from app.core.trading_calendar import require_market_open
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from app.services.live_investment_service import LiveInvestmentService
+
 
 router = APIRouter()
 
@@ -656,7 +657,7 @@ def get_equity_curve_graph(live_id: UUID, db: Session = Depends(get_db)):
 
     rows = db.query(LiveEquityCurve).filter(
         LiveEquityCurve.automate_equity_ra_id == live_id,
-    ).order_by(LiveEquityCurve.date.asc()).all()
+    ).order_by(LiveEquityCurve.date.asc(), LiveEquityCurve.total_days.asc()).all()
     return [
         EquityCurveGraphPoint(
             date=row.date,

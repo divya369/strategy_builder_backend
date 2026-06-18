@@ -1,13 +1,12 @@
 from __future__ import annotations
-
 import hashlib
 import logging
 from typing import Any, Dict, List
-
 import pandas as pd
 import requests
 from .base import BrokerPublisherAdapter
 from app.core.config import settings
+from app.core.broker_token_store import get_broker_token
 
 logger = logging.getLogger(__name__)
 
@@ -30,7 +29,6 @@ class ZerodhaPublisherAdapter(BrokerPublisherAdapter):
 
         Returns: {tradingsymbol: last_price} dict. Missing symbols are omitted.
         """
-        from app.core.broker_token_store import get_broker_token
         api_key = settings.ZERODHA_API_KEY
         access_token = get_broker_token()
 

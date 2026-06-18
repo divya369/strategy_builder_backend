@@ -11,6 +11,7 @@ Start the worker:
 from celery import Celery
 from celery.schedules import crontab
 from app.core.config import settings
+from celery.signals import after_setup_logger 
 
 celery_app = Celery(
     "strategy_builder",
@@ -68,8 +69,7 @@ celery_app.conf.update(
 # after_setup_logger fires once per worker process, AFTER Celery sets up
 # its own console/file handlers. setup_logging() only ADDS our daily-folder
 # file handlers — it does not touch Celery's existing handlers.
-
-from celery.signals import after_setup_logger   # noqa: E402
+# noqa: E402
 
 
 @after_setup_logger.connect

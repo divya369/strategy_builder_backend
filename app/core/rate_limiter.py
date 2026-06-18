@@ -23,10 +23,9 @@ import logging
 import asyncio
 from dataclasses import dataclass
 from typing import Optional
-
 from fastapi import Request, HTTPException
-
 from app.core.config import settings
+import redis.asyncio as aioredis
 
 logger = logging.getLogger(__name__)
 
@@ -128,7 +127,6 @@ class RedisBackend:
         """Lazy-connect to Redis."""
         if self._redis is None:
             try:
-                import redis.asyncio as aioredis
                 self._redis = aioredis.from_url(
                     settings.RATE_LIMIT_REDIS_URL,
                     decode_responses=True,

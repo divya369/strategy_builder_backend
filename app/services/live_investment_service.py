@@ -18,20 +18,19 @@ investment_strategy_ra.py:
     and appends equity curve rows.
 """
 from __future__ import annotations
-
-import logging
+import pytz
 import uuid
-from dataclasses import dataclass
-from datetime import date, timedelta
-from typing import Any, Dict, Optional
-
-import pandas as pd
+import logging
 import numpy as np
+import pandas as pd
+from dataclasses import dataclass
+from datetime import date, timedelta, datetime
+from typing import Any, Dict, Optional
 from fastapi import HTTPException
+from sqlalchemy import text
 from sqlalchemy.orm import Session
 from sqlalchemy import or_, func
-
-from app.core.database import equity_engine
+from app.core.database import equity_engine, EquitycaseSessionLocal
 from app.models.screener import ScreenerVersion
 from app.models.live_investment import (
     LiveStrategy,
@@ -48,6 +47,7 @@ from app.services.screener_execution_service import screener_execution_service
 from app.core.trading_calendar import next_trading_day, should_prepare_rebalance, next_rebalance_prepare_date
 from app.services.broker_publishers import get_publisher_adapter
 from app.core.config import settings
+from app.services.notifications import notify_all
 
 logger = logging.getLogger(__name__)
 
@@ -1172,10 +1172,6 @@ def _gather_and_notify_rebalance(db: Session, strategy: LiveStrategy, TODAY: dat
     because on the server the users table lives there.
     """
     try:
-        from sqlalchemy import text
-        from app.core.database import EquitycaseSessionLocal
-        from app.services.notifications import notify_all
-
         # Fetch user email from equitycase DB (separate database)
         ec_db = EquitycaseSessionLocal()
         try:
@@ -1223,8 +1219,6 @@ def _gather_and_notify_rebalance(db: Session, strategy: LiveStrategy, TODAY: dat
         if not changes:
             logger.info("[Notify] No buy/sell changes for strategy %s — sending empty notification", strategy.id)
 
-        from datetime import datetime
-        import pytz
         ist = pytz.timezone("Asia/Kolkata")
         
         # Execution date from DB — show "Today" if email is sent on the execution day itself

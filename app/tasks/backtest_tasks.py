@@ -10,9 +10,7 @@ with proper lifecycle management:
 """
 import logging
 import traceback
-
 from celery.exceptions import SoftTimeLimitExceeded
-
 from app.core.celery_app import celery_app
 from app.core.database import SessionLocal
 from app.models.backtest import BacktestRun

@@ -18,11 +18,9 @@ Standard response headers added to every response:
 
 import time
 import logging
-
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
-
 from app.core.config import settings
 from app.core.rate_limiter import limiter
 

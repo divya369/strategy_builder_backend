@@ -1,7 +1,5 @@
 from fastapi import APIRouter
-from app.api.v1 import screeners, auth
-from app.api.v1 import backtests, results
-from app.api.v1 import live_investment
+from app.api.v1 import screeners, auth , backtests, results, live_investment
 
 api_router = APIRouter()
 

@@ -9,12 +9,11 @@ CORS preflight (OPTIONS) requests are allowed through without checking.
 """
 
 import hmac
-
-from starlette.middleware.base import BaseHTTPMiddleware
+from app.core.config import settings
 from starlette.requests import Request
 from starlette.responses import JSONResponse
+from starlette.middleware.base import BaseHTTPMiddleware
 
-from app.core.config import settings
 
 
 class APIKeyMiddleware(BaseHTTPMiddleware):

@@ -6,7 +6,6 @@ To add a new channel (WhatsApp, Push, Slack), subclass this ABC, implement
 the abstract methods, and register in registry.py.
 """
 from __future__ import annotations
-
 from abc import ABC, abstractmethod
 from typing import Any, Dict, List
 

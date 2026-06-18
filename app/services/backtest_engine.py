@@ -22,12 +22,10 @@ from bisect import bisect_left
 from datetime import date, datetime, timedelta
 from statistics import median
 from typing import Dict, List, Optional, Tuple
-
 import numpy as np
 import pandas as pd
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
-
 from app.core.config import settings
 from app.core.database import SessionLocal, EquitySessionLocal
 from app.models.backtest import BacktestHoldingPeriod, BacktestRun
@@ -36,6 +34,8 @@ from app.core.symbol_registry import resolve_stock_symbol
 from app.services import csv_data_service
 from app.services import equity_data_service
 from app.services.screener_execution_service import screener_execution_service
+from app.services.backtest_job_service import BacktestJobService
+from app.models.screener import ScreenerVersion
 
 logger = logging.getLogger(__name__)
 
@@ -337,7 +337,6 @@ class BacktestEngineService:
             bm_sym          = run_record.benchmark_symbol or "NIFTY 200"
 
             # ── Need universe/filters/ranking from screener version ───────────
-            from app.models.screener import ScreenerVersion
             version = None
             if run_record.screener_version_id:
                 version = app_db.query(ScreenerVersion).filter(ScreenerVersion.id == run_record.screener_version_id).first()
@@ -444,7 +443,6 @@ class BacktestEngineService:
                 if time.time() - _last_heartbeat_time >= settings.BACKTEST_HEARTBEAT_SECONDS:
                     try:
                         _hb_db = SessionLocal()
-                        from app.services.backtest_job_service import BacktestJobService
                         BacktestJobService.heartbeat(_hb_db, run_id)
                     except Exception as hb_exc:
                         logger.debug("Heartbeat update failed: %s", hb_exc)

@@ -5,9 +5,7 @@ Uses UUID for screener_id (passed through from the caller).
 import uuid
 from datetime import datetime
 from typing import Union
-
 from sqlalchemy.orm import Session
-
 from app.models.screener import ScreenerVersion
 from app.schemas.screener import ScreenerVersionCreate
 

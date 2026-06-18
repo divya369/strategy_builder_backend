@@ -1,11 +1,12 @@
 import uuid
-from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy.orm import Session
 from typing import List
+from sqlalchemy.orm import Session
 from app.core.database import get_db
+from collections import OrderedDict
+from fastapi import APIRouter, Depends, HTTPException
+from app.models.result import BacktestSummary
 from app.core.backtest_metric_formatter import OVERVIEW_METRICS_CONFIG, format_metric_value
 from app.models.backtest import BacktestRun, BacktestHoldingPeriod
-from app.models.result import BacktestSummary
 
 router = APIRouter()
 
@@ -81,7 +82,6 @@ def get_overview(run_id: uuid.UUID, db: Session = Depends(get_db)):
     m = s.metrics_json or {}
 
     # Group by section preserving config order
-    from collections import OrderedDict
     sections = OrderedDict()
     for key, label, unit, section in OVERVIEW_METRICS_CONFIG:
         raw_value = m.get(key)
@@ -112,7 +112,6 @@ def get_monthly_returns(run_id: uuid.UUID, db: Session = Depends(get_db)):
     rows = summary.monthly_returns_json or []
 
     # Group by year and compute YTD (same logic as before, iterating dicts)
-    from collections import OrderedDict
     years = OrderedDict()
     for r in rows:
         years.setdefault(r["year"], []).append({

@@ -1,14 +1,23 @@
 import os
 import logging
 from contextlib import asynccontextmanager
-
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-
 from app.api.v1.router import api_router
 from app.core.config import settings
 from app.core.logging_config import setup_logging
+from app.core.database import SessionLocal
+from app.models.user import User
+from app.api.deps import SYSTEM_USER_ID
+from app.services.backtest_job_service import BacktestJobService
+from app.core.database import engine as app_engine
+from app.core.database import equity_engine
+from app.core.database import equitycase_engine
+from app.core.celery_app import celery_app
+from app.core.rate_limit_middleware import RateLimitMiddleware
+from app.core.auth_middleware import APIKeyMiddleware
+
 
 # Initialize daily-folder file logging (logs/<date>/<date>_<component>.log)
 setup_logging()
@@ -23,10 +32,6 @@ async def lifespan(app: FastAPI):
     logger.info("[Startup] %s is starting …", settings.PROJECT_NAME)
 
     # Seed system user
-    from app.core.database import SessionLocal
-    from app.models.user import User
-    from app.api.deps import SYSTEM_USER_ID
-
     db = SessionLocal()
     try:
         if not db.query(User).filter(User.id == SYSTEM_USER_ID).first():
@@ -42,8 +47,6 @@ async def lifespan(app: FastAPI):
         db.close()
 
     # Recover stale backtest jobs
-    from app.services.backtest_job_service import BacktestJobService
-
     db = SessionLocal()
     try:
         count = BacktestJobService.recover_stale_running_jobs(db)
@@ -63,7 +66,6 @@ async def lifespan(app: FastAPI):
     logger.info("[Shutdown] Graceful shutdown initiated …")
 
     # 1. Dispose SQLAlchemy connection pools
-    from app.core.database import engine as app_engine
     try:
         app_engine.dispose()
         logger.info("[Shutdown] App DB engine disposed")
@@ -71,14 +73,12 @@ async def lifespan(app: FastAPI):
         logger.exception("[Shutdown] Error disposing app DB engine")
 
     try:
-        from app.core.database import equity_engine
         equity_engine.dispose()
         logger.info("[Shutdown] Equity OHLC DB engine disposed")
     except Exception:
         logger.exception("[Shutdown] Error disposing equity DB engine")
 
     try:
-        from app.core.database import equitycase_engine
         equitycase_engine.dispose()
         logger.info("[Shutdown] EquityCase DB engine disposed")
     except Exception:
@@ -86,7 +86,6 @@ async def lifespan(app: FastAPI):
 
     # 2. Close Celery app (flushes pending results, closes broker connection)
     try:
-        from app.core.celery_app import celery_app
         celery_app.close()
         logger.info("[Shutdown] Celery app closed")
     except Exception:
@@ -111,11 +110,9 @@ app.add_middleware(
 )
 
 # ── Rate limiting ─────────────────────────────────────────────────────────────
-from app.core.rate_limit_middleware import RateLimitMiddleware
 app.add_middleware(RateLimitMiddleware)
 
 # ── API-key auth ──────────────────────────────────────────────────────────────
-from app.core.auth_middleware import APIKeyMiddleware
 app.add_middleware(APIKeyMiddleware)
 
 app.include_router(api_router, prefix="/api/v1")

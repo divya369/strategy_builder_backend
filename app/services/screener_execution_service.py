@@ -20,7 +20,6 @@ import json
 import pandas as pd
 from fastapi import HTTPException
 from sqlalchemy.orm import Session
-
 from app.core.filter_registry import FILTER_CONFIG_MAP, get_filter_label, get_db_key
 from app.models.screener import ScreenerVersion
 from app.services import csv_data_service

@@ -9,7 +9,6 @@ All other services call this module — they never read CSV files directly.
 import logging
 from datetime import date
 from typing import List, Optional
-
 from app.core.config import settings
 from app.services.data_access_layer import CsvScreenerReader, CsvIndexConstituentReader
 

@@ -1,7 +1,6 @@
 import logging
 from datetime import date
 from celery import shared_task
-
 from app.core.database import SessionLocal
 from app.core.logging_config import setup_logging
 from app.core.trading_calendar import is_trading_day

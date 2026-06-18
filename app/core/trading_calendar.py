@@ -9,7 +9,6 @@ import json
 import os
 from pathlib import Path
 from zoneinfo import ZoneInfo
-
 from fastapi import HTTPException
 
 CORE_DIR = Path(__file__).resolve().parent
@@ -117,7 +116,7 @@ def require_market_open() -> None:
 
     if not (MARKET_OPEN <= now_ist.time() <= MARKET_CLOSE):
         message = (
-        f"Market is closed at {now_ist.strftime('%I:%M %p IST')}. "
+        f"Market is closed. "
         f"This action is only available between {MARKET_OPEN.strftime('%I:%M %p')} "
         f"and {MARKET_CLOSE.strftime('%I:%M %p')} IST."
         )

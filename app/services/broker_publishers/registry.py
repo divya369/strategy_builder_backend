@@ -1,5 +1,4 @@
 from __future__ import annotations
-
 from .base import BrokerPublisherAdapter
 from .zerodha import ZerodhaPublisherAdapter
 

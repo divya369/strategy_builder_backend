@@ -5,7 +5,6 @@ overridden by real environment variables.  No secrets are hardcoded.
 """
 import os
 from pathlib import Path
-
 from dotenv import load_dotenv
 
 # Load .env from project root  (screener-builder/.env)

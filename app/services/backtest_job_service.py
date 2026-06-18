@@ -11,7 +11,6 @@ All methods are stateless and take an explicit DB session.
 import logging
 from datetime import datetime, timedelta
 from sqlalchemy.orm import Session
-
 from app.models.backtest import BacktestRun
 from app.core.config import settings
 

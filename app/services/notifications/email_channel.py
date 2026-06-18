@@ -4,14 +4,11 @@ Resend-based email notification channel.
 Uses Jinja2 for HTML template rendering and Resend SDK for delivery.
 """
 from __future__ import annotations
-
 import logging
 from pathlib import Path
 from typing import Any, Dict, List
-
 import resend
 from jinja2 import Environment, FileSystemLoader
-
 from app.core.config import settings
 from .base import BaseNotificationChannel
 
