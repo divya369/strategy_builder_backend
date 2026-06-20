@@ -263,7 +263,7 @@ def get_sell_df_investment(
                 "actual_price": 0.0,
                 "actual_amount": 0.0,
                 "order_id": None,
-                "method": "WHR",
+                "method": "WRH",
                 "circuit": False,
                 "updated_in_tradelog": False,
             })
@@ -2078,6 +2078,26 @@ class LiveInvestmentService:
 
             strategy.status = LiveStatus.ACTIVE
             logger.info("[AutoTimeout] Strategy %s restored to ACTIVE from EXIT_PENDING (no fills, stuck since %s)",
+                        strategy.id, strategy.updated_at)
+            count += 1
+
+        # Case 3: REBALANCE_SELL_COMPLETE → ACTIVE (auto-skip stale buy window)
+        # Sells already executed (money in account), but buy rows are stale
+        # (screener rankings/prices from previous day). Better to skip and let
+        # next rebalance cycle use fresh data.
+        rebal_stuck_strategies = db.query(LiveStrategy).filter(
+            LiveStrategy.status == LiveStatus.REBALANCE_SELL_COMPLETE,
+            LiveStrategy.updated_at < TODAY,  # Stuck since before today
+        ).all()
+        for strategy in rebal_stuck_strategies:
+            # Clean up orphaned buy rows (never sent to broker)
+            _delete_unapproved_preview_rows(db, strategy.id, include_sell=False)
+
+            strategy.status = LiveStatus.ACTIVE
+            strategy.next_rebalance_date = next_trading_day(
+                next_rebalance_prepare_date(TODAY, strategy.rebalance_frequency)
+            )
+            logger.info("[AutoTimeout] Strategy %s auto-skipped from REBALANCE_SELL_COMPLETE (buy window expired, stuck since %s)",
                         strategy.id, strategy.updated_at)
             count += 1
 
