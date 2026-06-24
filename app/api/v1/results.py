@@ -101,7 +101,10 @@ def get_drawdowns(run_id: uuid.UUID, db: Session = Depends(get_db)):
     summary = db.query(BacktestSummary).filter(BacktestSummary.backtest_run_id == run_id).first()
     if not summary:
         raise HTTPException(status_code=404, detail="Summary not found.")
-    return summary.drawdowns_json or []
+    episodes = summary.drawdowns_json or []
+    # Return top 5 worst drawdowns sorted by severity (most negative first)
+    top_5_worst = sorted(episodes, key=lambda x: x["drawdown_pct"])[:5]
+    return top_5_worst
 
 @router.get("/monthly-returns/{run_id}")
 def get_monthly_returns(run_id: uuid.UUID, db: Session = Depends(get_db)):
@@ -172,6 +175,7 @@ def get_tradelog_data(run_id: uuid.UUID, db: Session = Depends(get_db)):
             "qty": p.qty,
             "charges": float(p.cost_drag) if p.cost_drag is not None else None,
             "pnl_abs": float(p.pnl_abs) if p.pnl_abs is not None else None,
+            "pnl_pct": float(p.net_return) if p.net_return is not None else None,
             "exit_reason": p.exit_reason,
         })
     return response

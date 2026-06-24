@@ -17,18 +17,26 @@ OVERVIEW_METRICS_CONFIG = [
     ("benchmark_cagr", "Benchmark CAGR", "%", "Benchmark"),
     ("excess_cagr", "Excess CAGR (α)", "%", "Benchmark"),
     ("hit_ratio_vs_benchmark", "Hit Ratio vs Bench", "%", "Benchmark"),
-    ("upside_capture", "Upside Capture", "", "Benchmark"),
-    ("downside_capture", "Downside Capture", "", "Benchmark"),
+    ("upside_capture", "Upside Capture", "%", "Benchmark"),
+    ("downside_capture", "Downside Capture", "%", "Benchmark"),
 
     ("total_rebalances", "Total Rebalances", "#", "Turnover & Cost"),
     ("avg_turnover", "Avg Turnover", "%", "Turnover & Cost"),
     ("annualized_turnover", "Annualized Turnover", "%", "Turnover & Cost"),
     ("total_cost_drag", "Total Cost Drag", "%", "Turnover & Cost"),
+    ("total_cost_abs", "Total Cost", "₹", "Turnover & Cost"),
 
     ("avg_holding_days", "Avg Holding Days", "days", "Holding"),
     ("median_holding_days", "Median Holding Days", "days", "Holding"),
     ("avg_retention_pct", "Avg Retention %", "%", "Holding"),
     ("avg_churn_pct", "Avg Churn %", "%", "Holding"),
+
+    ("total_trades", "Total Trades", "#", "Trade Statistics"),
+    ("winning_trades", "Winning Trades", "#", "Trade Statistics"),
+    ("losing_trades", "Losing Trades", "#", "Trade Statistics"),
+    ("win_rate", "Win Rate", "%", "Trade Statistics"),
+    ("avg_profit_per_win", "Avg Profit / Win", "₹", "Trade Statistics"),
+    ("avg_loss_per_loss", "Avg Loss / Loss", "₹", "Trade Statistics"),
 ]
 
 
@@ -49,5 +57,8 @@ def format_metric_value(value, unit: str):
 
     if unit == "days":
         return round(value, 1)
+
+    if unit == "₹":
+        return round(value, 2)
 
     return value

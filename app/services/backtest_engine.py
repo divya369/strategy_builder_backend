@@ -219,10 +219,14 @@ class BacktestEngineService:
 
         open_px  = combined.pivot(index="date", columns="symbol", values="open")
         close_px = combined.pivot(index="date", columns="symbol", values="close")
+        del combined  # free the long-format copy immediately
+
         open_px.index  = pd.to_datetime(open_px.index)
         close_px.index = pd.to_datetime(close_px.index)
-        open_px  = open_px.reindex(idx).ffill()
-        close_px = close_px.reindex(idx).ffill()
+        open_px  = open_px.reindex(idx)
+        close_px = close_px.reindex(idx)
+        open_px.ffill(inplace=True)
+        close_px.ffill(inplace=True)
         return open_px, close_px, trading_dates
 
     @staticmethod
@@ -430,6 +434,8 @@ class BacktestEngineService:
             holdings: Dict[str, dict] = {}
             net_cash = gross_cash = float(initial_capital)
             cumulative_cost_abs = 0.0
+            total_trades = 0; winning_trades = 0; losing_trades = 0
+            sum_win_pnl = 0.0; sum_loss_pnl = 0.0
             realized_holding_periods: List[int] = []
             holding_period_objects: List[BacktestHoldingPeriod] = []
             rebalance_events_payload: List[dict] = []
@@ -477,9 +483,12 @@ class BacktestEngineService:
                         realized_holding_periods.append(holding_days)
                         entry_p = pos.get("entry_price", 0.0)
                         gross_ret = (sell_px / entry_p - 1.0) if entry_p > 0 else None
-                        net_ret = (gross_ret - total_cost_rate) if gross_ret is not None else None
-                        hp_cost_drag = (pos["qty"] * entry_p + pos["qty"] * sell_px) * total_cost_rate / 2.0
+                        net_ret = (gross_ret - 2 * total_cost_rate) if gross_ret is not None else None
+                        hp_cost_drag = (pos["qty"] * entry_p + pos["qty"] * sell_px) * total_cost_rate
                         hp_pnl_abs = (pos["qty"] * sell_px) - (pos["qty"] * entry_p) - hp_cost_drag
+                        total_trades += 1
+                        if hp_pnl_abs > 0: winning_trades += 1; sum_win_pnl += hp_pnl_abs
+                        else: losing_trades += 1; sum_loss_pnl += hp_pnl_abs
                         holding_period_objects.append(BacktestHoldingPeriod(backtest_run_id=run_record.id, symbol=symbol, entry_date=pos["entry_date"], exit_date=current_date, entry_rank=pos.get("entry_rank"), holding_days=holding_days, entry_price=entry_p, exit_price=sell_px, qty=pos["qty"], gross_return=gross_ret, net_return=net_ret, cost_drag=hp_cost_drag, pnl_abs=hp_pnl_abs, exit_reason="NOT_IN_TOP_N"))
                         del holdings[symbol]
 
@@ -529,20 +538,46 @@ class BacktestEngineService:
                 daily_nav_list.append({"trade_date": str(current_date), "portfolio_return_gross": float(daily_return_gross), "portfolio_return_net": float(daily_return_net), "portfolio_nav_gross": float(nav_gross_norm), "portfolio_nav_net": float(nav_net_norm), "benchmark_return": float(bm_ret_by_date[current_date]) if current_date in bm_ret_by_date and bm_ret_by_date[current_date] is not None else None, "benchmark_nav": float(bm_nav_by_date[current_date]) if current_date in bm_nav_by_date and bm_nav_by_date[current_date] is not None else None, "running_peak_nav": float(running_peak_norm), "drawdown": float(drawdown), "daily_turnover": float(event_turnover), "daily_cost": float(daily_cost_ratio)})
                 prev_nav_net_abs = nav_net_abs; prev_nav_gross_abs = nav_gross_abs
 
+                # ── Batch flush holding periods every 500 to limit memory ─────
+                if len(holding_period_objects) >= 500:
+                    app_db.bulk_save_objects(holding_period_objects)
+                    app_db.commit()
+                    holding_period_objects.clear()
+
             if not daily_nav_list:
                 run_record.status = "FAILED"; run_record.error_message = "Simulation produced no NAV rows."; app_db.commit(); return
 
-            # ── Close open positions ──────────────────────────────────────────
+            # ── Free memory: price frames and rank maps no longer needed ───────
+            del open_px, close_px
+            for p in aligned_plan:
+                p.pop("rank_map", None)
+
+            # ── Close open positions (liquidate at last close price) ────────
+            eob_sell_cost_total = 0.0
             for symbol, pos in holdings.items():
                 holding_days = max(1, (trading_dates[-1] - pos["entry_date"]).days)
                 realized_holding_periods.append(holding_days)
                 close_px_val = pos.get("last_close", pos.get("entry_price", 0.0))
                 entry_p = pos.get("entry_price", 0.0)
+                sell_cost_eob = pos["qty"] * close_px_val * total_cost_rate
+                cumulative_cost_abs += sell_cost_eob
+                eob_sell_cost_total += sell_cost_eob
                 gross_ret_open = (close_px_val / entry_p - 1.0) if entry_p > 0 else None
-                net_ret_open   = (gross_ret_open - total_cost_rate) if gross_ret_open is not None else None
-                hp_cost_drag = (pos["qty"] * entry_p + pos["qty"] * close_px_val) * total_cost_rate / 2.0
+                net_ret_open   = (gross_ret_open - 2 * total_cost_rate) if gross_ret_open is not None else None
+                hp_cost_drag = (pos["qty"] * entry_p + pos["qty"] * close_px_val) * total_cost_rate
                 hp_pnl_abs = (pos["qty"] * close_px_val) - (pos["qty"] * entry_p) - hp_cost_drag
+                total_trades += 1
+                if hp_pnl_abs > 0: winning_trades += 1; sum_win_pnl += hp_pnl_abs
+                else: losing_trades += 1; sum_loss_pnl += hp_pnl_abs
                 holding_period_objects.append(BacktestHoldingPeriod(backtest_run_id=run_record.id, symbol=symbol, entry_date=pos["entry_date"], exit_date=trading_dates[-1], entry_rank=pos.get("entry_rank"), holding_days=holding_days, entry_price=entry_p, exit_price=close_px_val, qty=pos["qty"], gross_return=gross_ret_open, net_return=net_ret_open, cost_drag=hp_cost_drag, pnl_abs=hp_pnl_abs, exit_reason="END_OF_BACKTEST"))
+
+            # ── Adjust final NAV for liquidation exit costs ───────────────────
+            if eob_sell_cost_total > 0 and daily_nav_list:
+                cost_nav_impact = eob_sell_cost_total / initial_capital * 100.0
+                daily_nav_list[-1]["portfolio_nav_net"] -= cost_nav_impact
+                adj_nav = daily_nav_list[-1]["portfolio_nav_net"]
+                peak = daily_nav_list[-1]["running_peak_nav"]
+                daily_nav_list[-1]["drawdown"] = (adj_nav / peak - 1.0) if peak > 0 else 0.0
 
             if holding_period_objects: app_db.bulk_save_objects(holding_period_objects)
             app_db.commit()
@@ -561,10 +596,10 @@ class BacktestEngineService:
             gross_total_return = float(nav_gross.iloc[-1] / 100.0 - 1.0)
             elapsed_days = max(1, (nav_df.index[-1] - nav_df.index[0]).days)
             cagr      = float((nav_net.iloc[-1] / nav_net.iloc[0]) ** (365.25 / elapsed_days) - 1.0) if nav_net.iloc[0] > 0 else 0.0
-            annual_vol = float(ret_net.std(ddof=0) * np.sqrt(252)) if len(ret_net) > 1 else 0.0
-            sharpe    = float(cagr / annual_vol) if annual_vol > 0 else 0.0
-            downside  = ret_net[ret_net < 0]; downside_dev = float(downside.std(ddof=0) * np.sqrt(252)) if len(downside) > 0 else 0.0
-            sortino   = float(cagr / downside_dev) if downside_dev > 0 else 0.0
+            annual_vol = float(ret_net.std(ddof=1) * np.sqrt(252)) if len(ret_net) > 1 else 0.0
+            sharpe    = float((cagr - settings.RISK_FREE_RATE) / annual_vol) if annual_vol > 0 else 0.0
+            downside  = ret_net[ret_net < 0]; downside_dev = float(downside.std(ddof=1) * np.sqrt(252)) if len(downside) > 0 else 0.0
+            sortino   = float((cagr - settings.RISK_FREE_RATE) / downside_dev) if downside_dev > 0 else 0.0
             max_dd    = float(drawdown_series.min()) if not drawdown_series.empty else 0.0
             calmar    = float(cagr / abs(max_dd)) if max_dd != 0 else 0.0
             monthly_nav = nav_net.resample("ME").last()
@@ -645,10 +680,17 @@ class BacktestEngineService:
                     "avg_turnover": avg_turnover,
                     "annualized_turnover": annualized_turnover,
                     "total_cost_drag": float(gross_total_return - total_return),
+                    "total_cost_abs": float(cumulative_cost_abs),
                     "avg_holding_days": avg_holding_days,
                     "median_holding_days": median_holding_days,
                     "avg_retention_pct": avg_retention_pct,
                     "avg_churn_pct": avg_churn_pct,
+                    "total_trades": total_trades,
+                    "winning_trades": winning_trades,
+                    "losing_trades": losing_trades,
+                    "win_rate": float(winning_trades / total_trades) if total_trades > 0 else 0.0,
+                    "avg_profit_per_win": float(sum_win_pnl / winning_trades) if winning_trades > 0 else 0.0,
+                    "avg_loss_per_loss": float(sum_loss_pnl / losing_trades) if losing_trades > 0 else 0.0,
                 },
                 daily_nav_json=daily_nav_list,
                 monthly_returns_json=monthly_returns_list,

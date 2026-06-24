@@ -34,7 +34,6 @@ class BacktestRun(Base):
     to_date = Column(Date, nullable=False)
     rebalance_frequency = Column(String(50), nullable=False, default="WEEKLY")
     portfolio_size = Column(Integer, nullable=False, default=30)
-    top_rank = Column(Integer, nullable=False, default=30)
     wrh = Column(Integer, nullable=False, default=40)
     transaction_cost_bps = Column(Numeric(10, 4), nullable=False, default=0)
     slippage_bps = Column(Numeric(10, 4), nullable=False, default=0)

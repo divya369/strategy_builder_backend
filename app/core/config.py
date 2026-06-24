@@ -53,6 +53,7 @@ class Settings:
     CELERY_RESULT_BACKEND: str = os.getenv("CELERY_RESULT_BACKEND", "redis://localhost:6379/3")
     BACKTEST_STALE_MINUTES: int = int(os.getenv("BACKTEST_STALE_MINUTES", "30"))
     BACKTEST_HEARTBEAT_SECONDS: int = int(os.getenv("BACKTEST_HEARTBEAT_SECONDS", "30"))
+    RISK_FREE_RATE: float = float(os.getenv("RISK_FREE_RATE", "0.065"))  # 6.5% default (India 91-day T-bill)
 
     # ── Equity DB column config ───────────────────────────────────────────────
     # Columns expected in every equity_ohlc per-symbol table

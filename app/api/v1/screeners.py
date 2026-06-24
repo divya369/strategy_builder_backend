@@ -19,6 +19,7 @@ from app.services import csv_data_service
 from app.models.screener import ScreenerVersion, Screener
 from app.models.backtest import BacktestRun
 from app.models.result import BacktestSummary
+from app.core.backtest_error_classifier import classify_error
 from zoneinfo import ZoneInfo
 
 router = APIRouter()
@@ -129,13 +130,15 @@ def get_version_backtests(screener_id: uuid.UUID, version_id: uuid.UUID, db: Ses
     result = []
     for run in runs:
         res = db.query(BacktestSummary).filter(BacktestSummary.backtest_run_id == run.id).first()
+        error_type, error_message = classify_error(run.error_message) if run.status == "FAILED" else (None, None)
         result.append({
             "run_id": str(run.id), "run_name": run.run_name or f"Run {run.id}",
             "period": f"{run.from_date} to {run.to_date}", "rebalance": run.rebalance_frequency,
             "portfolio_size": run.portfolio_size, "wrh": run.wrh,
             "cagr": format_metric_value(res.metrics_json.get("cagr"), "%") if res and res.metrics_json else None,
             "total_return": format_metric_value(res.metrics_json.get("total_return"), '%') if res and res.metrics_json else None,
-            "status": run.status, "created_at": run.created_at
+            "status": run.status, "created_at": run.created_at,
+            "error_type": error_type, "error_message": error_message
         })
     return result
 

@@ -123,7 +123,67 @@ def get_multi_stock_ohlc(
     Fetch OHLC for multiple symbols and return a combined long-format DataFrame.
     Columns: date, symbol, open, close.
     Symbols with no table are silently skipped.
+
+    Uses a single UNION ALL query instead of per-symbol queries for speed
+    (1 DB round-trip instead of N). Falls back to per-symbol loop on failure.
     """
+    if not symbols:
+        return pd.DataFrame(columns=["date", "symbol", "open", "close"])
+
+    # ── Resolve symbols to table names and check which tables exist ────────
+    existing_tables = set(list_available_symbols(db))
+    sym_table_pairs = []
+    for sym in symbols:
+        table_sym = resolve_stock_symbol(sym)
+        if table_sym in existing_tables:
+            sym_table_pairs.append((sym, table_sym))
+        else:
+            logger.debug("No OHLC table for symbol '%s' (resolved: '%s') — skipping", sym, table_sym)
+
+    if not sym_table_pairs:
+        return pd.DataFrame(columns=["date", "symbol", "open", "close"])
+
+    # ── Build single UNION ALL query ──────────────────────────────────────
+    date_col = _quote(_DATE_COL)
+    open_col = _quote(_OPEN_COL)
+    close_col = _quote(_CLOSE_COL)
+
+    parts = []
+    for sym, table_sym in sym_table_pairs:
+        # Use double-dollar quoting for the symbol literal to avoid SQL issues
+        safe_sym = sym.replace("'", "''")
+        table = _quote(table_sym)
+        parts.append(
+            f"SELECT '{safe_sym}' AS symbol, "
+            f"{date_col} AS date, {open_col} AS open, {close_col} AS close "
+            f"FROM public.{table} "
+            f"WHERE {date_col} BETWEEN :from_date AND :to_date"
+        )
+
+    full_sql = text(" UNION ALL ".join(parts))
+
+    try:
+        result = db.execute(full_sql, {"from_date": from_date, "to_date": to_date})
+        rows = result.fetchall()
+        if not rows:
+            return pd.DataFrame(columns=["date", "symbol", "open", "close"])
+        df = pd.DataFrame(rows, columns=["symbol", "date", "open", "close"])
+        df["date"]  = pd.to_datetime(df["date"]).dt.date
+        df["open"]  = pd.to_numeric(df["open"],  errors="coerce")
+        df["close"] = pd.to_numeric(df["close"], errors="coerce")
+        return df[["date", "symbol", "open", "close"]]
+    except Exception as exc:
+        logger.warning("Batch OHLC query failed, falling back to per-symbol loop: %s", exc)
+        return _get_multi_stock_ohlc_loop(symbols, from_date, to_date, db)
+
+
+def _get_multi_stock_ohlc_loop(
+    symbols: List[str],
+    from_date: date,
+    to_date: date,
+    db: Session,
+) -> pd.DataFrame:
+    """Original per-symbol loop fallback for get_multi_stock_ohlc."""
     frames = []
     for symbol in symbols:
         df = get_stock_ohlc(symbol, from_date, to_date, db)
