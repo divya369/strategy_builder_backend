@@ -113,8 +113,8 @@ class BacktestEngineService:
         wrh       = request_data.get("wrh", 40)
         universe_cfg   = request_data.get("universe", {})
         benchmark_symbol = (
-            universe_cfg.get("value", "NIFTY 200")
-            if universe_cfg.get("type") == "index" else "NIFTY 200"
+            universe_cfg.get("value", "NIFTY 50")
+            if universe_cfg.get("type") == "index" else "NIFTY 50"
         )
 
         run = BacktestRun(
@@ -447,13 +447,14 @@ class BacktestEngineService:
             for current_date in trading_dates:
                 # ── Heartbeat: signal that the worker is still alive ───────
                 if time.time() - _last_heartbeat_time >= settings.BACKTEST_HEARTBEAT_SECONDS:
+                    _hb_db = None
                     try:
                         _hb_db = SessionLocal()
                         BacktestJobService.heartbeat(_hb_db, run_id)
                     except Exception as hb_exc:
                         logger.debug("Heartbeat update failed: %s", hb_exc)
                     finally:
-                        _hb_db.close()
+                        if _hb_db: _hb_db.close()
                     _last_heartbeat_time = time.time()
                 day_cost_abs = day_trade_notional = event_turnover = 0.0
                 positions_before = len(holdings)
@@ -482,10 +483,17 @@ class BacktestEngineService:
                         holding_days = max(1, (current_date - pos["entry_date"]).days)
                         realized_holding_periods.append(holding_days)
                         entry_p = pos.get("entry_price", 0.0)
-                        gross_ret = (sell_px / entry_p - 1.0) if entry_p > 0 else None
-                        net_ret = (gross_ret - 2 * total_cost_rate) if gross_ret is not None else None
-                        hp_cost_drag = (pos["qty"] * entry_p + pos["qty"] * sell_px) * total_cost_rate
-                        hp_pnl_abs = (pos["qty"] * sell_px) - (pos["qty"] * entry_p) - hp_cost_drag
+                        # gross_ret = (sell_px / entry_p - 1.0) if entry_p > 0 else None
+                        # net_ret = (gross_ret - 2 * total_cost_rate) if gross_ret is not None else None
+                        # hp_cost_drag = (pos["qty"] * entry_p + pos["qty"] * sell_px) * total_cost_rate
+                        # hp_pnl_abs = (pos["qty"] * sell_px) - (pos["qty"] * entry_p) - hp_cost_drag
+                        buy_value = pos["qty"] * entry_p
+                        sell_value = pos["qty"] * sell_px
+                        gross_ret = (sell_value / buy_value - 1.0) if buy_value > 0 else None
+                        hp_cost_drag = (buy_value + sell_value) * total_cost_rate
+                        hp_pnl_abs = sell_value - buy_value - hp_cost_drag
+                        net_ret = (hp_pnl_abs / buy_value) if buy_value > 0 else None
+
                         total_trades += 1
                         if hp_pnl_abs > 0: winning_trades += 1; sum_win_pnl += hp_pnl_abs
                         else: losing_trades += 1; sum_loss_pnl += hp_pnl_abs
@@ -562,22 +570,50 @@ class BacktestEngineService:
                 sell_cost_eob = pos["qty"] * close_px_val * total_cost_rate
                 cumulative_cost_abs += sell_cost_eob
                 eob_sell_cost_total += sell_cost_eob
-                gross_ret_open = (close_px_val / entry_p - 1.0) if entry_p > 0 else None
-                net_ret_open   = (gross_ret_open - 2 * total_cost_rate) if gross_ret_open is not None else None
-                hp_cost_drag = (pos["qty"] * entry_p + pos["qty"] * close_px_val) * total_cost_rate
-                hp_pnl_abs = (pos["qty"] * close_px_val) - (pos["qty"] * entry_p) - hp_cost_drag
+                # gross_ret_open = (close_px_val / entry_p - 1.0) if entry_p > 0 else None
+                # net_ret_open   = (gross_ret_open - 2 * total_cost_rate) if gross_ret_open is not None else None
+                # hp_cost_drag = (pos["qty"] * entry_p + pos["qty"] * close_px_val) * total_cost_rate
+                # hp_pnl_abs = (pos["qty"] * close_px_val) - (pos["qty"] * entry_p) - hp_cost_drag
+                buy_value = pos["qty"] * entry_p
+                sell_value = pos["qty"] * close_px_val
+
+                gross_ret_open = (sell_value / buy_value - 1.0) if buy_value > 0 else None
+                hp_cost_drag = (buy_value + sell_value) * total_cost_rate
+                hp_pnl_abs = sell_value - buy_value - hp_cost_drag
+                net_ret_open = (hp_pnl_abs / buy_value) if buy_value > 0 else None
+
                 total_trades += 1
                 if hp_pnl_abs > 0: winning_trades += 1; sum_win_pnl += hp_pnl_abs
                 else: losing_trades += 1; sum_loss_pnl += hp_pnl_abs
                 holding_period_objects.append(BacktestHoldingPeriod(backtest_run_id=run_record.id, symbol=symbol, entry_date=pos["entry_date"], exit_date=trading_dates[-1], entry_rank=pos.get("entry_rank"), holding_days=holding_days, entry_price=entry_p, exit_price=close_px_val, qty=pos["qty"], gross_return=gross_ret_open, net_return=net_ret_open, cost_drag=hp_cost_drag, pnl_abs=hp_pnl_abs, exit_reason="END_OF_BACKTEST"))
 
             # ── Adjust final NAV for liquidation exit costs ───────────────────
+            # if eob_sell_cost_total > 0 and daily_nav_list:
+            #     cost_nav_impact = eob_sell_cost_total / initial_capital * 100.0
+            #     daily_nav_list[-1]["portfolio_nav_net"] -= cost_nav_impact
+            #     adj_nav = daily_nav_list[-1]["portfolio_nav_net"]
+            #     peak = daily_nav_list[-1]["running_peak_nav"]
+            #     daily_nav_list[-1]["drawdown"] = (adj_nav / peak - 1.0) if peak > 0 else 0.0
+
             if eob_sell_cost_total > 0 and daily_nav_list:
                 cost_nav_impact = eob_sell_cost_total / initial_capital * 100.0
                 daily_nav_list[-1]["portfolio_nav_net"] -= cost_nav_impact
-                adj_nav = daily_nav_list[-1]["portfolio_nav_net"]
-                peak = daily_nav_list[-1]["running_peak_nav"]
-                daily_nav_list[-1]["drawdown"] = (adj_nav / peak - 1.0) if peak > 0 else 0.0
+
+                if len(daily_nav_list) >= 2:
+                    prev_nav = daily_nav_list[-2]["portfolio_nav_net"]
+                    curr_nav = daily_nav_list[-1]["portfolio_nav_net"]
+                    daily_nav_list[-1]["portfolio_return_net"] = (
+                        curr_nav / prev_nav - 1.0
+                        if prev_nav > 0 else 0.0)
+
+                all_navs = [row["portfolio_nav_net"] for row in daily_nav_list]
+                running_peaks = pd.Series(all_navs).cummax().tolist()
+
+                for i, row in enumerate(daily_nav_list):
+                    row["running_peak_nav"] = float(running_peaks[i])
+                    row["drawdown"] = (
+                        float(row["portfolio_nav_net"] / running_peaks[i] - 1.0)
+                        if running_peaks[i] > 0 else 0.0)
 
             if holding_period_objects: app_db.bulk_save_objects(holding_period_objects)
             app_db.commit()
@@ -596,28 +632,76 @@ class BacktestEngineService:
             gross_total_return = float(nav_gross.iloc[-1] / 100.0 - 1.0)
             elapsed_days = max(1, (nav_df.index[-1] - nav_df.index[0]).days)
             cagr      = float((nav_net.iloc[-1] / nav_net.iloc[0]) ** (365.25 / elapsed_days) - 1.0) if nav_net.iloc[0] > 0 else 0.0
+            # annual_vol = float(ret_net.std(ddof=1) * np.sqrt(252)) if len(ret_net) > 1 else 0.0
+            # sharpe    = float((cagr - settings.RISK_FREE_RATE) / annual_vol) if annual_vol > 0 else 0.0
+            # downside  = ret_net[ret_net < 0]; downside_dev = float(downside.std(ddof=1) * np.sqrt(252)) if len(downside) > 0 else 0.0
+            # sortino   = float((cagr - settings.RISK_FREE_RATE) / downside_dev) if downside_dev > 0 else 0.0
             annual_vol = float(ret_net.std(ddof=1) * np.sqrt(252)) if len(ret_net) > 1 else 0.0
-            sharpe    = float((cagr - settings.RISK_FREE_RATE) / annual_vol) if annual_vol > 0 else 0.0
-            downside  = ret_net[ret_net < 0]; downside_dev = float(downside.std(ddof=1) * np.sqrt(252)) if len(downside) > 0 else 0.0
-            sortino   = float((cagr - settings.RISK_FREE_RATE) / downside_dev) if downside_dev > 0 else 0.0
+            risk_free_rate = float(settings.RISK_FREE_RATE or 0.0)
+            daily_rf = (1 + risk_free_rate) ** (1 / 252) - 1
+            excess_daily_returns = ret_net - daily_rf
+            sharpe = (
+                float(excess_daily_returns.mean() / ret_net.std(ddof=1) * np.sqrt(252))
+                if len(ret_net) > 1 and ret_net.std(ddof=1) > 0
+                else 0.0
+            )
+            downside_returns = np.minimum(excess_daily_returns, 0.0)
+            downside_dev = float(np.sqrt(np.mean(downside_returns ** 2)) * np.sqrt(252))
+            annualized_excess_return = float(excess_daily_returns.mean() * 252)
+            sortino = (
+                float(annualized_excess_return / downside_dev)
+                if downside_dev > 0
+                else 0.0
+            )
+            
             max_dd    = float(drawdown_series.min()) if not drawdown_series.empty else 0.0
             calmar    = float(cagr / abs(max_dd)) if max_dd != 0 else 0.0
             monthly_nav = nav_net.resample("ME").last()
-            monthly_nav_padded = pd.concat([pd.Series([100.0], index=[monthly_nav.index[0] - pd.offsets.MonthEnd(1)]), monthly_nav])
-            monthly_rets = monthly_nav_padded.pct_change().dropna()
+            # monthly_nav_padded = pd.concat([pd.Series([100.0], index=[monthly_nav.index[0] - pd.offsets.MonthEnd(1)]), monthly_nav])
+            if not monthly_nav.empty:
+                monthly_nav_padded = pd.concat([
+                    pd.Series([100.0], index=[monthly_nav.index[0] - pd.offsets.MonthEnd(1)]),
+                    monthly_nav
+                ])
+                monthly_rets = monthly_nav_padded.pct_change().dropna()
+            else:
+                monthly_rets = pd.Series(dtype=float)
 
             bm_nav_series = pd.Series({pd.Timestamp(d): v for d, v in bm_nav_by_date.items()}).sort_index() if bm_nav_by_date else None
             bm_monthly_rets = None
             if bm_nav_series is not None and not bm_nav_series.empty:
                 bm_monthly_nav = bm_nav_series.resample("ME").last()
-                bm_monthly_nav_padded = pd.concat([pd.Series([100.0], index=[bm_monthly_nav.index[0] - pd.offsets.MonthEnd(1)]), bm_monthly_nav])
-                bm_monthly_rets = bm_monthly_nav_padded.pct_change().dropna()
+                # bm_monthly_nav_padded = pd.concat([pd.Series([100.0], index=[bm_monthly_nav.index[0] - pd.offsets.MonthEnd(1)]), bm_monthly_nav])
+                # bm_monthly_rets = bm_monthly_nav_padded.pct_change().dropna()
+                if not bm_monthly_nav.empty:
+                    bm_monthly_nav_padded = pd.concat([
+                        pd.Series(
+                            [100.0],
+                            index=[bm_monthly_nav.index[0] - pd.offsets.MonthEnd(1)]
+                        ),
+                        bm_monthly_nav
+                    ])
+                    bm_monthly_rets = bm_monthly_nav_padded.pct_change().dropna()
+                else:
+                    bm_monthly_rets = pd.Series(dtype=float)
+            else:
+                bm_monthly_rets = None
 
             monthly_returns_list = []
+            # for dt, mret in monthly_rets.items():
+            #     bm_mret = float(bm_monthly_rets.get(dt, 0.0)) if bm_monthly_rets is not None else None
+            #     excess_mret = (float(mret) - bm_mret) if bm_mret is not None else float(mret)
+            #     monthly_returns_list.append({"year": dt.year, "month": dt.month, "monthly_return": float(mret), "benchmark_monthly_return": bm_mret, "excess_monthly_return": excess_mret})
             for dt, mret in monthly_rets.items():
                 bm_mret = float(bm_monthly_rets.get(dt, 0.0)) if bm_monthly_rets is not None else None
                 excess_mret = (float(mret) - bm_mret) if bm_mret is not None else float(mret)
-                monthly_returns_list.append({"year": dt.year, "month": dt.month, "monthly_return": float(mret), "benchmark_monthly_return": bm_mret, "excess_monthly_return": excess_mret})
+                monthly_returns_list.append({
+                    "year": dt.year,
+                    "month": dt.month,
+                    "monthly_return": float(mret),
+                    "benchmark_monthly_return": bm_mret,
+                    "excess_monthly_return": excess_mret
+                })
 
             positive_month_pct = float((monthly_rets > 0).mean()) if len(monthly_rets) > 0 else 0.0
             best_month = float(monthly_rets.max()) if len(monthly_rets) > 0 else 0.0
@@ -646,10 +730,31 @@ class BacktestEngineService:
                     both_nonzero = (port_ret_arr != 0) | (bm_ret_arr != 0)
                     if both_nonzero.sum() > 0:
                         hit_ratio_val = float((port_ret_arr[both_nonzero] > bm_ret_arr[both_nonzero]).mean())
+                    # up_days = bm_ret_arr > 0
+                    # if up_days.sum() > 0: upside_cap_val = float(port_ret_arr[up_days].mean() / bm_ret_arr[up_days].mean())
+                    # down_days = bm_ret_arr < 0
+                    # if down_days.sum() > 0: downside_cap_val = float(port_ret_arr[down_days].mean() / bm_ret_arr[down_days].mean())
+
                     up_days = bm_ret_arr > 0
-                    if up_days.sum() > 0: upside_cap_val = float(port_ret_arr[up_days].mean() / bm_ret_arr[up_days].mean())
+                    if up_days.sum() > 0:
+                        port_up_compounded = float((1 + port_ret_arr[up_days]).prod() - 1)
+                        bm_up_compounded = float((1 + bm_ret_arr[up_days]).prod() - 1)
+
+                        upside_cap_val = (
+                            port_up_compounded / bm_up_compounded
+                            if bm_up_compounded != 0 else None
+                        )
+
                     down_days = bm_ret_arr < 0
-                    if down_days.sum() > 0: downside_cap_val = float(port_ret_arr[down_days].mean() / bm_ret_arr[down_days].mean())
+                    if down_days.sum() > 0:
+                        port_down_compounded = float((1 + port_ret_arr[down_days]).prod() - 1)
+                        bm_down_compounded = float((1 + bm_ret_arr[down_days]).prod() - 1)
+
+                        downside_cap_val = (
+                            port_down_compounded / bm_down_compounded
+                            if bm_down_compounded != 0
+                            else None
+                        )
 
             # ── Drawdowns (JSONB only) ────────────────────────────────────
             dd_episodes = self._make_drawdown_episodes(nav_net)

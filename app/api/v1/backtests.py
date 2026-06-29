@@ -95,4 +95,4 @@ def get_backtest_result(run_id: uuid.UUID, db: Session = Depends(get_db)):
             "final_nav": round(daily_nav_data[-1]["portfolio_nav_net"], 2) if daily_nav_data else 0.0,
         }
 
-    return {"run_name": run.run_name, "status": run.status, "initial_capital": float(run.initial_capital), "metrics": metrics, "equity_curve": chart_data, "benchmark_curve": benchmark_curve}
+    return {"run_name": run.run_name, "status": run.status, "initial_capital": float(run.initial_capital), "metrics": metrics, "equity_curve": chart_data, "benchmark_curve": benchmark_curve, "benchmark_label": run.benchmark_symbol or "NIFTY 50"}
