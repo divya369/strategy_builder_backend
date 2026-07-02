@@ -100,6 +100,24 @@ def daily_equity_curve_update(today: date | None = None) -> int:
         count = LiveInvestmentService.daily_equity_curve_update(db, today)
         mtm_logger.info("[DailyMTM] Completed — updated %d strategies for %s", count, today)
 
+        # Safety net: verify strategies still stuck in pending states via kite.orders()
+        # This catches missed postbacks and failed orderbook verification tasks.
+        # Must run BEFORE auto_timeout to give stuck strategies a chance to resolve.
+        try:
+            safety_count = LiveInvestmentService.safety_net_verify_pending_strategies(db, today)
+            if safety_count:
+                mtm_logger.info("[DailyMTM] Safety net resolved %d stuck strategies", safety_count)
+        except Exception:
+            mtm_logger.exception("[DailyMTM] Safety net failed — non-blocking")
+
+        # Store daily orderbook backup (tag-filtered JSON per broker_account)
+        try:
+            backup_count = LiveInvestmentService.store_daily_orderbook_backup(db, today)
+            if backup_count:
+                mtm_logger.info("[DailyMTM] Stored orderbook backups for %d broker_accounts", backup_count)
+        except Exception:
+            mtm_logger.exception("[DailyMTM] Orderbook backup failed — non-blocking")
+
         # Auto-cancel strategies stuck in PENDING_USER_APPROVAL with no fills
         timeout_count = LiveInvestmentService.auto_timeout_stale_strategies(db, today)
         if timeout_count:

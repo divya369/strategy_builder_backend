@@ -12,6 +12,14 @@
   <style>
     @import url('https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700&display=swap');
 
+    /* Prevent image distortion / weird scaling across clients */
+    img {
+      border: 0;
+      outline: none;
+      text-decoration: none;
+      -ms-interpolation-mode: bicubic;
+    }
+
     /* Responsive overrides */
     @media only screen and (max-width: 599px) {
       .email-container {
@@ -28,10 +36,6 @@
         padding-right: 16px !important;
       }
 
-      .email-outer-pad {
-        padding: 16px 8px !important;
-      }
-
       .email-title {
         font-size: 15px !important;
       }
@@ -40,6 +44,7 @@
         width: 100% !important;
         display: block !important;
         text-align: center !important;
+        box-sizing: border-box !important;
       }
 
       .email-hr {
@@ -53,7 +58,11 @@
 <body style="background-color:rgb(243,244,246);margin:0;padding:0"><!--$--><!--html--><!--head-->
   <div style="display:none;overflow:hidden;line-height:1px;opacity:0;max-height:0;max-width:0" data-skip-in-text="true">
     Strategy &quot;{{ strategy_name }}&quot; has been rebalanced and is ready for execution.<div>
-       ‌​‍‎‏﻿ ‌​‍‎‏﻿ ‌​‍‎‏﻿ ‌​‍‎‏﻿ ‌​‍‎‏﻿ ‌​‍‎‏﻿ ‌​‍‎‏﻿ ‌​‍‎‏﻿ ‌​‍‎‏﻿ ‌​‍‎‏﻿ ‌​‍‎‏﻿ ‌​‍‎‏﻿ ‌​‍‎‏﻿ ‌​‍‎‏﻿ ‌​‍‎‏﻿ ‌​‍‎‏﻿ ‌​‍‎‏﻿ ‌​‍‎‏﻿ ‌​‍‎‏﻿ ‌​‍‎‏﻿ ‌​‍‎‏﻿ ‌​‍‎‏﻿ ‌​‍‎‏﻿ ‌​‍‎‏﻿ ‌​‍‎‏﻿ ‌​‍‎‏﻿ ‌​‍‎‏﻿ ‌​‍‎‏﻿ ‌​‍‎‏﻿ ‌​‍‎‏﻿ ‌​‍‎‏﻿ ‌​‍‎‏﻿ ‌​‍‎‏﻿ ‌​‍‎‏﻿ ‌​‍‎‏﻿ ‌​‍‎‏﻿ ‌​‍‎‏﻿ ‌​‍‎‏﻿ ‌​‍‎‏﻿ ‌​‍‎‏﻿ ‌​‍‎‏﻿ ‌​‍‎‏﻿ ‌​‍‎‏﻿ ‌​‍‎‏﻿ ‌​‍‎‏﻿ ‌​‍‎‏﻿ ‌​‍‎‏﻿ ‌​‍‎‏﻿ ‌​‍‎‏﻿ ‌​‍‎‏﻿ ‌​‍‎‏﻿ ‌​‍‎‏﻿ ‌​‍‎‏﻿ ‌​‍‎‏﻿ ‌​‍‎‏﻿ ‌​‍‎‏﻿ ‌​‍‎‏﻿ ‌​‍‎‏﻿ ‌​‍‎‏﻿ ‌​‍‎‏﻿ ‌​‍‎‏﻿ ‌​‍‎‏﻿ ‌​‍‎‏﻿ ‌​‍‎‏﻿ ‌​‍‎‏﻿ ‌​‍‎‏﻿ ‌​‍‎‏﻿ ‌​‍‎‏﻿ ‌​‍‎‏﻿ ‌​‍‎‏﻿ ‌​‍‎‏﻿ ‌​‍‎‏﻿ ‌​‍‎‏﻿ ‌​‍‎‏﻿ ‌​‍‎‏﻿
+      ‌​‍‎‏﻿ ‌​‍‎‏﻿ ‌​‍‎‏﻿ ‌​‍‎‏﻿ ‌​‍‎‏﻿ ‌​‍‎‏﻿ ‌​‍‎‏﻿ ‌​‍‎‏﻿ ‌​‍‎‏﻿ ‌​‍‎‏﻿ ‌​‍‎‏﻿ ‌​‍‎‏﻿ ‌​‍‎‏﻿ ‌​‍‎‏﻿ ‌​‍‎‏﻿ ‌​‍‎‏﻿
+      ‌​‍‎‏﻿ ‌​‍‎‏﻿ ‌​‍‎‏﻿ ‌​‍‎‏﻿ ‌​‍‎‏﻿ ‌​‍‎‏﻿ ‌​‍‎‏﻿ ‌​‍‎‏﻿ ‌​‍‎‏﻿ ‌​‍‎‏﻿ ‌​‍‎‏﻿ ‌​‍‎‏﻿ ‌​‍‎‏﻿ ‌​‍‎‏﻿ ‌​‍‎‏﻿ ‌​‍‎‏﻿
+      ‌​‍‎‏﻿ ‌​‍‎‏﻿ ‌​‍‎‏﻿ ‌​‍‎‏﻿ ‌​‍‎‏﻿ ‌​‍‎‏﻿ ‌​‍‎‏﻿ ‌​‍‎‏﻿ ‌​‍‎‏﻿ ‌​‍‎‏﻿ ‌​‍‎‏﻿ ‌​‍‎‏﻿ ‌​‍‎‏﻿ ‌​‍‎‏﻿ ‌​‍‎‏﻿ ‌​‍‎‏﻿
+      ‌​‍‎‏﻿ ‌​‍‎‏﻿ ‌​‍‎‏﻿ ‌​‍‎‏﻿ ‌​‍‎‏﻿ ‌​‍‎‏﻿ ‌​‍‎‏﻿ ‌​‍‎‏﻿ ‌​‍‎‏﻿ ‌​‍‎‏﻿ ‌​‍‎‏﻿ ‌​‍‎‏﻿ ‌​‍‎‏﻿ ‌​‍‎‏﻿ ‌​‍‎‏﻿ ‌​‍‎‏﻿
+      ‌​‍‎‏﻿ ‌​‍‎‏﻿ ‌​‍‎‏﻿ ‌​‍‎‏﻿ ‌​‍‎‏﻿ ‌​‍‎‏﻿ ‌​‍‎‏﻿ ‌​‍‎‏﻿ ‌​‍‎‏﻿ ‌​‍‎‏﻿
     </div>
   </div><!--body-->
   <table border="0" width="100%" cellPadding="0" cellSpacing="0" role="presentation" align="center">
@@ -79,14 +88,13 @@
                             <tbody>
                               <tr>
                                 <td>
-                                  <table align="center" width="100%" border="0" cellPadding="0" cellSpacing="0"
-                                    role="presentation">
-                                    <tbody style="width:100%">
-                                      <tr style="width:100%">
-                                        <td data-id="__react-email-column" style="width:24px;vertical-align:middle"><img
-                                            alt="EquityCase" height="18" src="https://www.equitycase.com/logo.png"
-                                            style="display:block;outline:none;border:none;text-decoration:none"
-                                            width="18" /></td>
+                                  <table align="center" border="0" cellPadding="0" cellSpacing="0" role="presentation">
+                                    <tbody>
+                                      <tr>
+                                        <td data-id="__react-email-column" style="vertical-align:middle;line-height:0">
+                                          <img alt="EquityCase" src="https://www.equitycase.com/logo.png" width="120"
+                                            style="display:block;height:auto;max-width:120px;width:100%;outline:none;border:none;text-decoration:none" />
+                                        </td>
                                       </tr>
                                     </tbody>
                                   </table>
@@ -108,7 +116,8 @@
                                     Your strategy <!-- --> <strong style="color:#111827">&quot;<!-- -->{{ strategy_name
                                       }}<!-- -->&quot;</strong> <!-- --> is due for rebalance.{% if rebalance_date %}
                                     You can execute it on <strong style="color:#111827">{{ rebalance_date }}</strong>
-                                    between <strong style="color:#111827">9:15 AM – 3:20 PM IST</strong> (market hours).{% endif %}
+                                    between <strong style="color:#111827">9:15 AM – 3:20 PM IST</strong> (market
+                                    hours).{% endif %}
                                   </p>
                                 </td>
                               </tr>
@@ -178,8 +187,11 @@
                                   </table>
                                   {% endfor %}
                                   {% else %}
-                                  <p style="font-size:13px;line-height:1.5;color:#111827;margin:0;padding:12px;background-color:#f8fafc;border-radius:6px;border:1px solid #e2e8f0;">
-                                    <strong style="color:#0f172a">No Action Required:</strong> There are no rebalance changes required for your portfolio today. Your strategy will continue with its existing holdings.
+                                  <p
+                                    style="font-size:13px;line-height:1.5;color:#111827;margin:0;padding:12px;background-color:#f8fafc;border-radius:6px;border:1px solid #e2e8f0;">
+                                    <strong style="color:#0f172a">No Action Required:</strong> There are no rebalance
+                                    changes required for your portfolio today. Your strategy will continue with its
+                                    existing holdings.
                                   </p>
                                   {% endif %}
                                 </td>
@@ -250,7 +262,8 @@
                         <td>
                           <p
                             style="font-size:10px;line-height:1.6;margin:0;color:#9ca3af;margin-top:0;margin-bottom:0;margin-left:0;margin-right:0">
-                            You are receiving this because you have an active strategy on EquityCase.<br />© 2026 EquityCase. All rights
+                            You are receiving this because you have an active strategy on EquityCase.<br />© 2026
+                            EquityCase. All rights
                             reserved.</p>
                         </td>
                       </tr>

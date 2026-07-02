@@ -46,3 +46,46 @@ class BrokerPublisherAdapter(ABC):
         Override in broker-specific adapter to implement verification.
         """
         return None
+
+    def fetch_orderbook(self, user_access_token: str) -> list:
+        """Fetch full day's orderbook for a user via broker API.
+
+        Uses the Publisher/app API key + the user's access_token (obtained
+        via token exchange during Publisher redirect) to fetch the complete
+        orderbook for that user for the current day.
+
+        Returns:
+            List of order dicts from the broker, or empty list on failure.
+
+        Raises:
+            NotImplementedError if the broker doesn't support orderbook fetch.
+        """
+        raise NotImplementedError(
+            f"Broker {self.broker} does not support orderbook fetch."
+        )
+
+    def exchange_token(self, request_token: str) -> Dict[str, Any]:
+        """Exchange a broker-specific request_token for access credentials.
+
+        Called after Publisher/offsite redirect returns a request_token.
+        Each broker adapter implements its own exchange logic.
+
+        Returns:
+            {
+                "access_token": str,
+                "user_id": str,
+                "user_name": str | None,
+                "email": str | None,
+                "broker": str,
+                "expires_at": datetime | None,
+                "profile": dict,     # broker-specific raw profile data
+            }
+
+        Raises:
+            NotImplementedError if the broker doesn't support token exchange.
+            requests.HTTPError if the exchange API call fails.
+        """
+        raise NotImplementedError(
+            f"Broker {self.broker} does not support token exchange."
+        )
+

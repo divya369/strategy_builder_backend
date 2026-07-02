@@ -42,7 +42,10 @@ from app.models.live_investment import (
     LivePublisherBasket,
     LiveBrokerAccount,
     LiveStatus,
+    PostbackLog,
 )
+import redis
+from app.core.encryption import decrypt_token
 from app.services.screener_execution_service import screener_execution_service
 from app.core.trading_calendar import next_trading_day, should_prepare_rebalance, next_rebalance_prepare_date
 from app.services.broker_publishers import get_publisher_adapter
@@ -867,6 +870,10 @@ def make_equitycurve_table(TODAY: date, user: LiveStrategy) -> pd.DataFrame:
         "monthly_return": 0.0,
         "quarterly_return": 0.0,
         "yearly_return": 0.0,
+        "benchmark_price": _safe_benchmark_price(TODAY, _get_benchmark_index_name(user)),
+        "benchmark_roc": 0.0,
+        "benchmark_daily_return": 0.0,
+        "benchmark_daily_performance": 0.0,
     }])
 
 
@@ -888,6 +895,43 @@ def _safe_latest_index_price(TODAY: date) -> float:
             if not today_rows.empty:
                 return float(today_rows["close"].iloc[-1])
         return float(temp_index_df["close"].iloc[-1])
+    except Exception:
+        return 0.0
+
+
+def _get_benchmark_index_name(strategy: "LiveStrategy") -> str:
+    """Extract the user-selected index name from the strategy's universe_json.
+
+    universe_json is like: {"type": "index", "value": "NIFTY 500"}
+    If type != "index" or value is missing/empty, default to "NIFTY 50".
+    """
+    uj = strategy.universe_json
+    if not uj or not isinstance(uj, dict):
+        return "NIFTY 50"
+    if uj.get("type") != "index" or not uj.get("value"):
+        return "NIFTY 50"
+    return uj["value"]
+
+
+def _safe_benchmark_price(TODAY: date, index_name: str) -> float:
+    """Return the benchmark index close price, same pattern as _safe_latest_index_price.
+
+    Reads from the equity_engine table named by index_name (e.g. "NIFTY 500").
+    Falls back to 0.0 if unavailable.
+    """
+    if not index_name or index_name == "NIFTY 50":
+        # Same as the main index — reuse that function to avoid duplicate reads
+        return _safe_latest_index_price(TODAY)
+    try:
+        temp_df = pd.read_sql_table(index_name, equity_engine)
+        if temp_df.empty or "close" not in temp_df.columns:
+            return 0.0
+        if "date" in temp_df.columns:
+            temp_df["date"] = pd.to_datetime(temp_df["date"]).dt.date
+            today_rows = temp_df.loc[temp_df["date"] == TODAY]
+            if not today_rows.empty:
+                return float(today_rows["close"].iloc[-1])
+        return float(temp_df["close"].iloc[-1])
     except Exception:
         return 0.0
 
@@ -950,6 +994,15 @@ def update_equitycurve(
     strategy_daily_performance = round((aum - yesterday_aum) / yesterday_aum * 100, 2) if yesterday_aum else 0.0
     index_daily_performance = round((index_price - previous_index_price) / previous_index_price * 100, 2) if previous_index_price else 0.0
     compare = 1 if strategy_daily_performance > index_daily_performance else 0
+
+    # ── Benchmark (user-selected index) ──────────────────────────────────
+    benchmark_index_name = _get_benchmark_index_name(user)
+    benchmark_price = _safe_benchmark_price(TODAY, benchmark_index_name)
+    first_benchmark_price = float(equitycurve_df["benchmark_price"].iloc[0] or 0.0) if "benchmark_price" in equitycurve_df.columns else 0.0
+    previous_benchmark_price = float(equitycurve_df["benchmark_price"].iloc[-1] or 0.0) if "benchmark_price" in equitycurve_df.columns else 0.0
+    benchmark_roc = round((benchmark_price - first_benchmark_price) / first_benchmark_price * 100, 2) if first_benchmark_price else 0.0
+    benchmark_daily_return = round(benchmark_price - previous_benchmark_price, 2) if previous_benchmark_price else 0.0
+    benchmark_daily_performance = round((benchmark_price - previous_benchmark_price) / previous_benchmark_price * 100, 2) if previous_benchmark_price else 0.0
 
     total_unrealised_pnl = round(float(tradelog_df["unrealised_pnl"].sum()), 2) if not tradelog_df.empty and "unrealised_pnl" in tradelog_df.columns else 0.0
     total_realised_pnl = round(float(tradelog_df["realised_pnl"].sum()), 2) if not tradelog_df.empty and "realised_pnl" in tradelog_df.columns else 0.0
@@ -1102,6 +1155,10 @@ def update_equitycurve(
         "monthly_return": monthly_return,
         "quarterly_return": quarterly_return,
         "yearly_return": yearly_return,
+        "benchmark_price": benchmark_price,
+        "benchmark_roc": benchmark_roc,
+        "benchmark_daily_return": benchmark_daily_return,
+        "benchmark_daily_performance": benchmark_daily_performance,
     }
 
     return pd.concat([equitycurve_df, pd.DataFrame([new_row])], ignore_index=True)
@@ -1245,6 +1302,280 @@ def _gather_and_notify_rebalance(db: Session, strategy: LiveStrategy, TODAY: dat
         )
     except Exception:
         logger.exception("[Notify] Rebalance notification failed for strategy %s — non-blocking", strategy.id)
+
+
+# -----------------------------------------------------------------------------
+# Orderbook/postback order processing helper
+# -----------------------------------------------------------------------------
+
+def _process_basket_orders(
+    db: Session,
+    strategy: LiveStrategy,
+    basket: LivePublisherBasket,
+    orders_data: dict,
+    basket_tags: set,
+    source: str,
+    TODAY: date,
+) -> None:
+    """Bulk update order rows and transition strategy status.
+
+    This is the shared processing logic used by both:
+    - verify_and_process_from_orderbook (primary path, from kite.orders() data)
+    - Fallback path (from stored broker_raw_postback data)
+
+    Args:
+        db: Database session
+        strategy: The LiveStrategy being processed
+        basket: The LivePublisherBasket with the order tags
+        orders_data: Dict mapping publisher_tag → order dict.
+                     Order dict has: tag, order_id, status, filled_quantity,
+                     average_price, tradingsymbol, transaction_type, placed_by, status_message
+        basket_tags: Set of publisher_tags for this basket
+        source: "orderbook" or "postback_fallback" (for logging)
+        TODAY: Current date
+    """
+    TERMINAL_STATUSES = {"COMPLETE", "REJECTED", "CANCELLED"}
+
+    # ── Step 1: Bulk update each order row from the order data ──
+    for tag, order in orders_data.items():
+        if tag not in basket_tags:
+            continue
+
+        status = (order.get("status") or "").upper()
+        if status == "CANCEL":
+            status = "CANCELLED"
+
+        filled_qty = int(order.get("filled_quantity") or 0)
+        avg_price = float(order.get("average_price") or 0)
+        kite_order_id = str(order.get("order_id") or "")
+
+        # Find the order row by tag
+        row_obj = db.query(LiveBuyStock).filter(LiveBuyStock.publisher_tag == tag).first()
+        order_table = "buy" if row_obj else None
+        if not row_obj:
+            row_obj = db.query(LiveSellStock).filter(LiveSellStock.publisher_tag == tag).first()
+            order_table = "sell" if row_obj else None
+        if not row_obj:
+            row_obj = db.query(LiveCircuitStock).filter(LiveCircuitStock.publisher_tag == tag).first()
+            order_table = "circuit" if row_obj else None
+        if not row_obj:
+            logger.warning("[ProcessOrders] No order row found for tag=%s — skipping", tag)
+            continue
+
+        # Skip if already processed (idempotent)
+        if hasattr(row_obj, "broker_status") and row_obj.broker_status in TERMINAL_STATUSES:
+            logger.info("[ProcessOrders] Tag %s already terminal (%s) — skipping", tag, row_obj.broker_status)
+            continue
+
+        # Update order row from the order data
+        if kite_order_id:
+            row_obj.order_id = kite_order_id
+        row_obj.broker_status = status
+        row_obj.broker_status_message = order.get("status_message")
+
+        if status == "COMPLETE" and filled_qty > 0:
+            row_obj.actual_qty = filled_qty
+            row_obj.actual_price = avg_price
+            row_obj.actual_amount = round(filled_qty * avg_price, 2)
+            row_obj.circuit = filled_qty < int(row_obj.qty)
+            row_obj.updated_in_tradelog = False
+            logger.info("[ProcessOrders] FILLED | tag=%s symbol=%s qty=%d price=%.2f source=%s",
+                        tag, row_obj.tradingsymbol, filled_qty, avg_price, source)
+
+        elif status == "REJECTED":
+            row_obj.actual_qty = 0
+            row_obj.actual_price = 0.0
+            row_obj.actual_amount = 0.0
+            row_obj.circuit = False
+            row_obj.updated_in_tradelog = True
+            logger.info("[ProcessOrders] REJECTED | tag=%s symbol=%s reason=%s source=%s",
+                        tag, row_obj.tradingsymbol, order.get("status_message"), source)
+
+        elif status == "CANCELLED":
+            partial_qty = filled_qty if filled_qty > 0 else 0
+            if partial_qty > 0:
+                row_obj.actual_qty = partial_qty
+                row_obj.actual_price = avg_price
+                row_obj.actual_amount = round(partial_qty * avg_price, 2)
+                row_obj.circuit = True
+                row_obj.updated_in_tradelog = False
+            else:
+                row_obj.actual_qty = 0
+                row_obj.actual_price = 0.0
+                row_obj.actual_amount = 0.0
+                row_obj.circuit = True
+                row_obj.updated_in_tradelog = True
+            logger.info("[ProcessOrders] CANCELLED | tag=%s symbol=%s partial_qty=%d source=%s",
+                        tag, row_obj.tradingsymbol, partial_qty, source)
+
+        # Create circuit stock row if needed (partial fill or cancelled)
+        if row_obj.circuit and order_table in ("buy", "sell"):
+            lower_upper = "upper" if order_table == "buy" else "lower"
+            circuit_row = LiveCircuitStock(
+                automate_equity_ra_id=strategy.id,
+                tradingsymbol=row_obj.tradingsymbol,
+                isin=getattr(row_obj, "isin", ""),
+                date=TODAY,
+                qty=int(row_obj.qty) - int(row_obj.actual_qty or 0),
+                price=float(row_obj.price),
+                amount=round((int(row_obj.qty) - int(row_obj.actual_qty or 0)) * float(row_obj.price), 2),
+                weightage=getattr(row_obj, "weightage", 0.0),
+                actual_qty=0,
+                actual_price=0.0,
+                actual_amount=0.0,
+                stoploss=getattr(row_obj, "stoploss", 0.0),
+                volatility=getattr(row_obj, "volatility", 0.0),
+                order_id=None,
+                updated_in_tradelog=False,
+                lower_upper=lower_upper,
+                action=order_table,
+                active=True,
+            )
+            db.add(circuit_row)
+
+    # ── Step 2: Client ID lock from orderbook data ──
+    first_order = next(iter(orders_data.values()), {})
+    client_id = first_order.get("placed_by") or first_order.get("account_id")
+    if client_id and not strategy.locked_client_id:
+        strategy.locked_client_id = client_id
+
+    # ── Step 3: Count filled vs rejected for status transition ──
+    filled_buy = db.query(LiveBuyStock).filter(
+        LiveBuyStock.publisher_tag.in_(basket_tags),
+        LiveBuyStock.broker_status == "COMPLETE",
+    ).count()
+    filled_sell = db.query(LiveSellStock).filter(
+        LiveSellStock.publisher_tag.in_(basket_tags),
+        LiveSellStock.broker_status == "COMPLETE",
+    ).count()
+    total_filled = filled_buy + filled_sell
+
+    # Collect rejection reasons for logging
+    rejected_orders = []
+    for model in (LiveBuyStock, LiveSellStock):
+        rejected_rows = db.query(model).filter(
+            model.publisher_tag.in_(basket_tags),
+            model.broker_status == "REJECTED",
+        ).all()
+        for r in rejected_rows:
+            rejected_orders.append({
+                "tradingsymbol": r.tradingsymbol,
+                "qty": r.qty,
+                "reason": r.broker_status_message or "Unknown",
+            })
+
+    # ── Step 4: Strategy status transition ──
+    previous_status = strategy.status
+
+    if total_filled == 0:
+        # ALL orders rejected/cancelled — no fills at all
+        if previous_status == LiveStatus.EXIT_PENDING_USER_APPROVAL:
+            strategy.status = LiveStatus.ACTIVE
+        elif previous_status == LiveStatus.REBALANCE_PENDING_USER_APPROVAL:
+            if basket.basket_type == "REBALANCE_SELL":
+                strategy.status = LiveStatus.REBALANCE_READY
+            elif basket.basket_type == "REBALANCE_BUY":
+                strategy.status = LiveStatus.REBALANCE_SELL_COMPLETE
+            else:
+                strategy.status = LiveStatus.REBALANCE_READY
+        else:
+            strategy.status = LiveStatus.ALL_REJECTED
+        logger.warning("[ProcessOrders] ALL orders failed | strategy=%s prev=%s new=%s reasons=%s source=%s",
+                       strategy.id, previous_status.value, strategy.status.value, rejected_orders, source)
+    elif previous_status == LiveStatus.EXIT_PENDING_USER_APPROVAL:
+        strategy.status = LiveStatus.EXITED
+        strategy.subscription_active = False
+    elif basket.basket_type == "REBALANCE_SELL":
+        strategy.status = LiveStatus.REBALANCE_SELL_COMPLETE
+        logger.info("[ProcessOrders] REBALANCE_SELL complete | strategy=%s — now awaiting BUY basket | source=%s",
+                    strategy.id, source)
+    else:
+        # INITIAL, REBALANCE (ALL), REBALANCE_BUY, EXIT — go to ACTIVE
+        strategy.status = LiveStatus.ACTIVE
+        strategy.subscription_active = True
+        strategy.next_rebalance_date = next_trading_day(next_rebalance_prepare_date(TODAY, strategy.rebalance_frequency))
+
+    # ── Step 5: Update basket status ──
+    basket.raw_postback = {"source": source, "processed_at": str(datetime.utcnow())}
+    basket.status = "ALL_REJECTED" if total_filled == 0 else "COMPLETE"
+
+    db.commit()
+    db.refresh(strategy)
+
+
+# -----------------------------------------------------------------------------
+# Daily per-strategy tradelog + equity curve processing helper
+# -----------------------------------------------------------------------------
+
+def _process_strategy_daily_update(db: Session, strategy: LiveStrategy, TODAY: date) -> bool:
+    """Process pending fills into tradelog, refresh LTP, and append equity curve row.
+
+    Shared logic used by:
+    - daily_equity_curve_update main loop (active strategies)
+    - daily_equity_curve_update exited block (recently exited strategies)
+
+    Returns True if there were pending fills, False otherwise.
+    Does NOT commit — caller must commit after any additional status changes.
+    """
+    buy_df = model_df(db, LiveBuyStock, strategy.id)
+    sell_df = model_df(db, LiveSellStock, strategy.id)
+    circuit_df = model_df(db, LiveCircuitStock, strategy.id)
+    tradelog_df = model_df(db, LiveTradelog, strategy.id)
+    equitycurve_df = model_df(db, LiveEquityCurve, strategy.id)
+
+    # Check for pending fills (rows not yet processed into tradelog)
+    # update_tradelog skips rows where:
+    #   - updated_in_tradelog = True (already processed, including REJECTED)
+    #   - actual_qty <= 0 (no fill happened)
+    # So REJECTED orders (updated_in_tradelog=True, actual_qty=0) are never added to tradelog.
+    has_pending_fills = False
+    if not buy_df.empty:
+        pending_buys = buy_df.loc[
+            (buy_df["updated_in_tradelog"].fillna(False) == False) &
+            (buy_df["actual_qty"].fillna(0) > 0)
+        ]
+        if not pending_buys.empty:
+            has_pending_fills = True
+
+    if not sell_df.empty:
+        pending_sells = sell_df.loc[
+            (sell_df["updated_in_tradelog"].fillna(False) == False) &
+            (sell_df["actual_qty"].fillna(0) > 0)
+        ]
+        if not pending_sells.empty:
+            has_pending_fills = True
+
+    tradelog_df, today_cash = update_tradelog(
+        TODAY, f"({strategy.id})", tradelog_df, buy_df, sell_df, circuit_df, 0.0
+    )
+
+    # Save tradelog (LTP already refreshed inside update_tradelog)
+    upsert_df_to_db(db, tradelog_df, LiveTradelog, commit=False)
+
+    # Mark buy/sell/circuit as processed (updated_in_tradelog = True)
+    if has_pending_fills:
+        update_df_to_db(db, buy_df, LiveBuyStock, commit=False)
+        update_df_to_db(db, sell_df, LiveSellStock, commit=False)
+        update_df_to_db(db, circuit_df, LiveCircuitStock, commit=False)
+
+    if tradelog_df.empty:
+        logger.info("[DailyMTM] Skipping equity curve for strategy %s — no tradelog rows", strategy.id)
+        return has_pending_fills
+
+    # Append today's equity curve row
+    rebalance = has_pending_fills  # Cash delta only on fill days
+    equitycurve_df = update_equitycurve(TODAY, strategy, tradelog_df, equitycurve_df, today_cash, rebalance)
+    insert_single_row_to_db(db, equitycurve_df.iloc[-1].to_dict(), LiveEquityCurve, commit=False)
+
+    # Sync strategy AUM fields
+    last = equitycurve_df.iloc[-1]
+    strategy.cash = float(last["cash"] or 0)
+    strategy.stock_value = float(last["stocks_value"] or 0)
+    strategy.final_aum = float(last["aum"] or 0)
+    strategy.pnl = float(last["total_pnl"] or 0)
+    strategy.todays_pnl = float(last["strategy_daily_return"] or 0)
+
+    return has_pending_fills
 
 
 # -----------------------------------------------------------------------------
@@ -1518,18 +1849,27 @@ class LiveInvestmentService:
         db.refresh(strategy)
         return strategy
 
+    # ── Redis for debounce (orderbook verification) ────────────────────────
+    _redis_client = redis.from_url(settings.REDIS_URL, decode_responses=True)
+
     @staticmethod
     def update_from_postback(db: Session, payload: Dict[str, Any], TODAY: Optional[date] = None) -> dict:
-        """Process a single broker postback. Only updates buy/sell/circuit stock tables.
+        """Process a single broker postback.
 
-        Tradelog and equitycurve are NOT updated here — they are updated by the
-        daily 16:30 celery job (daily_equity_curve_update).
+        New flow (orderbook verification):
+        1. Store raw postback on order row + log to postback_log (always)
+        2. If terminal status → schedule debounced orderbook verification task
+        3. Actual fill processing (actual_qty, broker_status, status transitions)
+           happens in verify_and_process_from_orderbook(), triggered by the
+           debounced celery task.
+
+        Postback data is stored for audit and as fallback if orderbook API fails.
 
         Returns a dict with status info for the API response.
         """
         TODAY = TODAY or date.today()
 
-        # Terminal statuses — only these should trigger fill processing
+        # Terminal statuses — only these should trigger orderbook verification
         TERMINAL_STATUSES = {"COMPLETE", "REJECTED", "CANCELLED"}
 
         logger.info("[Postback] Received | tag=%s order_id=%s status=%s symbol=%s txn=%s",
@@ -1586,20 +1926,32 @@ class LiveInvestmentService:
             logger.warning("[Postback] CHECKSUM FAILED | tag=%s strategy=%s — rejecting", raw_tag, strategy.id)
             raise HTTPException(status_code=403, detail="Postback checksum verification failed — possible tampering")
 
-        # ── VERIFICATION GUARD 2: Duplicate postback protection ──────────
+        # ── VERIFICATION GUARD 2: Already processed by orderbook ─────────
+        # If the order row already has a terminal broker_status (set by orderbook
+        # verification), this postback is a duplicate — skip it.
         if hasattr(row_obj, "broker_status") and row_obj.broker_status in TERMINAL_STATUSES:
             logger.info("[Postback] DUPLICATE skipped | tag=%s symbol=%s — already has terminal status=%s",
                         raw_tag, postback_symbol, row_obj.broker_status)
             return {"status": "ok", "detail": "already_processed"}
 
-        # ── Step 4: Store postback data on the order row ─────────────────
+        # ── Step 4: Store raw postback on order row (for audit + fallback) ──
         if kite_order_id:
             row_obj.order_id = kite_order_id
-        row_obj.broker_status = payload.get("status")
-        row_obj.broker_status_message = payload.get("status_message")
         row_obj.broker_raw_postback = payload
 
-        # ── VERIFICATION GUARD 3: Client ID lock ─────────────────────────
+        # ── Step 5: Log to postback_log (append-only audit trail) ────────
+        postback_log_entry = PostbackLog(
+            publisher_tag=raw_tag,
+            order_id=kite_order_id,
+            status=payload.get("status"),
+            tradingsymbol=postback_symbol,
+            raw_payload=payload,
+            matched_strategy_id=strategy.id,
+            processing_note="stored_awaiting_orderbook_verify",
+        )
+        db.add(postback_log_entry)
+
+        # ── Step 6: Client ID lock (early detection of wrong account) ────
         client_id = payload.get("client_id") or payload.get("user_id")
         if client_id:
             if not strategy.locked_client_id:
@@ -1617,202 +1969,223 @@ class LiveInvestmentService:
                 db.commit()
                 return {"status": "ok", "detail": "account_mismatch"}
 
-        # ── Step 5: Non-terminal status — just store data, don't process ─
+        db.commit()
+
+        # ── Step 7: If terminal → schedule debounced orderbook verification ──
         broker_status = (payload.get("status") or "").upper()
         if broker_status not in TERMINAL_STATUSES:
-            logger.info("[Postback] Non-terminal status=%s | tag=%s — stored, not processed", broker_status, raw_tag)
-            db.commit()
+            logger.info("[Postback] Non-terminal status=%s | tag=%s — stored, no verification needed", broker_status, raw_tag)
             return {"status": "ok", "detail": f"non_terminal_{broker_status.lower()}"}
 
-        # ── Step 6: Process terminal status — update fill data ───────────
-        filled_qty = int(payload.get("filled_quantity") or 0)
-        avg_price = float(payload.get("average_price") or 0)
-
-        if broker_status == "COMPLETE" and filled_qty > 0:
-            row_obj.actual_qty = filled_qty
-            row_obj.actual_price = avg_price
-            row_obj.actual_amount = round(filled_qty * avg_price, 2)
-            row_obj.circuit = filled_qty < int(row_obj.qty)
-            row_obj.updated_in_tradelog = False  # Will be processed by daily celery job
-            logger.info("[Postback] FILLED | tag=%s symbol=%s qty=%d price=%.2f",
-                        raw_tag, postback_symbol, filled_qty, avg_price)
-
-        elif broker_status == "REJECTED":
-            row_obj.actual_qty = 0
-            row_obj.actual_price = 0.0
-            row_obj.actual_amount = 0.0
-            row_obj.circuit = False  # REJECTED = don't retry via circuit
-            row_obj.updated_in_tradelog = True  # Mark as "done" so pending count drops
-            logger.info("[Postback] REJECTED | tag=%s symbol=%s reason=%s",
-                        raw_tag, postback_symbol, payload.get("status_message"))
-
-        elif broker_status == "CANCELLED":
-            partial_qty = filled_qty if filled_qty > 0 else 0
-            if partial_qty > 0:
-                # Partial fill before cancellation
-                row_obj.actual_qty = partial_qty
-                row_obj.actual_price = avg_price
-                row_obj.actual_amount = round(partial_qty * avg_price, 2)
-                row_obj.circuit = True  # Partial fill → circuit for remaining
-                row_obj.updated_in_tradelog = False
-            else:
-                # Fully cancelled with no fill
-                row_obj.actual_qty = 0
-                row_obj.actual_price = 0.0
-                row_obj.actual_amount = 0.0
-                row_obj.circuit = True  # Cancelled → circuit for retry
-                row_obj.updated_in_tradelog = True
-            logger.info("[Postback] CANCELLED | tag=%s symbol=%s partial_qty=%d",
-                        raw_tag, postback_symbol, partial_qty)
-
-        # Create circuit stock row if needed (only for circuit=True)
-        if row_obj.circuit and order_table in ("buy", "sell"):
-            lower_upper = "upper" if order_table == "buy" else "lower"
-            circuit_row = LiveCircuitStock(
-                automate_equity_ra_id=strategy.id,
-                tradingsymbol=row_obj.tradingsymbol,
-                isin=getattr(row_obj, "isin", ""),
-                date=TODAY,
-                qty=int(row_obj.qty) - int(row_obj.actual_qty or 0),  # Remaining unfilled qty
-                price=float(row_obj.price),
-                amount=round((int(row_obj.qty) - int(row_obj.actual_qty or 0)) * float(row_obj.price), 2),
-                weightage=getattr(row_obj, "weightage", 0.0),
-                actual_qty=0,
-                actual_price=0.0,
-                actual_amount=0.0,
-                stoploss=getattr(row_obj, "stoploss", 0.0),
-                volatility=getattr(row_obj, "volatility", 0.0),
-                order_id=None,
-                updated_in_tradelog=False,
-
-                lower_upper=lower_upper,
-                action=order_table,
-                active=True,
-            )
-            db.add(circuit_row)
-
-        db.flush()
-
-        # ── Step 7: Check basket completion — count ONLY current basket orders ─
-        # Get the latest basket and extract its tags to scope counts correctly.
-        # Without this, rebalance would count old initial basket rows too.
+        # Find the latest basket for this strategy to get the basket_id
         latest_basket = db.query(LivePublisherBasket).filter(
             LivePublisherBasket.automate_equity_ra_id == strategy.id,
         ).order_by(LivePublisherBasket.created_at.desc()).first()
 
-        basket_tags = []
-        if latest_basket and latest_basket.publisher_payload:
-            basket_tags = [
-                o.get("tag") for o in (latest_basket.publisher_payload.get("basket") or [])
+        if not latest_basket:
+            logger.warning("[Postback] No basket found for strategy %s — cannot schedule verification", strategy.id)
+            return {"status": "ok", "detail": "no_basket_found"}
+
+        # Debounce via Redis SETNX: only the FIRST terminal postback schedules the task.
+        # Subsequent terminal postbacks (arriving within 300s) see the key exists and skip.
+        redis_key = f"orderbook_verify:{latest_basket.id}"
+        is_first = LiveInvestmentService._redis_client.set(redis_key, "1", nx=True, ex=300)
+
+        if is_first:
+            # Schedule the debounced celery task with 5-second delay
+            from app.tasks.orderbook_sync_tasks import verify_basket_from_orderbook_task
+            verify_basket_from_orderbook_task.apply_async(
+                kwargs={"basket_id": str(latest_basket.id), "retry_count": 0},
+                countdown=5,
+            )
+            logger.info("[Postback] Scheduled orderbook verification | basket=%s (5s delay)", latest_basket.id)
+        else:
+            logger.info("[Postback] Verification already scheduled | basket=%s tag=%s — skipping", latest_basket.id, raw_tag)
+
+        return {"status": "ok", "detail": "stored_verification_scheduled"}
+
+    # ── Orderbook verification (called by debounced celery task) ──────────
+
+    @staticmethod
+    def verify_and_process_from_orderbook(
+        db: Session,
+        basket_id: str,
+        retry_count: int = 0,
+        TODAY: Optional[date] = None,
+    ) -> dict:
+        """Verify all basket orders from kite.orders() and bulk-update if all terminal.
+
+        Called by the debounced celery task after a terminal postback is received.
+
+        Flow:
+        1. Load basket → strategy → broker_account
+        2. Decrypt access_token → call kite.orders()
+        3. Filter orderbook by basket's publisher_tags
+        4. If all orders terminal → bulk update actual_qty/price/status → status transition
+        5. If not all terminal → reschedule (up to 20 retries × 5s = ~100s)
+        6. If token/API fails → fall back to stored postback data
+
+        Returns dict with processing result.
+        """
+        TODAY = TODAY or date.today()
+        TERMINAL_STATUSES = {"COMPLETE", "REJECTED", "CANCELLED"}
+        MAX_RETRIES = 20
+
+        basket = db.query(LivePublisherBasket).filter(
+            LivePublisherBasket.id == basket_id,
+        ).first()
+        if not basket:
+            logger.error("[OrderbookVerify] Basket %s not found", basket_id)
+            return {"status": "error", "detail": "basket_not_found"}
+
+        strategy = db.query(LiveStrategy).filter(
+            LiveStrategy.id == basket.automate_equity_ra_id,
+        ).first()
+        if not strategy:
+            logger.error("[OrderbookVerify] Strategy not found for basket %s", basket_id)
+            return {"status": "error", "detail": "strategy_not_found"}
+
+        # Extract basket's publisher_tags
+        basket_tags = set()
+        if basket.publisher_payload:
+            basket_tags = {
+                o.get("tag") for o in (basket.publisher_payload.get("basket") or [])
                 if o.get("tag")
-            ]
-
+            }
         if not basket_tags:
-            # No tags found — can't determine basket scope, commit and return
-            db.commit()
-            db.refresh(strategy)
-            return {"status": "ok", "strategy_status": strategy.status.value if hasattr(strategy.status, 'value') else str(strategy.status)}
+            logger.warning("[OrderbookVerify] No tags in basket %s — nothing to verify", basket_id)
+            return {"status": "ok", "detail": "no_tags"}
 
-        # Count pending orders — ONLY among current basket's tags
-        pending_buy = db.query(LiveBuyStock).filter(
-            LiveBuyStock.publisher_tag.in_(basket_tags),
-            LiveBuyStock.broker_status.is_(None),
-        ).count()
-        pending_sell = db.query(LiveSellStock).filter(
-            LiveSellStock.publisher_tag.in_(basket_tags),
-            LiveSellStock.broker_status.is_(None),
-        ).count()
+        # ── Try fetching orderbook from broker API ──
+        orderbook_orders = None  # Will be a dict: {tag: order_dict}
+        broker_account = db.query(LiveBrokerAccount).filter(
+            LiveBrokerAccount.id == strategy.broker_account_id,
+        ).first()
 
-        # Also count orders with non-terminal status (UPDATE, OPEN, etc.)
-        pending_buy += db.query(LiveBuyStock).filter(
-            LiveBuyStock.publisher_tag.in_(basket_tags),
-            LiveBuyStock.broker_status.isnot(None),
-            ~LiveBuyStock.broker_status.in_(list(TERMINAL_STATUSES)),
-        ).count()
-        pending_sell += db.query(LiveSellStock).filter(
-            LiveSellStock.publisher_tag.in_(basket_tags),
-            LiveSellStock.broker_status.isnot(None),
-            ~LiveSellStock.broker_status.in_(list(TERMINAL_STATUSES)),
-        ).count()
+        if broker_account and broker_account.access_token_encrypted and broker_account.token_date == TODAY:
+            try:
+                access_token = decrypt_token(broker_account.access_token_encrypted)
+                if access_token:
+                    adapter = get_publisher_adapter(strategy.broker)
+                    full_orderbook = adapter.fetch_orderbook(access_token)
 
-        if pending_buy == 0 and pending_sell == 0:
-            # All orders in current basket have terminal status — basket is complete
-            filled_buy = db.query(LiveBuyStock).filter(
-                LiveBuyStock.publisher_tag.in_(basket_tags),
-                LiveBuyStock.broker_status == "COMPLETE",
-            ).count()
-            filled_sell = db.query(LiveSellStock).filter(
-                LiveSellStock.publisher_tag.in_(basket_tags),
-                LiveSellStock.broker_status == "COMPLETE",
-            ).count()
-            total_filled = filled_buy + filled_sell
+                    # Filter by our basket's tags only
+                    orderbook_orders = {}
+                    for order in full_orderbook:
+                        tag = order.get("tag")
+                        if tag and tag in basket_tags:
+                            orderbook_orders[tag] = order
 
-            # Get rejection reasons for frontend
-            rejected_orders = []
-            for model in (LiveBuyStock, LiveSellStock):
-                rejected_rows = db.query(model).filter(
-                    model.publisher_tag.in_(basket_tags),
-                    model.broker_status == "REJECTED",
-                ).all()
-                for r in rejected_rows:
-                    rejected_orders.append({
-                        "tradingsymbol": r.tradingsymbol,
-                        "qty": r.qty,
-                        "reason": r.broker_status_message or "Unknown",
-                    })
+                    logger.info("[OrderbookVerify] Fetched %d total orders, %d match our tags | basket=%s",
+                                len(full_orderbook), len(orderbook_orders), basket_id)
+            except Exception as e:
+                logger.error("[OrderbookVerify] Failed to fetch orderbook for basket %s: %s", basket_id, e)
+                orderbook_orders = None  # Fall through to fallback
 
-            previous_status = strategy.status
+        # ── Check if all basket orders are terminal ──
+        if orderbook_orders is not None:
+            # We have orderbook data — check if all tagged orders are terminal
+            found_tags = set(orderbook_orders.keys())
+            missing_tags = basket_tags - found_tags
 
-            if total_filled == 0:
-                # ALL orders rejected/cancelled — no fills at all
-                # Transition depends on what basket type was running:
-                if previous_status == LiveStatus.EXIT_PENDING_USER_APPROVAL:
-                    # All exit orders rejected — go back to ACTIVE so user can retry
-                    # exit/preview → exit/trade-now flow again
-                    strategy.status = LiveStatus.ACTIVE
-                elif previous_status == LiveStatus.REBALANCE_PENDING_USER_APPROVAL:
-                    # Go back to appropriate retry status based on basket type
-                    if latest_basket and latest_basket.basket_type == "REBALANCE_SELL":
-                        # Sell basket all rejected → go back to REBALANCE_READY so user can retry sell
-                        strategy.status = LiveStatus.REBALANCE_READY
-                    elif latest_basket and latest_basket.basket_type == "REBALANCE_BUY":
-                        # Buy basket all rejected → go back to REBALANCE_SELL_COMPLETE so user can retry buy
-                        strategy.status = LiveStatus.REBALANCE_SELL_COMPLETE
-                    else:
-                        # Old-style REBALANCE (ALL) basket → go back to REBALANCE_READY
-                        strategy.status = LiveStatus.REBALANCE_READY
+            all_terminal = True
+            for tag in found_tags:
+                status = (orderbook_orders[tag].get("status") or "").upper()
+                if status == "CANCEL":
+                    status = "CANCELLED"  # Kite sends "CANCEL" sometimes
+                if status not in TERMINAL_STATUSES:
+                    all_terminal = False
+                    break
+
+            # Missing tags = orders not yet in orderbook (not placed yet or API lag)
+            if missing_tags:
+                all_terminal = False
+
+            if not all_terminal:
+                if retry_count < MAX_RETRIES:
+                    # Reschedule — not all orders are terminal yet
+                    from app.tasks.orderbook_sync_tasks import verify_basket_from_orderbook_task
+                    verify_basket_from_orderbook_task.apply_async(
+                        kwargs={"basket_id": str(basket_id), "retry_count": retry_count + 1},
+                        countdown=5,
+                    )
+                    logger.info("[OrderbookVerify] Not all terminal (%d/%d found, %d missing) — retry %d/%d | basket=%s",
+                                len(found_tags), len(basket_tags), len(missing_tags), retry_count + 1, MAX_RETRIES, basket_id)
+                    return {"status": "ok", "detail": "rescheduled", "retry": retry_count + 1}
                 else:
-                    # Initial basket — go to ALL_REJECTED (user can retry Trade Now)
-                    strategy.status = LiveStatus.ALL_REJECTED
-                logger.warning("[Postback] ALL orders failed | strategy=%s prev_status=%s new_status=%s reasons=%s",
-                               strategy.id, previous_status.value, strategy.status.value, rejected_orders)
-            elif previous_status == LiveStatus.EXIT_PENDING_USER_APPROVAL:
-                strategy.status = LiveStatus.EXITED
-                strategy.subscription_active = False
-            elif latest_basket and latest_basket.basket_type == "REBALANCE_SELL":
-                # Sell basket complete → transition to REBALANCE_SELL_COMPLETE (enable Buy button)
-                strategy.status = LiveStatus.REBALANCE_SELL_COMPLETE
-                logger.info("[Postback] REBALANCE_SELL complete | strategy=%s — now awaiting BUY basket",
-                            strategy.id)
-            else:
-                # INITIAL, REBALANCE (ALL), REBALANCE_BUY, EXIT — go to ACTIVE
-                strategy.status = LiveStatus.ACTIVE
-                strategy.subscription_active = True
-                strategy.next_rebalance_date = next_trading_day(next_rebalance_prepare_date(TODAY, strategy.rebalance_frequency))
+                    logger.warning("[OrderbookVerify] Max retries (%d) reached — giving up, 16:30 safety net will catch | basket=%s",
+                                   MAX_RETRIES, basket_id)
+                    # Clear Redis key so future postbacks can re-trigger
+                    LiveInvestmentService._redis_client.delete(f"orderbook_verify:{basket_id}")
+                    return {"status": "ok", "detail": "max_retries_reached"}
 
-            # Update Publisher basket status
-            if latest_basket:
-                latest_basket.raw_postback = payload
-                if total_filled == 0:
-                    latest_basket.status = "ALL_REJECTED"
+            # ── ALL TERMINAL — Bulk update from orderbook ──
+            source = "orderbook"
+            orders_data = orderbook_orders  # {tag: order_dict}
+        else:
+            # ── FALLBACK: No orderbook data available — use stored postback data ──
+            logger.warning("[OrderbookVerify] No orderbook data — falling back to postback data | basket=%s", basket_id)
+            source = "postback_fallback"
+            orders_data = {}  # {tag: order_dict from postback}
+
+            for tag in basket_tags:
+                # Try to find stored postback data on each order row
+                row = db.query(LiveBuyStock).filter(LiveBuyStock.publisher_tag == tag).first()
+                if not row:
+                    row = db.query(LiveSellStock).filter(LiveSellStock.publisher_tag == tag).first()
+                if not row:
+                    row = db.query(LiveCircuitStock).filter(LiveCircuitStock.publisher_tag == tag).first()
+
+                if row and row.broker_raw_postback:
+                    pb = row.broker_raw_postback
+                    orders_data[tag] = {
+                        "tag": tag,
+                        "order_id": pb.get("order_id") or getattr(row, "order_id", None),
+                        "status": pb.get("status", ""),
+                        "filled_quantity": pb.get("filled_quantity", 0),
+                        "average_price": pb.get("average_price", 0),
+                        "tradingsymbol": pb.get("tradingsymbol", ""),
+                        "transaction_type": pb.get("transaction_type", ""),
+                        "placed_by": pb.get("client_id") or pb.get("user_id", ""),
+                        "status_message": pb.get("status_message"),
+                    }
+
+            # Check if all fallback orders are terminal
+            all_fallback_terminal = all(
+                (orders_data.get(tag, {}).get("status") or "").upper() in TERMINAL_STATUSES
+                for tag in basket_tags
+                if tag in orders_data
+            )
+            if not all_fallback_terminal or len(orders_data) < len(basket_tags):
+                if retry_count < MAX_RETRIES:
+                    from app.tasks.orderbook_sync_tasks import verify_basket_from_orderbook_task
+                    verify_basket_from_orderbook_task.apply_async(
+                        kwargs={"basket_id": str(basket_id), "retry_count": retry_count + 1},
+                        countdown=5,
+                    )
+                    logger.info("[OrderbookVerify] Fallback: not all terminal — retry %d/%d | basket=%s",
+                                retry_count + 1, MAX_RETRIES, basket_id)
+                    return {"status": "ok", "detail": "fallback_rescheduled"}
                 else:
-                    latest_basket.status = "COMPLETE"
+                    logger.warning("[OrderbookVerify] Fallback: max retries reached | basket=%s", basket_id)
+                    LiveInvestmentService._redis_client.delete(f"orderbook_verify:{basket_id}")
+                    return {"status": "ok", "detail": "fallback_max_retries"}
 
-        db.commit()
-        db.refresh(strategy)
-        logger.info("[Postback] Processed | tag=%s strategy=%s status=%s",
-                    raw_tag, strategy.id, strategy.status.value if hasattr(strategy.status, 'value') else strategy.status)
-        return {"status": "ok", "strategy_status": strategy.status.value if hasattr(strategy.status, 'value') else str(strategy.status)}
+        # ── Process all orders — bulk update from orderbook/postback data ──
+        _process_basket_orders(db, strategy, basket, orders_data, basket_tags, source, TODAY)
+
+        # Clear Redis debounce key
+        LiveInvestmentService._redis_client.delete(f"orderbook_verify:{basket_id}")
+
+        logger.info("[OrderbookVerify] Basket %s processed from %s | strategy=%s status=%s",
+                    basket_id, source, strategy.id,
+                    strategy.status.value if hasattr(strategy.status, 'value') else strategy.status)
+
+        return {
+            "status": "ok",
+            "detail": f"processed_from_{source}",
+            "strategy_status": strategy.status.value if hasattr(strategy.status, 'value') else str(strategy.status),
+        }
 
     @staticmethod
     def duplicate_strategy(db: Session, strategy_id, *, broker_account_id, strategy_name: Optional[str], aum: Optional[float]) -> LiveStrategy:
@@ -1895,6 +2268,7 @@ class LiveInvestmentService:
         # Include stuck rebalance statuses for auto-skip
         valid_statuses = [
             LiveStatus.ACTIVE,
+            LiveStatus.PENDING_USER_APPROVAL,
             LiveStatus.REBALANCE_READY,
             LiveStatus.REBALANCE_SELL_COMPLETE,
             LiveStatus.REBALANCE_PENDING_USER_APPROVAL,
@@ -1907,67 +2281,9 @@ class LiveInvestmentService:
         count = 0
         for strategy in strategies:
             try:
-                buy_df = model_df(db, LiveBuyStock, strategy.id)
-                sell_df = model_df(db, LiveSellStock, strategy.id)
-                circuit_df = model_df(db, LiveCircuitStock, strategy.id)
-                tradelog_df = model_df(db, LiveTradelog, strategy.id)
-                equitycurve_df = model_df(db, LiveEquityCurve, strategy.id)
+                has_pending_fills = _process_strategy_daily_update(db, strategy, TODAY)
 
-                # Step 1: Process pending fills into tradelog entries
-                # update_tradelog_buy_df skips rows where:
-                #   - updated_in_tradelog = True (already processed, including REJECTED)
-                #   - actual_qty <= 0 (no fill happened)
-                # So REJECTED orders (updated_in_tradelog=True, actual_qty=0) are never added to tradelog.
-                has_pending_fills = False
-                if not buy_df.empty:
-                    pending_buys = buy_df.loc[
-                        (buy_df["updated_in_tradelog"].fillna(False) == False) &
-                        (buy_df["actual_qty"].fillna(0) > 0)
-                    ]
-                    if not pending_buys.empty:
-                        has_pending_fills = True
-
-                if not sell_df.empty:
-                    pending_sells = sell_df.loc[
-                        (sell_df["updated_in_tradelog"].fillna(False) == False) &
-                        (sell_df["actual_qty"].fillna(0) > 0)
-                    ]
-                    if not pending_sells.empty:
-                        has_pending_fills = True
-
-                tradelog_df, today_cash = update_tradelog(
-                    TODAY, f"({strategy.id})", tradelog_df, buy_df, sell_df, circuit_df, 0.0
-                )
-
-                # Step 2: Save tradelog first (LTP already refreshed inside update_tradelog)
-                upsert_df_to_db(db, tradelog_df, LiveTradelog, commit=False)
-
-                # Mark buy/sell/circuit as processed (updated_in_tradelog = True)
-                if has_pending_fills:
-                    update_df_to_db(db, buy_df, LiveBuyStock, commit=False)
-                    update_df_to_db(db, sell_df, LiveSellStock, commit=False)
-                    update_df_to_db(db, circuit_df, LiveCircuitStock, commit=False)
-
-                if tradelog_df.empty:
-                    logger.info("[DailyMTM] Skipping equity curve for strategy %s — no tradelog rows", strategy.id)
-                    db.commit()
-                    count += 1
-                    continue
-
-                # Step 3: Append today's equity curve row
-                rebalance = has_pending_fills  # Cash delta only on fill days
-                equitycurve_df = update_equitycurve(TODAY, strategy, tradelog_df, equitycurve_df, today_cash, rebalance)
-                insert_single_row_to_db(db, equitycurve_df.iloc[-1].to_dict(), LiveEquityCurve, commit=False)
-
-                # Step 4: Sync strategy AUM fields — single atomic commit below
-                last = equitycurve_df.iloc[-1]
-                strategy.cash = float(last["cash"] or 0)
-                strategy.stock_value = float(last["stocks_value"] or 0)
-                strategy.final_aum = float(last["aum"] or 0)
-                strategy.pnl = float(last["total_pnl"] or 0)
-                strategy.todays_pnl = float(last["strategy_daily_return"] or 0)
-
-                # Step 5: Auto-skip ignored or stuck rebalances
+                # Auto-skip ignored or stuck rebalances
                 stuck_statuses = {
                     LiveStatus.REBALANCE_READY,
                     LiveStatus.REBALANCE_PENDING_USER_APPROVAL
@@ -1991,6 +2307,210 @@ class LiveInvestmentService:
                 db.rollback()
                 continue
         logger.info("[DailyMTM] Updated %d strategies for %s", count, TODAY)
+
+        # ── Process recently-EXITED strategies with pending fills ─────────
+        # When a user exits during market hours, strategy immediately becomes
+        # EXITED + subscription_active=False (for frontend portfolio page).
+        # But the exit sell fills still need tradelog + equity curve processing.
+        # This block catches them using the same helper — no code duplication.
+        exited_strategies = db.query(LiveStrategy).filter(
+            LiveStrategy.status == LiveStatus.EXITED,
+            LiveStrategy.subscription_active == False,
+        ).all()
+
+        exited_count = 0
+        for strategy in exited_strategies:
+            try:
+                # Quick check: are there ANY pending fills for this strategy?
+                pending_fills = db.query(LiveBuyStock).filter(
+                    LiveBuyStock.automate_equity_ra_id == strategy.id,
+                    LiveBuyStock.updated_in_tradelog == False,
+                    LiveBuyStock.actual_qty > 0,
+                ).count() + db.query(LiveSellStock).filter(
+                    LiveSellStock.automate_equity_ra_id == strategy.id,
+                    LiveSellStock.updated_in_tradelog == False,
+                    LiveSellStock.actual_qty > 0,
+                ).count()
+
+                if pending_fills == 0:
+                    continue  # No pending fills — skip (costs <1ms)
+
+                logger.info("[DailyMTM] Processing EXITED strategy %s — %d pending fills", strategy.id, pending_fills)
+                _process_strategy_daily_update(db, strategy, TODAY)
+                db.commit()
+                exited_count += 1
+                logger.info("[DailyMTM] Processed EXITED strategy %s | final_aum=%.2f", strategy.id, float(strategy.final_aum or 0))
+            except Exception:
+                logger.exception("[DailyMTM] Error processing EXITED strategy %s", strategy.id)
+                db.rollback()
+                continue
+
+        if exited_count:
+            logger.info("[DailyMTM] Processed %d EXITED strategies with pending fills", exited_count)
+
+        return count
+
+    @staticmethod
+    def safety_net_verify_pending_strategies(db: Session, TODAY: Optional[date] = None) -> int:
+        """Safety net: verify strategies stuck in pending states via kite.orders().
+
+        Run as part of the 16:30 daily celery job. Catches cases where:
+        - Postback was lost/never arrived
+        - Orderbook verification task failed or timed out
+        - Token was not available during market hours but is now
+
+        Calls verify_and_process_from_orderbook for each stuck strategy.
+        """
+        TODAY = TODAY or date.today()
+        pending_statuses = [
+            LiveStatus.PENDING_USER_APPROVAL,
+            LiveStatus.REBALANCE_PENDING_USER_APPROVAL,
+            LiveStatus.EXIT_PENDING_USER_APPROVAL,
+        ]
+        stuck_strategies = db.query(LiveStrategy).filter(
+            LiveStrategy.status.in_(pending_statuses),
+            LiveStrategy.subscription_active == True,
+        ).all()
+
+        count = 0
+        for strategy in stuck_strategies:
+            try:
+                # Find the latest basket for this strategy
+                basket = db.query(LivePublisherBasket).filter(
+                    LivePublisherBasket.automate_equity_ra_id == strategy.id,
+                ).order_by(LivePublisherBasket.created_at.desc()).first()
+
+                if not basket:
+                    continue
+
+                logger.info("[SafetyNet] Verifying stuck strategy %s (status=%s) via orderbook",
+                            strategy.id, strategy.status.value)
+                result = LiveInvestmentService.verify_and_process_from_orderbook(
+                    db, basket_id=str(basket.id), retry_count=0, TODAY=TODAY,
+                )
+                if result.get("detail") in ("processed_from_orderbook", "processed_from_postback_fallback"):
+                    count += 1
+                    logger.info("[SafetyNet] Resolved strategy %s → %s", strategy.id, result.get("strategy_status"))
+            except Exception:
+                logger.exception("[SafetyNet] Error verifying strategy %s", strategy.id)
+                db.rollback()
+                continue
+
+        logger.info("[SafetyNet] Resolved %d stuck strategies for %s", count, TODAY)
+        return count
+
+    @staticmethod
+    def store_daily_orderbook_backup(db: Session, TODAY: Optional[date] = None) -> int:
+        """Store filtered orderbook JSON backup for broker_accounts that had orders today.
+
+        Run as part of the 16:30 daily celery job. For each broker_account that
+        had active baskets today:
+        1. Call kite.orders() one final time
+        2. Filter out non-tagged orders (user's personal trades)
+        3. Store filtered JSON in broker_orderbook_daily (one row per account per date)
+
+        Only stores OUR tagged orders for privacy + storage efficiency.
+        """
+        from app.models.live_investment import BrokerOrderbookDaily
+
+        TODAY = TODAY or date.today()
+
+        # Find broker_accounts that had baskets created today
+        baskets_today = db.query(LivePublisherBasket).filter(
+            func.date(LivePublisherBasket.created_at) == TODAY,
+        ).all()
+
+        if not baskets_today:
+            logger.info("[OrderbookBackup] No baskets today — skipping backup")
+            return 0
+
+        # Collect unique broker_account_ids and all their tags
+        account_tags = {}  # {broker_account_id: set(tags)}
+        account_strategy_map = {}  # {broker_account_id: strategy}
+        for basket in baskets_today:
+            strategy = db.query(LiveStrategy).filter(
+                LiveStrategy.id == basket.automate_equity_ra_id,
+            ).first()
+            if not strategy:
+                continue
+
+            ba_id = strategy.broker_account_id
+            if ba_id not in account_tags:
+                account_tags[ba_id] = set()
+                account_strategy_map[ba_id] = strategy
+
+            if basket.publisher_payload:
+                for o in (basket.publisher_payload.get("basket") or []):
+                    tag = o.get("tag")
+                    if tag:
+                        account_tags[ba_id].add(tag)
+
+        count = 0
+        for ba_id, tags in account_tags.items():
+            if not tags:
+                continue
+
+            try:
+                broker_account = db.query(LiveBrokerAccount).filter(
+                    LiveBrokerAccount.id == ba_id,
+                ).first()
+                if not broker_account or not broker_account.access_token_encrypted:
+                    logger.warning("[OrderbookBackup] No valid token for broker_account %s — skipping", ba_id)
+                    continue
+                if broker_account.token_date != TODAY:
+                    logger.warning("[OrderbookBackup] Token not from today for broker_account %s — skipping", ba_id)
+                    continue
+
+                access_token = decrypt_token(broker_account.access_token_encrypted)
+                if not access_token:
+                    continue
+
+                strategy = account_strategy_map[ba_id]
+                adapter = get_publisher_adapter(strategy.broker)
+                full_orderbook = adapter.fetch_orderbook(access_token)
+
+                # Filter to only our tagged orders
+                filtered = [
+                    order for order in full_orderbook
+                    if order.get("tag") in tags
+                ]
+
+                # Serialize datetime objects for JSON storage
+                import json
+                filtered_serializable = json.loads(
+                    json.dumps(filtered, default=str)
+                )
+
+                # Upsert into broker_orderbook_daily
+                existing = db.query(BrokerOrderbookDaily).filter(
+                    BrokerOrderbookDaily.broker_account_id == ba_id,
+                    BrokerOrderbookDaily.date == TODAY,
+                ).first()
+
+                if existing:
+                    existing.order_count = len(filtered_serializable)
+                    existing.filtered_orderbook = filtered_serializable
+                else:
+                    row = BrokerOrderbookDaily(
+                        broker_account_id=ba_id,
+                        broker_user_id=broker_account.broker_user_id,
+                        date=TODAY,
+                        order_count=len(filtered_serializable),
+                        filtered_orderbook=filtered_serializable,
+                    )
+                    db.add(row)
+
+                db.commit()
+                count += 1
+                logger.info("[OrderbookBackup] Stored %d filtered orders for broker_account %s on %s",
+                            len(filtered_serializable), ba_id, TODAY)
+
+            except Exception:
+                logger.exception("[OrderbookBackup] Error storing backup for broker_account %s", ba_id)
+                db.rollback()
+                continue
+
+        logger.info("[OrderbookBackup] Stored backups for %d broker_accounts on %s", count, TODAY)
         return count
 
     @staticmethod
@@ -2105,3 +2625,107 @@ class LiveInvestmentService:
             db.commit()
         logger.info("[AutoTimeout] Auto-recovered %d stale strategies", count)
         return count
+
+    # ── Publisher redirect-callback (token exchange) ──────────────────────
+
+    @staticmethod
+    def handle_publisher_redirect_callback(
+        db: Session,
+        *,
+        user_id,
+        live_id,
+        request_token: str,
+    ) -> dict:
+        """Handle the frontend callback after Kite Publisher redirect.
+
+        1. Verifies the strategy belongs to the calling user.
+        2. Finds the latest basket for the strategy.
+        3. Exchanges request_token for access_token via the broker adapter.
+        4. Encrypts and stores the access_token in broker_account.
+        5. Verifies the broker user_id matches the locked strategy account.
+
+        Returns a dict with status information for the frontend.
+        """
+        from app.core.encryption import encrypt_token
+
+        strategy = db.query(LiveStrategy).filter(LiveStrategy.id == live_id).first()
+        if not strategy:
+            raise HTTPException(status_code=404, detail="Live strategy not found")
+
+        # Verify the strategy belongs to this user
+        if str(strategy.user_id) != str(user_id):
+            raise HTTPException(status_code=403, detail="Strategy does not belong to this user")
+
+        # Find the latest basket for this strategy
+        basket = db.query(LivePublisherBasket).filter(
+            LivePublisherBasket.automate_equity_ra_id == live_id,
+        ).order_by(LivePublisherBasket.created_at.desc()).first()
+        if not basket:
+            raise HTTPException(status_code=404, detail="Publisher basket not found")
+
+        broker_account = db.query(LiveBrokerAccount).filter(
+            LiveBrokerAccount.id == strategy.broker_account_id
+        ).first()
+        if not broker_account:
+            raise HTTPException(status_code=404, detail="Broker account not found")
+
+        # If already connected today, skip exchange (request_token is one-time use)
+        if (
+            broker_account.auth_status == "CONNECTED"
+            and broker_account.token_date == date.today()
+        ):
+            logger.info("[RedirectCallback] Already connected today for strategy %s, skipping token exchange", live_id)
+            return {
+                "status": "ok",
+                "detail": "already_connected_for_today",
+                "broker_user_id": broker_account.broker_user_id,
+            }
+
+        # Exchange request_token → access_token via broker adapter
+        try:
+            adapter = get_publisher_adapter(strategy.broker)
+            token_data = adapter.exchange_token(request_token)
+        except Exception as e:
+            logger.error("[RedirectCallback] Token exchange failed for strategy %s: %s", live_id, e)
+            broker_account.auth_status = "TOKEN_EXCHANGE_FAILED"
+            db.commit()
+            return {
+                "status": "error",
+                "detail": f"token_exchange_failed: {e}",
+                "strategy_status": strategy.status.value if hasattr(strategy.status, "value") else str(strategy.status),
+            }
+
+        # Verify broker user_id matches (prevent accidental login with wrong account)
+        zerodha_user_id = token_data.get("user_id")
+        if broker_account.broker_user_id and zerodha_user_id != broker_account.broker_user_id:
+            strategy.status = LiveStatus.ACCOUNT_MISMATCH
+            broker_account.auth_status = "ACCOUNT_MISMATCH"
+            db.commit()
+            return {
+                "status": "account_mismatch",
+                "expected": broker_account.broker_user_id,
+                "actual": zerodha_user_id,
+            }
+
+        # Store encrypted access_token + metadata in broker_account
+        broker_account.access_token_encrypted = encrypt_token(token_data["access_token"])
+        broker_account.token_date = date.today()
+        broker_account.token_expires_at = token_data.get("expires_at")
+        broker_account.last_request_token = request_token
+        broker_account.last_authorised_at = datetime.utcnow()
+        broker_account.auth_status = "CONNECTED"
+        broker_account.broker_profile = token_data.get("profile")
+
+        basket.status = "REDIRECT_RECEIVED"
+        db.commit()
+
+        logger.info("[RedirectCallback] Token exchanged successfully for strategy %s, broker_user=%s",
+                     live_id, zerodha_user_id)
+
+        return {
+            "status": "ok",
+            "detail": "broker_connected_for_today",
+            "broker_user_id": zerodha_user_id,
+        }
+
+

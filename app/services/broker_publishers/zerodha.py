@@ -220,9 +220,9 @@ class ZerodhaPublisherAdapter(BrokerPublisherAdapter):
             False — checksum is invalid (postback is tampered/fake)
             None  — cannot verify (api_secret not configured or fields missing)
         """
-        api_secret = settings.ZERODHA_API_SECRET
+        api_secret = settings.ZERODHA_PUBLISHER_API_SECRET
         if not api_secret:
-            return None  # Cannot verify without api_secret
+            return None  # Cannot verify without publisher api_secret
 
         checksum = payload.get("checksum")
         order_id = payload.get("order_id")
@@ -236,3 +236,108 @@ class ZerodhaPublisherAdapter(BrokerPublisherAdapter):
         ).hexdigest()
 
         return checksum == expected
+
+    # ── Orderbook fetch (read-only via Publisher access_token) ─────────────
+
+    def fetch_orderbook(self, user_access_token: str) -> list:
+        """Fetch full day's orderbook for a user via Kite Connect API.
+
+        Uses the PUBLISHER API key (ZERODHA_PUBLISHER_API_KEY) + the user's
+        access_token obtained via Publisher token exchange. This gives us
+        read-only access to the user's orderbook for the current day.
+
+        GET https://api.kite.trade/orders
+        Authorization: token <publisher_api_key>:<user_access_token>
+
+        Returns:
+            List of order dicts from Kite, or empty list on failure.
+            Each order has: tag, order_id, status, filled_quantity,
+            average_price, tradingsymbol, transaction_type, placed_by, etc.
+        """
+        api_key = settings.ZERODHA_PUBLISHER_API_KEY
+        if not api_key or not user_access_token:
+            logger.warning("[Orderbook] Missing API key or access_token — cannot fetch orderbook")
+            return []
+
+        try:
+            resp = requests.get(
+                "https://api.kite.trade/orders",
+                headers={
+                    "X-Kite-Version": "3",
+                    "Authorization": f"token {api_key}:{user_access_token}",
+                },
+                timeout=10,
+            )
+            resp.raise_for_status()
+            data = resp.json().get("data", [])
+            logger.info("[Orderbook] Fetched %d orders from Kite", len(data))
+            return data
+        except requests.exceptions.HTTPError as e:
+            logger.error("[Orderbook] Kite API HTTP error: %s — %s", e, getattr(e.response, 'text', ''))
+            return []
+        except Exception as e:
+            logger.error("[Orderbook] Failed to fetch orderbook: %s", e)
+            return []
+
+    # ── Token exchange (Publisher redirect → access_token) ────────────────
+
+    def exchange_token(self, request_token: str) -> Dict[str, Any]:
+        """Exchange Kite Publisher request_token for access_token.
+
+        Uses: SHA256(api_key + request_token + api_secret) as checksum.
+        POST to https://api.kite.trade/session/token
+
+        The resulting access_token can be used for read-only operations:
+        user orders, holdings, margins, etc.
+        """
+        from datetime import datetime, timedelta, time, date as date_cls
+
+        api_key = settings.ZERODHA_PUBLISHER_API_KEY
+        api_secret = settings.ZERODHA_PUBLISHER_API_SECRET
+
+        if not api_key or not api_secret:
+            raise ValueError("ZERODHA_PUBLISHER_API_KEY or ZERODHA_PUBLISHER_API_SECRET not configured")
+
+        checksum = hashlib.sha256(
+            f"{api_key}{request_token}{api_secret}".encode()
+        ).hexdigest()
+
+        resp = requests.post(
+            "https://api.kite.trade/session/token",
+            headers={"X-Kite-Version": "3"},
+            data={
+                "api_key": api_key,
+                "request_token": request_token,
+                "checksum": checksum,
+            },
+            timeout=10,
+        )
+        resp.raise_for_status()
+
+        data = resp.json()["data"]
+
+        # Token expires around 6 AM next day
+        expires_at = datetime.combine(
+            date_cls.today() + timedelta(days=1),
+            time(hour=6, minute=0),
+        )
+
+        return {
+            "access_token": data["access_token"],
+            "user_id": data.get("user_id"),
+            "user_name": data.get("user_name"),
+            "user_shortname": data.get("user_shortname"),
+            "email": data.get("email"),
+            "broker": data.get("broker"),
+            "login_time": data.get("login_time"),
+            "expires_at": expires_at,
+            "profile": {
+                "user_id": data.get("user_id"),
+                "user_name": data.get("user_name"),
+                "user_shortname": data.get("user_shortname"),
+                "email": data.get("email"),
+                "broker": data.get("broker"),
+                "login_time": data.get("login_time"),
+            },
+        }
+

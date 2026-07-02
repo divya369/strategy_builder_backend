@@ -29,10 +29,12 @@ from app.schemas.live_investment import (
     TradelogHoldingResponse,
     EquityCurvePointResponse,
     EquityCurveGraphPoint,
+    EquityCurveGraphResponse,
     PendingBasketResponse,
     PortfolioSummaryResponse,
     OrderStatusResponse,
     OrderDetail,
+    ZerodhaPublisherCallbackRequest,
 )
 from app.core.trading_calendar import require_market_open
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
@@ -64,6 +66,25 @@ async def publisher_postback(request: Request, db: Session = Depends(get_db)):
     logger.info("[Postback] Decoded payload: %s", payload)
     result = LiveInvestmentService.update_from_postback(db, payload, date.today())
     return result
+
+
+@router.post("/publisher/redirect-callback")
+def publisher_redirect_callback(
+    payload: ZerodhaPublisherCallbackRequest,
+    db: Session = Depends(get_db),
+):
+    """Handle frontend callback after Kite Publisher redirect.
+
+    Frontend calls this after Kite redirects back with request_token and status.
+    Backend exchanges request_token for access_token (read-only) and stores it
+    encrypted in broker_account for later use (orders, holdings, margins queries).
+    """
+    return LiveInvestmentService.handle_publisher_redirect_callback(
+        db=db,
+        user_id=payload.user_id,
+        live_id=payload.live_id,
+        request_token=payload.request_token,
+    )
 
 
 def serialize_broker_account(obj: LiveBrokerAccount) -> BrokerAccountResponse:
@@ -608,10 +629,20 @@ def get_strategy_dashboard(live_id: UUID, db: Session = Depends(get_db)):
             publisher_payload=pending_basket_row.publisher_payload,
         )
 
+    # Check if exit orders were actually sent to broker
+    exit_orders_sent = False
+    if strategy.status == LiveStatus.EXIT_PENDING_USER_APPROVAL:
+        exit_orders_sent = db.query(LiveSellStock).filter(
+            LiveSellStock.automate_equity_ra_id == live_id,
+            LiveSellStock.order_id.isnot(None),
+            LiveSellStock.order_id != "",
+        ).count() > 0
+
     return LiveDashboardResponse(
         strategy=serialize_strategy(strategy),
         latest_equity_curve=latest_equity_curve,
         pending_basket=pending_basket,
+        exit_orders_sent=exit_orders_sent,
     )
 
 
@@ -648,21 +679,31 @@ def get_strategy_holdings(live_id: UUID, db: Session = Depends(get_db)):
     ]
 
 
-@router.get("/{live_id}/equity-curve-graph", response_model=List[EquityCurveGraphPoint])
+@router.get("/{live_id}/equity-curve-graph", response_model=EquityCurveGraphResponse)
 def get_equity_curve_graph(live_id: UUID, db: Session = Depends(get_db)):
-    """Full equity curve data for chart (date, strategy_roc, index_roc)."""
+    """Full equity curve data for chart (date, strategy_roc, index_roc, benchmark_roc)."""
     strategy = db.query(LiveStrategy).filter(LiveStrategy.id == live_id).first()
     if not strategy:
         raise HTTPException(status_code=404, detail="Live strategy not found")
 
+    # Resolve benchmark label from strategy's universe_json
+    uj = strategy.universe_json
+    benchmark_label = uj.get("value", "NIFTY 50") if isinstance(uj, dict) and uj.get("type") == "index" and uj.get("value") else "NIFTY 50"
+
     rows = db.query(LiveEquityCurve).filter(
         LiveEquityCurve.automate_equity_ra_id == live_id,
     ).order_by(LiveEquityCurve.date.asc(), LiveEquityCurve.total_days.asc()).all()
-    return [
+    data = [
         EquityCurveGraphPoint(
             date=row.date,
             strategy_roc=row.strategy_roc,
             index_roc=row.index_roc,
+            benchmark_roc=row.benchmark_roc,
         )
         for row in rows
     ]
+    return EquityCurveGraphResponse(
+        index_label="NIFTY 50",
+        benchmark_label=benchmark_label,
+        data=data,
+    )

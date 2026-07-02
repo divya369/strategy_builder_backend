@@ -20,6 +20,7 @@ celery_app = Celery(
     include=[
         "app.tasks.backtest_tasks",
         "app.tasks.live_rebalance_tasks",
+        "app.tasks.orderbook_sync_tasks",
     ],
 )
 

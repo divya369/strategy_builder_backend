@@ -90,6 +90,16 @@ class Settings:
     ZERODHA_API_SECRET: str = os.getenv("ZERODHA_API_SECRET", "")
     ZERODHA_TOTP: str = os.getenv("ZERODHA_TOTP", "")
 
+    # Zerodha Publisher credentials (multi-user: basket, postback, token exchange)
+    # These are separate from the LTP credentials above.
+    ZERODHA_PUBLISHER_API_KEY: str = os.getenv("ZERODHA_PUBLISHER_API_KEY", "")
+    ZERODHA_PUBLISHER_API_SECRET: str = os.getenv("ZERODHA_PUBLISHER_API_SECRET", "")
+
+    # ── Encryption (Fernet) ───────────────────────────────────────────────
+    # Used to encrypt sensitive broker tokens stored in DB.
+    # Generate with: python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+    ENCRYPTION_KEY: str = os.getenv("ENCRYPTION_KEY", "")
+
     # ── Email / Notifications (Resend) ────────────────────────────────────
     RESEND_API_KEY: str = os.getenv("RESEND_API_KEY", "")
     EMAIL_FROM: str = os.getenv("EMAIL_FROM", "EquityCase <noreply@equitycase.com>")

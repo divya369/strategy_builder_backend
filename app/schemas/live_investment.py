@@ -125,16 +125,25 @@ class PendingBasketResponse(BaseModel):
 
 
 class EquityCurveGraphPoint(BaseModel):
-    """Lightweight point for equity curve chart (date vs strategy_roc vs index_roc)."""
+    """Lightweight point for equity curve chart (date vs strategy_roc vs index_roc vs benchmark_roc)."""
     date: date
     strategy_roc: Optional[float] = None
     index_roc: Optional[float] = None
+    benchmark_roc: Optional[float] = None
+
+
+class EquityCurveGraphResponse(BaseModel):
+    """Equity curve graph data with index/benchmark labels for frontend legend."""
+    index_label: str = "NIFTY 50"
+    benchmark_label: str = "NIFTY 50"
+    data: List[EquityCurveGraphPoint] = []
 
 
 class LiveDashboardResponse(BaseModel):
     strategy: LiveStrategyResponse
     latest_equity_curve: Optional[EquityCurvePointResponse] = None
     pending_basket: Optional[PendingBasketResponse] = None
+    exit_orders_sent: bool = False
 
 
 class LiveStrategyListItem(BaseModel):
@@ -182,3 +191,17 @@ class OrderStatusResponse(BaseModel):
     pending: int
     cancelled: int
     orders: List[OrderDetail]
+
+
+# ── Publisher redirect-callback schema ────────────────────────────────────
+
+class ZerodhaPublisherCallbackRequest(BaseModel):
+    """Schema for frontend callback after Kite Publisher redirect.
+
+    Frontend calls this after Kite redirects back with status=success.
+    Backend exchanges request_token for access_token (read-only).
+    """
+    user_id: str
+    live_id: UUID
+    request_token: str
+

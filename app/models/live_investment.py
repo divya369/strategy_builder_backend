@@ -58,6 +58,16 @@ class LiveBrokerAccount(Base):
     broker_account_label = Column(String(255), nullable=False)
     broker_user_id = Column(String(100), nullable=True, index=True)
     is_active = Column(Boolean, nullable=False, default=True)
+
+    # ── Broker auth token fields (populated by Publisher redirect-callback) ──
+    access_token_encrypted = Column(Text, nullable=True)
+    token_date = Column(Date, nullable=True)
+    token_expires_at = Column(DateTime(timezone=True), nullable=True)
+    last_request_token = Column(Text, nullable=True)
+    last_authorised_at = Column(DateTime(timezone=True), nullable=True)
+    auth_status = Column(String(30), nullable=True)
+    broker_profile = Column(JSONB, nullable=True)
+
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
 
@@ -299,6 +309,13 @@ class LiveEquityCurve(Base):
     quarterly_return = Column(Float, nullable=True)
     yearly_return = Column(Float, nullable=True)
 
+    # Benchmark = user-selected index (from screener universe_json).
+    # Falls back to NIFTY 50 if user selected "All Stocks".
+    benchmark_price = Column(Float, nullable=True)
+    benchmark_roc = Column(Float, nullable=True)
+    benchmark_daily_return = Column(Float, nullable=True)
+    benchmark_daily_performance = Column(Float, nullable=True)
+
 
 class LivePublisherBasket(Base):
     """
@@ -322,3 +339,54 @@ class LivePublisherBasket(Base):
     raw_postback = Column(JSONB, nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
+
+
+class BrokerOrderbookDaily(Base):
+    """
+    Daily orderbook backup — one filtered JSON blob per broker_account per date.
+
+    Stored at 16:30 by the daily celery job. Only contains OUR tagged orders
+    (filtered by publisher_tags), not the user's personal trades.
+    This keeps storage small (~5 KB/user/day) and handles privacy.
+
+    Purpose:
+    - Audit trail: what orders were actually on the broker side that day
+    - Reconciliation: cross-check postback data vs orderbook data
+    - Backup: if postback data was lost/corrupted, this has the truth
+    """
+    __tablename__ = "broker_orderbook_daily"
+    __table_args__ = (
+        UniqueConstraint("broker_account_id", "date", name="uq_orderbook_daily_account_date"),
+    )
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4, nullable=False)
+    broker_account_id = Column(UUID(as_uuid=True), ForeignKey("broker_account.id", ondelete="CASCADE"), nullable=False, index=True)
+    broker_user_id = Column(String(100), nullable=True)
+    date = Column(Date, nullable=False, index=True)
+    order_count = Column(Integer, nullable=False, default=0)
+    filtered_orderbook = Column(JSONB, nullable=False)  # Only our tagged orders from kite.orders()
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+
+class PostbackLog(Base):
+    """
+    Append-only log of every postback received from broker.
+
+    Never deleted. Used for:
+    - Debugging: see exact postback payloads and timing
+    - Reconciliation: compare postback data vs orderbook data
+    - Backup: if orderbook API fails, postback data is the fallback source
+
+    Each postback is logged regardless of whether it's processed or skipped.
+    """
+    __tablename__ = "postback_log"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4, nullable=False)
+    received_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False, index=True)
+    publisher_tag = Column(String(8), nullable=True, index=True)
+    order_id = Column(String, nullable=True)
+    status = Column(String(30), nullable=True)
+    tradingsymbol = Column(String, nullable=True)
+    raw_payload = Column(JSONB, nullable=False)
+    matched_strategy_id = Column(UUID(as_uuid=True), nullable=True)
+    processing_note = Column(Text, nullable=True)  # e.g. "orderbook_verified", "fallback_used"
