@@ -1338,6 +1338,18 @@ def _process_basket_orders(
     """
     TERMINAL_STATUSES = {"COMPLETE", "REJECTED", "CANCELLED"}
 
+    # ── Guard: skip already-completed baskets (idempotency) ──
+    if basket.status in ("COMPLETE", "ALL_REJECTED"):
+        logger.info("[ProcessOrders] Basket %s already %s — skipping re-process | source=%s",
+                    basket.id, basket.status, source)
+        return
+
+    # ── Guard: don't revert EXITED strategies ──
+    if strategy.status == LiveStatus.EXITED:
+        logger.info("[ProcessOrders] Strategy %s already EXITED — skipping | source=%s",
+                    strategy.id, source)
+        return
+
     # ── Step 1: Bulk update each order row from the order data ──
     for tag, order in orders_data.items():
         if tag not in basket_tags:
@@ -2040,12 +2052,22 @@ class LiveInvestmentService:
             logger.error("[OrderbookVerify] Basket %s not found", basket_id)
             return {"status": "error", "detail": "basket_not_found"}
 
+        # Early guard: skip already-processed baskets (saves a wasted kite.orders() call)
+        if basket.status in ("COMPLETE", "ALL_REJECTED"):
+            logger.info("[OrderbookVerify] Basket %s already %s — skipping", basket_id, basket.status)
+            return {"status": "ok", "detail": "already_processed"}
+
         strategy = db.query(LiveStrategy).filter(
             LiveStrategy.id == basket.automate_equity_ra_id,
         ).first()
         if not strategy:
             logger.error("[OrderbookVerify] Strategy not found for basket %s", basket_id)
             return {"status": "error", "detail": "strategy_not_found"}
+
+        # Early guard: don't revert EXITED strategies
+        if strategy.status == LiveStatus.EXITED:
+            logger.info("[OrderbookVerify] Strategy %s already EXITED — skipping", strategy.id)
+            return {"status": "ok", "detail": "already_exited"}
 
         # Extract basket's publisher_tags
         basket_tags = set()
