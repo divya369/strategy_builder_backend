@@ -923,7 +923,9 @@ def _safe_benchmark_price(TODAY: date, index_name: str) -> float:
         # Same as the main index — reuse that function to avoid duplicate reads
         return _safe_latest_index_price(TODAY)
     try:
-        temp_df = pd.read_sql_table(index_name, equity_engine)
+        from app.core.benchmark_registry import resolve_benchmark_table
+        table_name = resolve_benchmark_table(index_name)
+        temp_df = pd.read_sql_table(table_name, equity_engine)
         if temp_df.empty or "close" not in temp_df.columns:
             return 0.0
         if "date" in temp_df.columns:
