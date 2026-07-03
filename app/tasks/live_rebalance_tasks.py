@@ -87,8 +87,8 @@ def daily_equity_curve_update(today: date | None = None) -> int:
     Refreshes LTP for active holdings and appends new equity curve row.
     """
     setup_logging()  # ensure file handlers for cron (no-op if already called)
-    today = today or date.today()
-    # today = date.fromisoformat("2026-07-01")
+    # today = today or date.today()
+    today = date.fromisoformat("2026-07-02")
 
     if not is_trading_day(today):
         mtm_logger.info("[DailyMTM] %s is a non-trading day, skipping daily equity curve update", today)
