@@ -125,12 +125,24 @@ class ZerodhaPublisherAdapter(BrokerPublisherAdapter):
                 "transaction_type": "SELL",
                 "quantity": int(row["qty"]),
                 "product": "CNC",
-                "order_type": "LIMIT",
-                "price": round(limit_price, 2),
+                "order_type": "MARKET",
                 "validity": "DAY",
                 "readonly": False,
                 "tag": tag,
             })
+
+            # orders.append({
+            #     "exchange": "NSE",
+            #     "tradingsymbol": tradingsymbol,
+            #     "transaction_type": "SELL",
+            #     "quantity": int(row["qty"]),
+            #     "product": "CNC",
+            #     "order_type": "LIMIT",
+            #     "price": round(limit_price, 2),
+            #     "validity": "DAY",
+            #     "readonly": False,
+            #     "tag": tag,
+            # })
 
         for _, row in buy_df.iterrows():
             if int(row.get("qty") or 0) <= 0:
@@ -153,12 +165,24 @@ class ZerodhaPublisherAdapter(BrokerPublisherAdapter):
                 "transaction_type": "BUY",
                 "quantity": int(row["qty"]),
                 "product": "CNC",
-                "order_type": "LIMIT",
-                "price": round(limit_price, 2),
+                "order_type": "MARKET",
                 "validity": "DAY",
                 "readonly": False,
                 "tag": tag,
             })
+
+            # orders.append({
+            #     "exchange": "NSE",
+            #     "tradingsymbol": tradingsymbol,
+            #     "transaction_type": "BUY",
+            #     "quantity": int(row["qty"]),
+            #     "product": "CNC",
+            #     "order_type": "LIMIT",
+            #     "price": round(limit_price, 2),
+            #     "validity": "DAY",
+            #     "readonly": False,
+            #     "tag": tag,
+            # })
 
         return {
             "broker": self.broker,
@@ -312,7 +336,24 @@ class ZerodhaPublisherAdapter(BrokerPublisherAdapter):
             },
             timeout=10,
         )
-        resp.raise_for_status()
+
+        if resp.status_code != 200:
+            # Log the FULL Kite error response before raising
+            try:
+                error_body = resp.json()
+                kite_message = error_body.get("message", "")
+                kite_error_type = error_body.get("error_type", "")
+            except Exception:
+                kite_message = resp.text
+                kite_error_type = ""
+            logger.error(
+                "[TokenExchange] Kite returned HTTP %d | message=%s | error_type=%s | request_token=%s...%s",
+                resp.status_code, kite_message, kite_error_type,
+                request_token[:8], request_token[-4:] if len(request_token) > 8 else "",
+            )
+            raise ValueError(
+                f"Kite token exchange failed (HTTP {resp.status_code}): {kite_message} [{kite_error_type}]"
+            )
 
         data = resp.json()["data"]
 

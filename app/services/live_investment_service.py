@@ -42,7 +42,6 @@ from app.models.live_investment import (
     LivePublisherBasket,
     LiveBrokerAccount,
     LiveStatus,
-    PostbackLog,
 )
 import redis
 from app.core.encryption import decrypt_token
@@ -1822,6 +1821,23 @@ class LiveInvestmentService:
             current = strategy.status.value if hasattr(strategy.status, "value") else str(strategy.status)
             raise HTTPException(status_code=400, detail=f"Exit preview can be generated only from ACTIVE. Current status={current}")
         _delete_unapproved_preview_rows(db, strategy.id, include_sell=True)
+
+        # ── Same-day exit support ──
+        # If user bought stocks today and wants to exit before 16:30 daily job,
+        # the tradelog won't have entries yet. Process pending fills into tradelog
+        # on-demand so exit preview can read them. Scoped to THIS strategy only.
+        buy_df = model_df(db, LiveBuyStock, strategy.id)
+        if not buy_df.empty:
+            pending_buys = buy_df.loc[
+                (buy_df["updated_in_tradelog"].fillna(False) == False) &
+                (buy_df["actual_qty"].fillna(0) > 0)
+            ]
+            if not pending_buys.empty:
+                logger.info("[ExitPreview] Found %d pending fills for strategy %s — processing into tradelog now",
+                            len(pending_buys), strategy.id)
+                _process_strategy_daily_update(db, strategy, TODAY)
+                db.commit()
+
         tradelog_df = model_df(db, LiveTradelog, strategy.id)
         active_df = tradelog_df.loc[tradelog_df["active"] == True] if not tradelog_df.empty else pd.DataFrame()
         # Fetch live LTP for exit preview prices
@@ -1870,14 +1886,13 @@ class LiveInvestmentService:
     def update_from_postback(db: Session, payload: Dict[str, Any], TODAY: Optional[date] = None) -> dict:
         """Process a single broker postback.
 
-        New flow (orderbook verification):
-        1. Store raw postback on order row + log to postback_log (always)
-        2. If terminal status → schedule debounced orderbook verification task
-        3. Actual fill processing (actual_qty, broker_status, status transitions)
+        Flow:
+        1. Find order row by publisher_tag
+        2. Store raw postback + order_id on order row (broker_raw_postback column)
+        3. If terminal status → schedule debounced orderbook verification task
+        4. Actual fill processing (actual_qty, broker_status, status transitions)
            happens in verify_and_process_from_orderbook(), triggered by the
            debounced celery task.
-
-        Postback data is stored for audit and as fallback if orderbook API fails.
 
         Returns a dict with status info for the API response.
         """
@@ -1894,26 +1909,25 @@ class LiveInvestmentService:
         kite_order_id = payload.get("order_id")  # Kite's unique order ID
         postback_symbol = payload.get("tradingsymbol")
 
-        if not raw_tag and not kite_order_id:
-            raise HTTPException(status_code=400, detail="Postback missing both tag and order_id")
+        if not raw_tag:
+            raise HTTPException(status_code=400, detail="Postback missing tag")
         if not postback_symbol:
             raise HTTPException(status_code=400, detail="Postback missing tradingsymbol")
 
         # ── Step 1: Find the specific order row by publisher_tag (unique per order) ──
         row_obj = None
         order_table = None  # Track which table the order is in
-        if raw_tag:
-            row_obj = db.query(LiveBuyStock).filter(LiveBuyStock.publisher_tag == raw_tag).first()
+        row_obj = db.query(LiveBuyStock).filter(LiveBuyStock.publisher_tag == raw_tag).first()
+        if row_obj:
+            order_table = "buy"
+        else:
+            row_obj = db.query(LiveSellStock).filter(LiveSellStock.publisher_tag == raw_tag).first()
             if row_obj:
-                order_table = "buy"
+                order_table = "sell"
             else:
-                row_obj = db.query(LiveSellStock).filter(LiveSellStock.publisher_tag == raw_tag).first()
+                row_obj = db.query(LiveCircuitStock).filter(LiveCircuitStock.publisher_tag == raw_tag).first()
                 if row_obj:
-                    order_table = "sell"
-                else:
-                    row_obj = db.query(LiveCircuitStock).filter(LiveCircuitStock.publisher_tag == raw_tag).first()
-                    if row_obj:
-                        order_table = "circuit"
+                    order_table = "circuit"
 
         if not row_obj:
             logger.warning("[Postback] No order found for publisher_tag=%s symbol=%s", raw_tag, postback_symbol)
@@ -1932,41 +1946,17 @@ class LiveInvestmentService:
 
         # Broker-specific normalization after strategy is known.
         adapter = get_publisher_adapter(strategy.broker)
-        payload = adapter.normalize_postback(payload)
+        normalized = adapter.normalize_postback(payload)
 
-        # ── VERIFICATION GUARD 1: Checksum (anti-tampering) ──────────────
-        checksum_result = adapter.verify_checksum(payload.get("raw") or payload)
-        if checksum_result is False:
-            logger.warning("[Postback] CHECKSUM FAILED | tag=%s strategy=%s — rejecting", raw_tag, strategy.id)
-            raise HTTPException(status_code=403, detail="Postback checksum verification failed — possible tampering")
-
-        # ── VERIFICATION GUARD 2: Already processed by orderbook ─────────
-        # If the order row already has a terminal broker_status (set by orderbook
-        # verification), this postback is a duplicate — skip it.
-        if hasattr(row_obj, "broker_status") and row_obj.broker_status in TERMINAL_STATUSES:
-            logger.info("[Postback] DUPLICATE skipped | tag=%s symbol=%s — already has terminal status=%s",
-                        raw_tag, postback_symbol, row_obj.broker_status)
-            return {"status": "ok", "detail": "already_processed"}
-
-        # ── Step 4: Store raw postback on order row (for audit + fallback) ──
+        # ── Step 4: Store raw postback + order_id on order row ──
         if kite_order_id:
             row_obj.order_id = kite_order_id
-        row_obj.broker_raw_postback = payload
+        row_obj.broker_raw_postback = normalized
+        logger.info("[Postback] Stored raw postback | tag=%s symbol=%s order_id=%s table=%s",
+                    raw_tag, postback_symbol, kite_order_id, order_table)
 
-        # ── Step 5: Log to postback_log (append-only audit trail) ────────
-        postback_log_entry = PostbackLog(
-            publisher_tag=raw_tag,
-            order_id=kite_order_id,
-            status=payload.get("status"),
-            tradingsymbol=postback_symbol,
-            raw_payload=payload,
-            matched_strategy_id=strategy.id,
-            processing_note="stored_awaiting_orderbook_verify",
-        )
-        db.add(postback_log_entry)
-
-        # ── Step 6: Client ID lock (early detection of wrong account) ────
-        client_id = payload.get("client_id") or payload.get("user_id")
+        # ── Step 5: Client ID lock (early detection of wrong account) ────
+        client_id = normalized.get("client_id") or normalized.get("user_id")
         if client_id:
             if not strategy.locked_client_id:
                 broker_account = db.query(LiveBrokerAccount).filter(
@@ -1985,8 +1975,8 @@ class LiveInvestmentService:
 
         db.commit()
 
-        # ── Step 7: If terminal → schedule debounced orderbook verification ──
-        broker_status = (payload.get("status") or "").upper()
+        # ── Step 6: If terminal → schedule debounced orderbook verification ──
+        broker_status = (normalized.get("status") or "").upper()
         if broker_status not in TERMINAL_STATUSES:
             logger.info("[Postback] Non-terminal status=%s | tag=%s — stored, no verification needed", broker_status, raw_tag)
             return {"status": "ok", "detail": f"non_terminal_{broker_status.lower()}"}

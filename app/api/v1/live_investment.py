@@ -96,14 +96,51 @@ def serialize_broker_account(obj: LiveBrokerAccount) -> BrokerAccountResponse:
         is_active=obj.is_active,
     )
 
-# Please do not scan this and edit.
-# @router.get("/broker-accounts", response_model=list[BrokerAccountResponse])
-# def list_broker_accounts(db: Session = Depends(get_db)):
-#     rows = db.query(LiveBrokerAccount).filter(
-#         LiveBrokerAccount.user_id == SYSTEM_USER_ID,
-#         LiveBrokerAccount.is_active == True,
-#     ).order_by(LiveBrokerAccount.broker.asc(), LiveBrokerAccount.broker_account_label.asc()).all()
-#     return [serialize_broker_account(x) for x in rows]
+@router.get("/broker-accounts/{user_id}", response_model=list[BrokerAccountResponse])
+def list_broker_accounts(user_id: str, db: Session = Depends(get_db)):
+    """List all active broker accounts for a user."""
+    rows = db.query(LiveBrokerAccount).filter(
+        LiveBrokerAccount.user_id == user_id,
+        LiveBrokerAccount.is_active == True,
+    ).order_by(LiveBrokerAccount.broker.asc(), LiveBrokerAccount.broker_account_label.asc()).all()
+    return [serialize_broker_account(x) for x in rows]
+
+
+@router.delete("/broker-accounts/{account_id}")
+def delete_broker_account(account_id: UUID, db: Session = Depends(get_db)):
+    """Soft-delete a broker account (sets is_active=False).
+
+    After soft-delete, another user can register the same broker_user_id.
+    Guard: cannot delete if any running strategy uses this account.
+    """
+    account = db.query(LiveBrokerAccount).filter(LiveBrokerAccount.id == account_id).first()
+    if not account:
+        raise HTTPException(status_code=404, detail="Broker account not found")
+    if not account.is_active:
+        return {"status": "ok", "detail": "already_deleted"}
+
+    # Guard: check if any running strategy uses this broker account
+    running_statuses = {
+        LiveStatus.PENDING_USER_APPROVAL, LiveStatus.ACTIVE,
+        LiveStatus.REBALANCE_READY, LiveStatus.REBALANCE_PENDING_USER_APPROVAL,
+        LiveStatus.REBALANCE_SELL_COMPLETE,
+        LiveStatus.EXIT_PENDING_USER_APPROVAL,
+    }
+    active_strategy = db.query(LiveStrategy).filter(
+        LiveStrategy.broker_account_id == account_id,
+        LiveStrategy.status.in_(running_statuses),
+    ).first()
+    if active_strategy:
+        raise HTTPException(
+            status_code=400,
+            detail="Cannot delete broker account — it is used by an active strategy. "
+                   "Exit or cancel the strategy first.",
+        )
+
+    account.is_active = False
+    db.commit()
+    return {"status": "ok", "detail": "broker_account_deleted"}
+
 
 
 def serialize_strategy(obj: LiveStrategy) -> LiveStrategyResponse:
@@ -182,18 +219,43 @@ def go_live(payload: GoLiveRequest, db: Session = Depends(get_db), _mkt=Depends(
     """
     # ── Inline broker account upsert (replaces old POST /broker-accounts) ──
     broker_value = payload.broker
+    label = payload.broker_account_label or payload.broker_user_id  # Default label to broker_user_id
+
+    # Guard: is this broker_user_id already registered by a DIFFERENT active user?
+    conflict = db.query(LiveBrokerAccount).filter(
+        LiveBrokerAccount.broker_user_id == payload.broker_user_id,
+        LiveBrokerAccount.broker == broker_value,
+        LiveBrokerAccount.user_id != payload.user_id,
+        LiveBrokerAccount.is_active == True,
+    ).first()
+    if conflict:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": "This broker user ID is already registered by another user. "
+                           "If you own this account, ask the other user to remove it first.",
+                "broker_user_id": payload.broker_user_id,
+            },
+        )
+
+    # Find existing account for THIS user by broker_user_id (not label)
     existing_account = db.query(LiveBrokerAccount).filter(
         LiveBrokerAccount.user_id == payload.user_id,
         LiveBrokerAccount.broker == broker_value,
-        LiveBrokerAccount.broker_account_label == payload.broker_account_label,
+        LiveBrokerAccount.broker_user_id == payload.broker_user_id,
+        LiveBrokerAccount.is_active == True,
     ).first()
     if existing_account:
         broker_account = existing_account
+        # Update label if user changed it
+        if broker_account.broker_account_label != label:
+            broker_account.broker_account_label = label
+            db.commit()
     else:
         broker_account = LiveBrokerAccount(
             user_id=payload.user_id,
             broker=broker_value,
-            broker_account_label=payload.broker_account_label,
+            broker_account_label=label,
             broker_user_id=payload.broker_user_id,
         )
         db.add(broker_account)
@@ -486,29 +548,50 @@ def portfolio_summary(user_id: str, db: Session = Depends(get_db)):
 
 @router.get("/{live_id}/order-status", response_model=OrderStatusResponse)
 def get_order_status(live_id: UUID, db: Session = Depends(get_db)):
-    """Per-order status for the current basket.
+    """Per-order status for the current basket (today only).
 
     Returns filled/rejected/pending/cancelled counts and per-order details
     with rejection reasons. Frontend uses this to:
     - Show progress while orders are processing (poll every 5s)
     - Show rejection reasons when ALL_REJECTED
     - Show partial fill details
+
+    Only returns today's orders — past days return empty.
+    Frontend should also hide this section when strategy is ACTIVE/EXITED.
     """
+    today = date.today()
     strategy = db.query(LiveStrategy).filter(LiveStrategy.id == live_id).first()
     if not strategy:
         raise HTTPException(status_code=404, detail="Live strategy not found")
 
-    # Get current basket's tags to scope to latest basket only
+    # Get latest basket — but only if it was created today
     latest_basket = db.query(LivePublisherBasket).filter(
         LivePublisherBasket.automate_equity_ra_id == live_id,
     ).order_by(LivePublisherBasket.created_at.desc()).first()
 
     basket_tags = set()
     if latest_basket and latest_basket.publisher_payload:
-        basket_tags = {
-            o.get("tag") for o in (latest_basket.publisher_payload.get("basket") or [])
-            if o.get("tag")
-        }
+        # Only use basket tags if the basket was created today
+        basket_date = latest_basket.created_at.date() if latest_basket.created_at else None
+        if basket_date == today:
+            basket_tags = {
+                o.get("tag") for o in (latest_basket.publisher_payload.get("basket") or [])
+                if o.get("tag")
+            }
+
+    # If no basket tags for today, return empty response (past-day safety)
+    if not basket_tags:
+        return OrderStatusResponse(
+            live_id=live_id,
+            strategy_name=strategy.strategy_name,
+            strategy_status=strategy.status.value if hasattr(strategy.status, "value") else str(strategy.status),
+            total_orders=0,
+            filled=0,
+            rejected=0,
+            pending=0,
+            cancelled=0,
+            orders=[],
+        )
 
     orders = []
     filled = 0
@@ -516,13 +599,14 @@ def get_order_status(live_id: UUID, db: Session = Depends(get_db)):
     pending = 0
     cancelled = 0
 
-    # Buy orders
+    # Buy orders (today only)
     buy_rows = db.query(LiveBuyStock).filter(
         LiveBuyStock.automate_equity_ra_id == live_id,
+        LiveBuyStock.date == today,
     ).all()
     for r in buy_rows:
-        if basket_tags and r.publisher_tag not in basket_tags:
-            continue  # Skip old basket rows
+        if r.publisher_tag not in basket_tags:
+            continue  # Skip rows not in this basket
         status = (r.broker_status or "").upper() if r.broker_status else None
         if status == "COMPLETE":
             filled += 1
@@ -544,12 +628,13 @@ def get_order_status(live_id: UUID, db: Session = Depends(get_db)):
             filled_price=float(r.actual_price or 0),
         ))
 
-    # Sell orders
+    # Sell orders (today only)
     sell_rows = db.query(LiveSellStock).filter(
         LiveSellStock.automate_equity_ra_id == live_id,
+        LiveSellStock.date == today,
     ).all()
     for r in sell_rows:
-        if basket_tags and r.publisher_tag not in basket_tags:
+        if r.publisher_tag not in basket_tags:
             continue
         status = (r.broker_status or "").upper() if r.broker_status else None
         if status == "COMPLETE":

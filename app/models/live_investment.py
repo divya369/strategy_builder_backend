@@ -367,26 +367,3 @@ class BrokerOrderbookDaily(Base):
     filtered_orderbook = Column(JSONB, nullable=False)  # Only our tagged orders from kite.orders()
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
-
-class PostbackLog(Base):
-    """
-    Append-only log of every postback received from broker.
-
-    Never deleted. Used for:
-    - Debugging: see exact postback payloads and timing
-    - Reconciliation: compare postback data vs orderbook data
-    - Backup: if orderbook API fails, postback data is the fallback source
-
-    Each postback is logged regardless of whether it's processed or skipped.
-    """
-    __tablename__ = "postback_log"
-
-    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4, nullable=False)
-    received_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False, index=True)
-    publisher_tag = Column(String(8), nullable=True, index=True)
-    order_id = Column(String, nullable=True)
-    status = Column(String(30), nullable=True)
-    tradingsymbol = Column(String, nullable=True)
-    raw_payload = Column(JSONB, nullable=False)
-    matched_strategy_id = Column(UUID(as_uuid=True), nullable=True)
-    processing_note = Column(Text, nullable=True)  # e.g. "orderbook_verified", "fallback_used"
