@@ -2,7 +2,7 @@ import json
 import logging
 from uuid import UUID
 from datetime import date
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, joinedload
 from app.core.database import get_db
 from typing import Any, Dict, List, Optional
 from app.models.live_investment import (
@@ -19,6 +19,7 @@ from app.models.live_investment import (
 from app.schemas.live_investment import (
     GoLiveRequest,
     BrokerAccountResponse,
+    BrokerLinkedStrategy,
     LiveStrategyResponse,
     PreviewStockItem,
     PreviewResponse,
@@ -87,13 +88,34 @@ def publisher_redirect_callback(
     )
 
 
-def serialize_broker_account(obj: LiveBrokerAccount) -> BrokerAccountResponse:
+def serialize_broker_account(db: Session, obj: LiveBrokerAccount) -> BrokerAccountResponse:
+    # Query running strategies linked to this broker account
+    running_statuses = [
+        LiveStatus.PENDING_USER_APPROVAL, LiveStatus.ACTIVE,
+        LiveStatus.REBALANCE_READY, LiveStatus.REBALANCE_PENDING_USER_APPROVAL,
+        LiveStatus.REBALANCE_SELL_COMPLETE,
+        LiveStatus.EXIT_PENDING_USER_APPROVAL,
+    ]
+    linked = db.query(LiveStrategy).options(
+        joinedload(LiveStrategy.screener_version)
+    ).filter(
+        LiveStrategy.broker_account_id == obj.id,
+        LiveStrategy.status.in_(running_statuses),
+    ).all()
     return BrokerAccountResponse(
         id=obj.id,
         broker=obj.broker,
         label=obj.broker_account_label,
         expected_client_id=obj.broker_user_id,
         is_active=obj.is_active,
+        strategies=[
+            BrokerLinkedStrategy(
+                id=s.id, 
+                strategy_name=s.strategy_name, 
+                version_number=s.screener_version.version_number if s.screener_version else 0
+            )
+            for s in linked
+        ],
     )
 
 @router.get("/broker-accounts/{user_id}", response_model=list[BrokerAccountResponse])
@@ -103,17 +125,17 @@ def list_broker_accounts(user_id: str, db: Session = Depends(get_db)):
         LiveBrokerAccount.user_id == user_id,
         LiveBrokerAccount.is_active == True,
     ).order_by(LiveBrokerAccount.broker.asc(), LiveBrokerAccount.broker_account_label.asc()).all()
-    return [serialize_broker_account(x) for x in rows]
+    return [serialize_broker_account(db, x) for x in rows]
 
 
-@router.delete("/broker-accounts/{account_id}")
-def delete_broker_account(account_id: UUID, db: Session = Depends(get_db)):
+@router.delete("/broker-accounts/{broker_account_id}")
+def delete_broker_account(broker_account_id: UUID, db: Session = Depends(get_db)):
     """Soft-delete a broker account (sets is_active=False).
 
     After soft-delete, another user can register the same broker_user_id.
     Guard: cannot delete if any running strategy uses this account.
     """
-    account = db.query(LiveBrokerAccount).filter(LiveBrokerAccount.id == account_id).first()
+    account = db.query(LiveBrokerAccount).filter(LiveBrokerAccount.id == broker_account_id).first()
     if not account:
         raise HTTPException(status_code=404, detail="Broker account not found")
     if not account.is_active:
@@ -127,7 +149,7 @@ def delete_broker_account(account_id: UUID, db: Session = Depends(get_db)):
         LiveStatus.EXIT_PENDING_USER_APPROVAL,
     }
     active_strategy = db.query(LiveStrategy).filter(
-        LiveStrategy.broker_account_id == account_id,
+        LiveStrategy.broker_account_id == broker_account_id,
         LiveStrategy.status.in_(running_statuses),
     ).first()
     if active_strategy:
@@ -522,15 +544,18 @@ def list_strategies(
 
 
 @router.get("/portfolio-summary/{user_id}", response_model=PortfolioSummaryResponse)
-def portfolio_summary(user_id: str, db: Session = Depends(get_db)):
-    """Aggregate summary across all running strategies (subscription_active=True).
+def portfolio_summary(user_id: str, status: str = "ACTIVE", db: Session = Depends(get_db)):
+    """Aggregate summary across strategies based on status.
 
     Returns: total_investment, current_investment, total_pnl, todays_pnl, strategy_count.
     """
-    rows = db.query(LiveStrategy).filter(
-        LiveStrategy.user_id == user_id,
-        LiveStrategy.subscription_active == True,
-    ).all()
+    query = db.query(LiveStrategy).filter(LiveStrategy.user_id == user_id)
+    if status == "ACTIVE":
+        query = query.filter(LiveStrategy.subscription_active == True)
+    elif status == "EXITED":
+        query = query.filter(LiveStrategy.status == LiveStatus.EXITED)
+    
+    rows = query.all()
 
     total_investment = sum(float(r.initial_aum or 0) for r in rows)
     current_investment = sum(float(r.final_aum or 0) for r in rows)
@@ -697,6 +722,14 @@ def get_strategy_dashboard(live_id: UUID, db: Session = Depends(get_db)):
             total_pnl=latest_eq.total_pnl,
             sharpe=latest_eq.sharpe,
             cagr_percent=latest_eq.cagr_percent,
+            total_trades=latest_eq.total_trades,
+            winning_trades=latest_eq.winning_trades,
+            losing_trades=latest_eq.losing_trades,
+            winning_percent=latest_eq.winning_percent,
+            avg_win=latest_eq.avg_win,
+            avg_loss=latest_eq.avg_loss,
+            total_charges=latest_eq.total_charges,
+            monthly_return=latest_eq.monthly_return,
         )
 
     # Latest pending/partial basket
@@ -732,16 +765,17 @@ def get_strategy_dashboard(live_id: UUID, db: Session = Depends(get_db)):
 
 
 @router.get("/{live_id}/holdings", response_model=List[TradelogHoldingResponse])
-def get_strategy_holdings(live_id: UUID, db: Session = Depends(get_db)):
-    """Active holdings for a strategy (from tradelog)."""
+def get_active_holdings(live_id: UUID, status: str = "ACTIVE", db: Session = Depends(get_db)):
+    """Holdings for a strategy (from tradelog). Allows status=ALL for exited strategies."""
     strategy = db.query(LiveStrategy).filter(LiveStrategy.id == live_id).first()
     if not strategy:
         raise HTTPException(status_code=404, detail="Live strategy not found")
 
-    rows = db.query(LiveTradelog).filter(
-        LiveTradelog.automate_equity_ra_id == live_id,
-        LiveTradelog.active == True,
-    ).all()
+    query = db.query(LiveTradelog).filter(LiveTradelog.automate_equity_ra_id == live_id)
+    if status == "ACTIVE":
+        query = query.filter(LiveTradelog.active == True)
+        
+    rows = query.order_by(LiveTradelog.buy_date.desc()).all()
     return [
         TradelogHoldingResponse(
             tradingsymbol=h.tradingsymbol,
@@ -750,6 +784,8 @@ def get_strategy_holdings(live_id: UUID, db: Session = Depends(get_db)):
             buy_qty=h.buy_qty,
             buy_price=float(h.buy_price or 0),
             buy_amount=float(h.buy_amount or 0),
+            sell_date=h.sell_date,
+            hold=h.hold,
             sell_qty=h.sell_qty or 0,
             sell_price=float(h.sell_price or 0),
             ltp=float(h.ltp) if h.ltp else None,
@@ -778,17 +814,30 @@ def get_equity_curve_graph(live_id: UUID, db: Session = Depends(get_db)):
     rows = db.query(LiveEquityCurve).filter(
         LiveEquityCurve.automate_equity_ra_id == live_id,
     ).order_by(LiveEquityCurve.date.asc(), LiveEquityCurve.total_days.asc()).all()
-    data = [
-        EquityCurveGraphPoint(
-            date=row.date,
-            strategy_roc=row.strategy_roc,
-            index_roc=row.index_roc,
-            benchmark_roc=row.benchmark_roc,
+    data = []
+    monthly_returns_map = {}
+    for row in rows:
+        data.append(
+            EquityCurveGraphPoint(
+                date=row.date,
+                strategy_roc=row.strategy_roc,
+                index_roc=row.index_roc,
+                benchmark_roc=row.benchmark_roc,
+                current_dd_percent=row.current_dd_percent,
+            )
         )
-        for row in rows
-    ]
+        # Overwrites daily so the last day of the month is the final value
+        year = row.date.year
+        month = row.date.month
+        monthly_returns_map[f"{year}-{month}"] = {
+            "year": year,
+            "month": month,
+            "monthly_return": row.monthly_return or 0.0
+        }
+
     return EquityCurveGraphResponse(
         index_label="NIFTY 50",
         benchmark_label=benchmark_label,
         data=data,
+        monthly_returns=list(monthly_returns_map.values()),
     )

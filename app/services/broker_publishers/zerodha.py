@@ -110,6 +110,8 @@ class ZerodhaPublisherAdapter(BrokerPublisherAdapter):
             tag_val = row.get("publisher_tag")
             tag = "" if pd.isna(tag_val) else str(tag_val or "")
             tradingsymbol = row["tradingsymbol"]
+            if not tag:
+                logger.warning("[KiteBasket] SELL order for %s has EMPTY publisher_tag — postback matching will fail!", tradingsymbol)
 
             # Use live LTP if available, otherwise fall back to existing price from DB
             limit_price = ltp_map.get(tradingsymbol)
@@ -150,6 +152,8 @@ class ZerodhaPublisherAdapter(BrokerPublisherAdapter):
             tag_val = row.get("publisher_tag")
             tag = "" if pd.isna(tag_val) else str(tag_val or "")
             tradingsymbol = row["tradingsymbol"]
+            if not tag:
+                logger.warning("[KiteBasket] BUY order for %s has EMPTY publisher_tag — postback matching will fail!", tradingsymbol)
 
             # Use live LTP if available, otherwise fall back to existing price from DB
             limit_price = ltp_map.get(tradingsymbol)

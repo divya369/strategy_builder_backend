@@ -406,6 +406,17 @@ def assign_publisher_tags(db: Session, strategy: LiveStrategy, basket_type: str,
                 sell_df.at[i, "publisher_tag"] = _publisher_tag(strategy.id, "SELL", int(row["id"]))
         update_df_to_db(db, sell_df, LiveSellStock)
 
+    # ── Tag verification: ensure no order row has an empty publisher_tag ──
+    # If any row has an empty tag, the Kite order will have no tag → postback
+    # can't match → actual_qty/price/order_id never update → status gets stuck.
+    for df_label, df_check in [("buy", buy_df), ("sell", sell_df)]:
+        if not df_check.empty:
+            empty_tags = df_check[df_check["publisher_tag"].isna() | (df_check["publisher_tag"] == "")]
+            if not empty_tags.empty:
+                symbols = list(empty_tags["tradingsymbol"])
+                logger.error("[AssignTags] %d %s rows still have EMPTY publisher_tag after assignment! symbols=%s",
+                             len(empty_tags), df_label, symbols)
+
     # ── Side filtering for split rebalance ────────────────────────────────
     if side == "SELL":
         buy_df = buy_df.iloc[0:0]  # Empty — only sell orders in this basket
@@ -1186,7 +1197,7 @@ def _delete_unapproved_preview_rows(db: Session, strategy_id, *, include_sell: b
     if include_sell:
         db.query(LiveSellStock).filter(
             LiveSellStock.automate_equity_ra_id == strategy_id,
-            LiveSellStock.order_id.is_(None),
+            or_(LiveSellStock.order_id.is_(None), LiveSellStock.order_id == ""),
             or_(LiveSellStock.actual_qty.is_(None), LiveSellStock.actual_qty == 0),
             LiveSellStock.updated_in_tradelog == False,
         ).delete(synchronize_session=False)
@@ -1664,7 +1675,28 @@ class LiveInvestmentService:
         strategy = db.query(LiveStrategy).filter(LiveStrategy.id == strategy_id).first()
         if not strategy:
             raise HTTPException(status_code=404, detail="Live strategy not found")
-        if strategy.status not in {LiveStatus.DRAFT, LiveStatus.PREVIEW_READY, LiveStatus.ALL_REJECTED}:
+        # ── Stale recovery: PENDING_USER_APPROVAL with 0 fills (user abandoned Kite) ──
+        if strategy.status == LiveStatus.PENDING_USER_APPROVAL:
+            filled = db.query(LiveBuyStock).filter(
+                LiveBuyStock.automate_equity_ra_id == strategy.id,
+                LiveBuyStock.actual_qty > 0,
+            ).count()
+            if filled == 0:
+                # Cancel stale baskets + delete unfilled rows
+                db.query(LivePublisherBasket).filter(
+                    LivePublisherBasket.automate_equity_ra_id == strategy.id,
+                    LivePublisherBasket.status.in_(["PENDING_USER_APPROVAL", "REDIRECT_RECEIVED"]),
+                ).update({"status": "CANCELLED"}, synchronize_session=False)
+                db.query(LiveBuyStock).filter(
+                    LiveBuyStock.automate_equity_ra_id == strategy.id,
+                    or_(LiveBuyStock.actual_qty.is_(None), LiveBuyStock.actual_qty == 0),
+                ).delete(synchronize_session=False)
+                db.commit()
+                logger.info("[InitialPreview] Stale recovery for strategy %s — cancelled baskets + deleted unfilled rows", strategy.id)
+                # Fall through to re-create preview
+            else:
+                raise HTTPException(status_code=400, detail="Orders were already filled. Wait for postback processing to complete.")
+        elif strategy.status not in {LiveStatus.DRAFT, LiveStatus.PREVIEW_READY, LiveStatus.ALL_REJECTED}:
             current = strategy.status.value if hasattr(strategy.status, "value") else str(strategy.status)
             raise HTTPException(status_code=400, detail=f"Preview can be generated only from DRAFT/PREVIEW_READY/ALL_REJECTED. Current status={current}")
         _delete_unapproved_preview_rows(db, strategy.id, include_sell=False)
@@ -1715,6 +1747,11 @@ class LiveInvestmentService:
             )
             insert_df_to_db(db, buy_df, LiveBuyStock)
 
+        # Clean up rejected rows when retrying BUY from REBALANCE_SELL_COMPLETE
+        # Rejected rows have updated_in_tradelog=True so assign_publisher_tags skips them
+        if basket_type == "REBALANCE" and side == "BUY" and strategy.status == LiveStatus.REBALANCE_SELL_COMPLETE:
+            _delete_unapproved_preview_rows(db, strategy.id, include_sell=False)
+
         # Auto-refresh exit sell rows with latest LTP before sending basket
         # Same pattern as ALL_REJECTED auto-retry above
         if basket_type == "EXIT":
@@ -1729,11 +1766,59 @@ class LiveInvestmentService:
         strategy = db.query(LiveStrategy).filter(LiveStrategy.id == strategy_id).first()
         if not strategy:
             raise HTTPException(status_code=404, detail="Live strategy not found")
+        _stale_recovered = False
         if strategy.status in {LiveStatus.REBALANCE_SELL_COMPLETE, LiveStatus.REBALANCE_PENDING_USER_APPROVAL}:
-            # Sell basket already sent/completed — buy/sell rows already exist.
-            # Just return the strategy so frontend can render the preview page.
-            return strategy
-        if strategy.status not in {LiveStatus.ACTIVE, LiveStatus.REBALANCE_READY}:
+            if strategy.status == LiveStatus.REBALANCE_PENDING_USER_APPROVAL:
+                # Check if any orders were actually filled by broker.
+                # If zero fills → user abandoned Kite without completing orders.
+                filled_sells = db.query(LiveSellStock).filter(
+                    LiveSellStock.automate_equity_ra_id == strategy.id,
+                    LiveSellStock.actual_qty > 0,
+                ).count()
+                filled_buys = db.query(LiveBuyStock).filter(
+                    LiveBuyStock.automate_equity_ra_id == strategy.id,
+                    LiveBuyStock.actual_qty > 0,
+                ).count()
+
+                if filled_sells == 0 and filled_buys == 0:
+                    # ── Stale basket recovery ──
+                    # User went to Kite but placed zero orders. Cancel stale baskets
+                    # and aggressively clean up ALL unfilled order rows (including rows
+                    # that have stale publisher_tags which would cause tag mismatch on retry).
+                    db.query(LivePublisherBasket).filter(
+                        LivePublisherBasket.automate_equity_ra_id == strategy.id,
+                        LivePublisherBasket.status.in_(["PENDING_USER_APPROVAL", "REDIRECT_RECEIVED"]),
+                    ).update({"status": "CANCELLED"}, synchronize_session=False)
+
+                    # Delete ALL unfilled/unprocessed rows regardless of order_id or tag.
+                    # This is more aggressive than _delete_unapproved_preview_rows because
+                    # it also catches rows where a non-terminal postback set order_id but
+                    # verification never ran (e.g., OPEN postback arrived, user abandoned).
+                    db.query(LiveSellStock).filter(
+                        LiveSellStock.automate_equity_ra_id == strategy.id,
+                        or_(LiveSellStock.actual_qty.is_(None), LiveSellStock.actual_qty == 0),
+                        LiveSellStock.updated_in_tradelog == False,
+                    ).delete(synchronize_session=False)
+                    db.query(LiveBuyStock).filter(
+                        LiveBuyStock.automate_equity_ra_id == strategy.id,
+                        or_(LiveBuyStock.actual_qty.is_(None), LiveBuyStock.actual_qty == 0),
+                        LiveBuyStock.updated_in_tradelog == False,
+                    ).delete(synchronize_session=False)
+
+                    # NOTE: Do NOT change strategy.status here — leave as
+                    # REBALANCE_PENDING_USER_APPROVAL until re-preparation is complete.
+                    # This prevents cron jobs from seeing a transient ACTIVE status.
+                    db.commit()  # only saves basket cancellations + row deletions
+                    _stale_recovered = True
+                    logger.info("[Rebalance] Auto-cancelled stale REBALANCE_PENDING for strategy %s (0 fills) — re-preparing", strategy.id)
+                    # Fall through to full rebalance preparation below
+                else:
+                    # Orders were filled — return as-is for frontend to render current state
+                    return strategy
+            else:
+                # REBALANCE_SELL_COMPLETE — sell basket completed, buy/sell rows exist
+                return strategy
+        if not _stale_recovered and strategy.status not in {LiveStatus.ACTIVE, LiveStatus.REBALANCE_READY}:
             raise HTTPException(status_code=400, detail=f"Strategy must be ACTIVE or REBALANCE_READY to prepare rebalance. Current status={strategy.status.value}")
         _delete_unapproved_preview_rows(db, strategy.id, include_sell=True)
 
@@ -1778,6 +1863,23 @@ class LiveInvestmentService:
             aum=aum,
         )
         insert_df_to_db(db, buy_df, LiveBuyStock)
+
+        # ── Empty rebalance: nothing to buy or sell ──
+        # Portfolio already matches screener output — no action needed.
+        # Stay ACTIVE, roll next_rebalance_date forward, still send email.
+        if sell_df.empty and buy_df.empty:
+            strategy.next_rebalance_date = next_trading_day(
+                next_rebalance_prepare_date(TODAY, strategy.rebalance_frequency)
+            )
+            db.commit()
+            db.refresh(strategy)
+            logger.info("[Rebalance] No changes needed for strategy %s — staying ACTIVE, next=%s",
+                        strategy.id, strategy.next_rebalance_date)
+            # Still send notification email (user wants to know even if no changes)
+            if send_email:
+                _gather_and_notify_rebalance(db, strategy, TODAY)
+            return strategy
+
         strategy.status = LiveStatus.REBALANCE_READY
         db.commit()
         db.refresh(strategy)
@@ -1804,6 +1906,14 @@ class LiveInvestmentService:
             current = strategy.status.value if hasattr(strategy.status, "value") else str(strategy.status)
             raise HTTPException(status_code=400, detail=f"Cannot skip rebalance from status={current}")
 
+        # Clean up orphaned preview rows before resetting
+        _delete_unapproved_preview_rows(db, strategy.id, include_sell=True)
+        # Cancel any pending baskets
+        db.query(LivePublisherBasket).filter(
+            LivePublisherBasket.automate_equity_ra_id == strategy.id,
+            LivePublisherBasket.status.in_(["PENDING_USER_APPROVAL", "REDIRECT_RECEIVED"]),
+        ).update({"status": "CANCELLED"}, synchronize_session=False)
+
         # Reset to active and roll over date
         strategy.status = LiveStatus.ACTIVE
         strategy.next_rebalance_date = next_trading_day(next_rebalance_prepare_date(TODAY, strategy.rebalance_frequency))
@@ -1817,7 +1927,31 @@ class LiveInvestmentService:
         strategy = db.query(LiveStrategy).filter(LiveStrategy.id == strategy_id).first()
         if not strategy:
             raise HTTPException(status_code=404, detail="Live strategy not found")
-        if strategy.status != LiveStatus.ACTIVE:
+        # ── Stale recovery: EXIT_PENDING_USER_APPROVAL with 0 fills (user abandoned Kite) ──
+        if strategy.status == LiveStatus.EXIT_PENDING_USER_APPROVAL:
+            filled = db.query(LiveSellStock).filter(
+                LiveSellStock.automate_equity_ra_id == strategy.id,
+                LiveSellStock.method == "EXIT",
+                LiveSellStock.actual_qty > 0,
+            ).count()
+            if filled == 0:
+                # Cancel stale baskets + delete unfilled exit sell rows
+                db.query(LivePublisherBasket).filter(
+                    LivePublisherBasket.automate_equity_ra_id == strategy.id,
+                    LivePublisherBasket.status.in_(["PENDING_USER_APPROVAL", "REDIRECT_RECEIVED"]),
+                ).update({"status": "CANCELLED"}, synchronize_session=False)
+                db.query(LiveSellStock).filter(
+                    LiveSellStock.automate_equity_ra_id == strategy.id,
+                    LiveSellStock.method == "EXIT",
+                    or_(LiveSellStock.actual_qty.is_(None), LiveSellStock.actual_qty == 0),
+                    LiveSellStock.updated_in_tradelog == False,
+                ).delete(synchronize_session=False)
+                strategy.status = LiveStatus.ACTIVE  # Restore to ACTIVE so exit preview can proceed
+                db.commit()
+                logger.info("[ExitPreview] Stale recovery for strategy %s — cancelled baskets + deleted unfilled exit rows, restored to ACTIVE", strategy.id)
+            else:
+                raise HTTPException(status_code=400, detail="Exit orders were already filled. Wait for postback processing to complete.")
+        elif strategy.status != LiveStatus.ACTIVE:
             current = strategy.status.value if hasattr(strategy.status, "value") else str(strategy.status)
             raise HTTPException(status_code=400, detail=f"Exit preview can be generated only from ACTIVE. Current status={current}")
         _delete_unapproved_preview_rows(db, strategy.id, include_sell=True)
@@ -2249,7 +2383,7 @@ class LiveInvestmentService:
         """
         TODAY = TODAY or date.today()
         strategies = db.query(LiveStrategy).filter(
-            LiveStrategy.status == LiveStatus.REBALANCE_READY,
+            LiveStrategy.status.in_([LiveStatus.REBALANCE_READY, LiveStatus.REBALANCE_PENDING_USER_APPROVAL]),
             LiveStrategy.subscription_active == True,
         ).all()
         count = 0
@@ -2297,15 +2431,30 @@ class LiveInvestmentService:
             try:
                 has_pending_fills = _process_strategy_daily_update(db, strategy, TODAY)
 
-                # Auto-skip ignored or stuck rebalances
+                # Auto-skip ignored or stuck rebalances (only if zero fills)
                 stuck_statuses = {
                     LiveStatus.REBALANCE_READY,
                     LiveStatus.REBALANCE_PENDING_USER_APPROVAL
                 }
                 if strategy.status in stuck_statuses:
-                    logger.info("[Auto-Skip] Strategy %s missed rebalance (status=%s), resetting to ACTIVE", strategy.id, strategy.status.value if hasattr(strategy.status, "value") else strategy.status)
-                    strategy.status = LiveStatus.ACTIVE
-                    strategy.next_rebalance_date = next_trading_day(next_rebalance_prepare_date(TODAY, strategy.rebalance_frequency))
+                    # Check if any orders were filled before auto-skipping
+                    filled_sells = db.query(LiveSellStock).filter(
+                        LiveSellStock.automate_equity_ra_id == strategy.id,
+                        LiveSellStock.actual_qty > 0,
+                    ).count()
+                    filled_buys = db.query(LiveBuyStock).filter(
+                        LiveBuyStock.automate_equity_ra_id == strategy.id,
+                        LiveBuyStock.actual_qty > 0,
+                    ).count()
+                    if filled_sells == 0 and filled_buys == 0:
+                        logger.info("[Auto-Skip] Strategy %s missed rebalance (status=%s, 0 fills), resetting to ACTIVE", strategy.id, strategy.status.value if hasattr(strategy.status, "value") else strategy.status)
+                        _delete_unapproved_preview_rows(db, strategy.id, include_sell=True)
+                        strategy.status = LiveStatus.ACTIVE
+                        strategy.next_rebalance_date = next_trading_day(next_rebalance_prepare_date(TODAY, strategy.rebalance_frequency))
+                    else:
+                        logger.warning("[Auto-Skip] Strategy %s has %d fills (sells=%d, buys=%d) — NOT auto-skipping from %s",
+                                       strategy.id, filled_sells + filled_buys, filled_sells, filled_buys,
+                                       strategy.status.value if hasattr(strategy.status, "value") else strategy.status)
 
                 # REBALANCE_SELL_COMPLETE: sells were already filled by broker.
                 # Don't auto-skip — user must manually send buy basket or call /rebalance/skip.
@@ -2383,8 +2532,7 @@ class LiveInvestmentService:
         ]
         stuck_strategies = db.query(LiveStrategy).filter(
             LiveStrategy.status.in_(pending_statuses),
-            LiveStrategy.subscription_active == True,
-        ).all()
+        ).all()  # Removed subscription_active filter — initial PENDING has subscription_active=False
 
         count = 0
         for strategy in stuck_strategies:
@@ -2584,6 +2732,15 @@ class LiveInvestmentService:
 
             strategy.status = LiveStatus.CANCELLED
             strategy.subscription_active = False
+            # Clean up orphaned rows and cancel baskets
+            db.query(LiveBuyStock).filter(
+                LiveBuyStock.automate_equity_ra_id == strategy.id,
+                or_(LiveBuyStock.actual_qty.is_(None), LiveBuyStock.actual_qty == 0),
+            ).delete(synchronize_session=False)
+            db.query(LivePublisherBasket).filter(
+                LivePublisherBasket.automate_equity_ra_id == strategy.id,
+                LivePublisherBasket.status.in_(["PENDING_USER_APPROVAL", "REDIRECT_RECEIVED"]),
+            ).update({"status": "CANCELLED"}, synchronize_session=False)
             logger.info("[AutoTimeout] Strategy %s auto-cancelled from PENDING_USER_APPROVAL (no fills, stuck since %s)",
                         strategy.id, strategy.updated_at)
             count += 1
@@ -2609,6 +2766,11 @@ class LiveInvestmentService:
                 LiveSellStock.method == "EXIT",
                 LiveSellStock.updated_in_tradelog == False,
             ).delete(synchronize_session=False)
+            # Cancel stale baskets
+            db.query(LivePublisherBasket).filter(
+                LivePublisherBasket.automate_equity_ra_id == strategy.id,
+                LivePublisherBasket.status.in_(["PENDING_USER_APPROVAL", "REDIRECT_RECEIVED"]),
+            ).update({"status": "CANCELLED"}, synchronize_session=False)
 
             strategy.status = LiveStatus.ACTIVE
             logger.info("[AutoTimeout] Strategy %s restored to ACTIVE from EXIT_PENDING (no fills, stuck since %s)",
@@ -2670,9 +2832,10 @@ class LiveInvestmentService:
         if str(strategy.user_id) != str(user_id):
             raise HTTPException(status_code=403, detail="Strategy does not belong to this user")
 
-        # Find the latest basket for this strategy
+        # Find the latest PENDING basket for this strategy (don't revive cancelled ones)
         basket = db.query(LivePublisherBasket).filter(
             LivePublisherBasket.automate_equity_ra_id == live_id,
+            LivePublisherBasket.status.in_(["PENDING_USER_APPROVAL", "CREATED"]),
         ).order_by(LivePublisherBasket.created_at.desc()).first()
         if not basket:
             raise HTTPException(status_code=404, detail="Publisher basket not found")

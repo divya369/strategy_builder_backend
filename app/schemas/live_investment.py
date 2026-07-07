@@ -5,12 +5,18 @@ from pydantic import BaseModel, Field
 
 
 
+class BrokerLinkedStrategy(BaseModel):
+    id: UUID
+    strategy_name: Optional[str] = None
+    version_number: int
+
 class BrokerAccountResponse(BaseModel):
     id: UUID
     broker: str
     label: str
     expected_client_id: Optional[str] = None
     is_active: bool
+    strategies: List[BrokerLinkedStrategy] = []
 
 
 class GoLiveRequest(BaseModel):
@@ -91,6 +97,8 @@ class TradelogHoldingResponse(BaseModel):
     buy_qty: int
     buy_price: float
     buy_amount: float
+    sell_date: Optional[date] = None
+    hold: Optional[int] = 0
     sell_qty: Optional[int] = 0
     sell_price: Optional[float] = 0.0
     ltp: Optional[float] = None
@@ -114,6 +122,14 @@ class EquityCurvePointResponse(BaseModel):
     total_pnl: Optional[float] = None
     sharpe: Optional[float] = None
     cagr_percent: Optional[float] = None
+    total_trades: Optional[int] = None
+    winning_trades: Optional[int] = None
+    losing_trades: Optional[int] = None
+    winning_percent: Optional[float] = None
+    avg_win: Optional[float] = None
+    avg_loss: Optional[float] = None
+    total_charges: Optional[float] = None
+    monthly_return: Optional[float] = None
 
 
 class PendingBasketResponse(BaseModel):
@@ -130,6 +146,13 @@ class EquityCurveGraphPoint(BaseModel):
     strategy_roc: Optional[float] = None
     index_roc: Optional[float] = None
     benchmark_roc: Optional[float] = None
+    current_dd_percent: Optional[float] = None
+
+
+class LiveMonthlyReturn(BaseModel):
+    year: int
+    month: int
+    monthly_return: float
 
 
 class EquityCurveGraphResponse(BaseModel):
@@ -137,6 +160,7 @@ class EquityCurveGraphResponse(BaseModel):
     index_label: str = "NIFTY 50"
     benchmark_label: str = "NIFTY 50"
     data: List[EquityCurveGraphPoint] = []
+    monthly_returns: List[LiveMonthlyReturn] = []
 
 
 class LiveDashboardResponse(BaseModel):
