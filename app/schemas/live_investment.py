@@ -101,6 +101,7 @@ class TradelogHoldingResponse(BaseModel):
     hold: Optional[int] = 0
     sell_qty: Optional[int] = 0
     sell_price: Optional[float] = 0.0
+    sell_amount: Optional[float] = 0.0
     ltp: Optional[float] = None
     current_value: Optional[float] = None
     unrealised_pnl: Optional[float] = None
@@ -126,6 +127,7 @@ class EquityCurvePointResponse(BaseModel):
     winning_trades: Optional[int] = None
     losing_trades: Optional[int] = None
     winning_percent: Optional[float] = None
+    losing_percent: Optional[float] = None
     avg_win: Optional[float] = None
     avg_loss: Optional[float] = None
     total_charges: Optional[float] = None
