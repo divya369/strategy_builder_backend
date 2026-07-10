@@ -1427,7 +1427,7 @@ def _process_basket_orders(
                 row_obj.actual_qty = 0
                 row_obj.actual_price = 0.0
                 row_obj.actual_amount = 0.0
-                row_obj.circuit = True
+                row_obj.circuit = False  # No circuit row for unplaced/fully-cancelled orders — next rebalance handles it
                 row_obj.updated_in_tradelog = True
             logger.info("[ProcessOrders] CANCELLED | tag=%s symbol=%s partial_qty=%d source=%s",
                         tag, row_obj.tradingsymbol, partial_qty, source)
@@ -1462,6 +1462,13 @@ def _process_basket_orders(
     client_id = first_order.get("placed_by") or first_order.get("account_id")
     if client_id and not strategy.locked_client_id:
         strategy.locked_client_id = client_id
+
+    # ── Flush in-memory updates to DB before counting ──
+    # CRITICAL: Session uses autoflush=False, so Step 1's broker_status updates
+    # are only in Python memory. Without this flush, the COUNT queries below
+    # hit the database (which still has broker_status=NULL) and return 0,
+    # causing ALL_REJECTED even when all orders are COMPLETE.
+    db.flush()
 
     # ── Step 3: Count filled vs rejected for status transition ──
     filled_buy = db.query(LiveBuyStock).filter(
@@ -1677,15 +1684,28 @@ class LiveInvestmentService:
             raise HTTPException(status_code=404, detail="Live strategy not found")
         # ── Stale recovery: PENDING_USER_APPROVAL with 0 fills (user abandoned Kite) ──
         if strategy.status == LiveStatus.PENDING_USER_APPROVAL:
+            # ── Safety check: did the user already visit Kite? ──
+            # If basket is REDIRECT_RECEIVED, the user went to Kite and came back.
+            # Orders might have been placed — postbacks could still be in transit.
+            # Do NOT auto-cancel; block until postback/verify completes.
+            latest_basket = db.query(LivePublisherBasket).filter(
+                LivePublisherBasket.automate_equity_ra_id == strategy.id,
+            ).order_by(LivePublisherBasket.created_at.desc()).first()
+
+            if latest_basket and latest_basket.status == "REDIRECT_RECEIVED":
+                logger.warning("[InitialPreview] Blocked stale recovery for strategy %s — basket %s is REDIRECT_RECEIVED (orders may be in-flight)",
+                               strategy.id, latest_basket.id)
+                raise HTTPException(status_code=400, detail="Orders may have been placed on the exchange. Please wait for order processing to complete before retrying.")
+
             filled = db.query(LiveBuyStock).filter(
                 LiveBuyStock.automate_equity_ra_id == strategy.id,
                 LiveBuyStock.actual_qty > 0,
             ).count()
             if filled == 0:
-                # Cancel stale baskets + delete unfilled rows
+                # No orders filled and user never reached Kite — safe to cancel
                 db.query(LivePublisherBasket).filter(
                     LivePublisherBasket.automate_equity_ra_id == strategy.id,
-                    LivePublisherBasket.status.in_(["PENDING_USER_APPROVAL", "REDIRECT_RECEIVED"]),
+                    LivePublisherBasket.status == "PENDING_USER_APPROVAL",
                 ).update({"status": "CANCELLED"}, synchronize_session=False)
                 db.query(LiveBuyStock).filter(
                     LiveBuyStock.automate_equity_ra_id == strategy.id,
@@ -1769,6 +1789,16 @@ class LiveInvestmentService:
         _stale_recovered = False
         if strategy.status in {LiveStatus.REBALANCE_SELL_COMPLETE, LiveStatus.REBALANCE_PENDING_USER_APPROVAL}:
             if strategy.status == LiveStatus.REBALANCE_PENDING_USER_APPROVAL:
+                # ── Safety check: did the user already visit Kite? ──
+                latest_basket = db.query(LivePublisherBasket).filter(
+                    LivePublisherBasket.automate_equity_ra_id == strategy.id,
+                ).order_by(LivePublisherBasket.created_at.desc()).first()
+
+                if latest_basket and latest_basket.status == "REDIRECT_RECEIVED":
+                    logger.warning("[Rebalance] Blocked stale recovery for strategy %s — basket %s is REDIRECT_RECEIVED (orders may be in-flight)",
+                                   strategy.id, latest_basket.id)
+                    raise HTTPException(status_code=400, detail="Orders may have been placed on the exchange. Please wait for order processing to complete before retrying.")
+
                 # Check if any orders were actually filled by broker.
                 # If zero fills → user abandoned Kite without completing orders.
                 filled_sells = db.query(LiveSellStock).filter(
@@ -1787,7 +1817,7 @@ class LiveInvestmentService:
                     # that have stale publisher_tags which would cause tag mismatch on retry).
                     db.query(LivePublisherBasket).filter(
                         LivePublisherBasket.automate_equity_ra_id == strategy.id,
-                        LivePublisherBasket.status.in_(["PENDING_USER_APPROVAL", "REDIRECT_RECEIVED"]),
+                        LivePublisherBasket.status == "PENDING_USER_APPROVAL",
                     ).update({"status": "CANCELLED"}, synchronize_session=False)
 
                     # Delete ALL unfilled/unprocessed rows regardless of order_id or tag.
@@ -2261,11 +2291,35 @@ class LiveInvestmentService:
                                 len(found_tags), len(basket_tags), len(missing_tags), retry_count + 1, MAX_RETRIES, basket_id)
                     return {"status": "ok", "detail": "rescheduled", "retry": retry_count + 1}
                 else:
-                    logger.warning("[OrderbookVerify] Max retries (%d) reached — giving up, 16:30 safety net will catch | basket=%s",
-                                   MAX_RETRIES, basket_id)
-                    # Clear Redis key so future postbacks can re-trigger
-                    LiveInvestmentService._redis_client.delete(f"orderbook_verify:{basket_id}")
-                    return {"status": "ok", "detail": "max_retries_reached"}
+                    # ── Max retries reached: treat missing/non-terminal tags as CANCELLED ──
+                    # Orders that never appeared in the orderbook were never placed by the
+                    # broker. Waiting longer won't help — proceed with what we have so the
+                    # strategy isn't stuck forever. Next rebalance will pick up any missing stocks.
+                    logger.warning("[OrderbookVerify] Max retries (%d) reached — treating %d missing tags as CANCELLED | basket=%s",
+                                   MAX_RETRIES, len(missing_tags), basket_id)
+                    for mtag in missing_tags:
+                        orderbook_orders[mtag] = {
+                            "tag": mtag,
+                            "order_id": "",
+                            "status": "CANCELLED",
+                            "filled_quantity": 0,
+                            "average_price": 0,
+                            "tradingsymbol": "",
+                            "transaction_type": "",
+                            "status_message": "Order never placed — not found in orderbook after max retries",
+                        }
+                    # Also handle found-but-non-terminal orders (e.g. stuck in OPEN)
+                    for tag in found_tags:
+                        status = (orderbook_orders[tag].get("status") or "").upper()
+                        if status == "CANCEL":
+                            status = "CANCELLED"
+                        if status not in TERMINAL_STATUSES:
+                            logger.warning("[OrderbookVerify] Tag %s still non-terminal (%s) after max retries — treating as CANCELLED | basket=%s",
+                                           tag, status, basket_id)
+                            orderbook_orders[tag]["status"] = "CANCELLED"
+                            orderbook_orders[tag]["filled_quantity"] = 0
+                            orderbook_orders[tag]["status_message"] = f"Order stuck in {status} — treated as CANCELLED after max retries"
+                    # Fall through to process all orders
 
             # ── ALL TERMINAL — Bulk update from orderbook ──
             source = "orderbook"
@@ -2315,9 +2369,33 @@ class LiveInvestmentService:
                                 retry_count + 1, MAX_RETRIES, basket_id)
                     return {"status": "ok", "detail": "fallback_rescheduled"}
                 else:
-                    logger.warning("[OrderbookVerify] Fallback: max retries reached | basket=%s", basket_id)
-                    LiveInvestmentService._redis_client.delete(f"orderbook_verify:{basket_id}")
-                    return {"status": "ok", "detail": "fallback_max_retries"}
+                    # ── Max retries reached: treat missing tags as CANCELLED ──
+                    # Same logic as orderbook path — orders without postback data
+                    # were never placed. Proceed with what we have.
+                    missing_fallback_tags = basket_tags - set(orders_data.keys())
+                    logger.warning("[OrderbookVerify] Fallback: max retries reached — treating %d missing tags as CANCELLED | basket=%s",
+                                   len(missing_fallback_tags), basket_id)
+                    for mtag in missing_fallback_tags:
+                        orders_data[mtag] = {
+                            "tag": mtag,
+                            "order_id": "",
+                            "status": "CANCELLED",
+                            "filled_quantity": 0,
+                            "average_price": 0,
+                            "tradingsymbol": "",
+                            "transaction_type": "",
+                            "status_message": "Order never placed — no postback received after max retries",
+                        }
+                    # Also handle non-terminal postback orders
+                    for tag in list(orders_data.keys()):
+                        status = (orders_data[tag].get("status") or "").upper()
+                        if status not in TERMINAL_STATUSES:
+                            logger.warning("[OrderbookVerify] Fallback: tag %s non-terminal (%s) — treating as CANCELLED | basket=%s",
+                                           tag, status, basket_id)
+                            orders_data[tag]["status"] = "CANCELLED"
+                            orders_data[tag]["filled_quantity"] = 0
+                            orders_data[tag]["status_message"] = f"Order stuck in {status} — treated as CANCELLED after max retries"
+                    # Fall through to process all orders
 
         # ── Process all orders — bulk update from orderbook/postback data ──
         _process_basket_orders(db, strategy, basket, orders_data, basket_tags, source, TODAY)

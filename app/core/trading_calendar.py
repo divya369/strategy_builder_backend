@@ -169,15 +169,24 @@ def _last_trading_day_between(start: date, end: date) -> date:
 
 
 def next_week_last_trading_day(d: date) -> date:
-    """Next weekly rebalance preparation date after d."""
-    x = d + timedelta(days=1)
+    """Next weekly rebalance preparation date on or after d.
+
+    Includes d itself: if d is already the last trading day of the week,
+    it is returned immediately. This ensures that a strategy starting on
+    Friday gets next_rebalance_date = next Monday (not the Monday after).
+    """
+    x = d
     while not is_week_last_trading_day(x):
         x += timedelta(days=1)
     return x
 
 
 def next_month_last_trading_day(d: date) -> date:
-    """Next monthly rebalance preparation date after d."""
+    """Next monthly rebalance preparation date on or after d.
+
+    Includes d itself: if d is already the last trading day of the month,
+    it is returned immediately.
+    """
     year = d.year
     month = d.month
     while True:
@@ -190,7 +199,7 @@ def next_month_last_trading_day(d: date) -> date:
         month_end = first_of_next_month - timedelta(days=1)
         month_start = date(year, month, 1)
         candidate = _last_trading_day_between(month_start, month_end)
-        if candidate > d:
+        if candidate >= d:
             return candidate
         month += 1
         if month == 13:

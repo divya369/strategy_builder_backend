@@ -303,24 +303,37 @@ def go_live(payload: GoLiveRequest, db: Session = Depends(get_db), _mkt=Depends(
     # completed Kite flow (failed login, closed popup, etc.). Auto-cancel it
     # so they can retry Go Live without friction.
     if duplicate and duplicate.status == LiveStatus.PENDING_USER_APPROVAL:
-        filled = db.query(LiveBuyStock).filter(
-            LiveBuyStock.automate_equity_ra_id == duplicate.id,
-            LiveBuyStock.actual_qty > 0,
-        ).count()
-        if filled == 0:
-            # No orders filled — safe to cancel
-            db.query(LiveBuyStock).filter(LiveBuyStock.automate_equity_ra_id == duplicate.id).delete(synchronize_session=False)
-            db.query(LiveSellStock).filter(LiveSellStock.automate_equity_ra_id == duplicate.id).delete(synchronize_session=False)
-            db.query(LiveCircuitStock).filter(LiveCircuitStock.automate_equity_ra_id == duplicate.id).delete(synchronize_session=False)
-            db.query(LivePublisherBasket).filter(
-                LivePublisherBasket.automate_equity_ra_id == duplicate.id,
-                LivePublisherBasket.status == "PENDING_USER_APPROVAL",
-            ).update({"status": "CANCELLED"}, synchronize_session=False)
-            duplicate.status = LiveStatus.CANCELLED
-            duplicate.subscription_active = False
-            db.commit()
-            logger.info("[GoLive] Auto-cancelled stale PENDING strategy %s (0 fills) to allow retry", duplicate.id)
-            duplicate = None  # Clear so the guard below doesn't block
+        # ── Safety check: did the user already visit Kite? ──
+        # If basket is REDIRECT_RECEIVED, the user went to Kite and came back.
+        # Orders might have been placed — postbacks could still be in transit.
+        # Do NOT auto-cancel; let postback/verify flow complete.
+        latest_basket = db.query(LivePublisherBasket).filter(
+            LivePublisherBasket.automate_equity_ra_id == duplicate.id,
+        ).order_by(LivePublisherBasket.created_at.desc()).first()
+
+        if latest_basket and latest_basket.status == "REDIRECT_RECEIVED":
+            logger.warning("[GoLive] Blocked auto-cancel for strategy %s — basket %s is REDIRECT_RECEIVED (orders may be in-flight)",
+                           duplicate.id, latest_basket.id)
+            # Fall through to the duplicate guard below (will return 409)
+        else:
+            filled = db.query(LiveBuyStock).filter(
+                LiveBuyStock.automate_equity_ra_id == duplicate.id,
+                LiveBuyStock.actual_qty > 0,
+            ).count()
+            if filled == 0:
+                # No orders filled and user never reached Kite — safe to cancel
+                db.query(LiveBuyStock).filter(LiveBuyStock.automate_equity_ra_id == duplicate.id).delete(synchronize_session=False)
+                db.query(LiveSellStock).filter(LiveSellStock.automate_equity_ra_id == duplicate.id).delete(synchronize_session=False)
+                db.query(LiveCircuitStock).filter(LiveCircuitStock.automate_equity_ra_id == duplicate.id).delete(synchronize_session=False)
+                db.query(LivePublisherBasket).filter(
+                    LivePublisherBasket.automate_equity_ra_id == duplicate.id,
+                    LivePublisherBasket.status == "PENDING_USER_APPROVAL",
+                ).update({"status": "CANCELLED"}, synchronize_session=False)
+                duplicate.status = LiveStatus.CANCELLED
+                duplicate.subscription_active = False
+                db.commit()
+                logger.info("[GoLive] Auto-cancelled stale PENDING strategy %s (0 fills) to allow retry", duplicate.id)
+                duplicate = None  # Clear so the guard below doesn't block
 
     if duplicate:
         raise HTTPException(
@@ -391,6 +404,17 @@ def cancel_strategy(live_id: UUID, db: Session = Depends(get_db)):
         raise HTTPException(
             status_code=400,
             detail=f"Cannot cancel strategy in status={current}. Only {', '.join(s.value for s in cancellable_statuses)} can be cancelled.",
+        )
+
+    # Guard: if user went to Kite (REDIRECT_RECEIVED), orders may be in-flight
+    latest_basket = db.query(LivePublisherBasket).filter(
+        LivePublisherBasket.automate_equity_ra_id == live_id,
+    ).order_by(LivePublisherBasket.created_at.desc()).first()
+
+    if latest_basket and latest_basket.status == "REDIRECT_RECEIVED":
+        raise HTTPException(
+            status_code=400,
+            detail="Orders may have been placed on the exchange. Please wait for order processing to complete before cancelling.",
         )
 
     # Guard: if any orders were already filled, don't allow cancel — partial fills exist
