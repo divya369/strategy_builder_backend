@@ -1554,6 +1554,13 @@ def _process_strategy_daily_update(db: Session, strategy: LiveStrategy, TODAY: d
     tradelog_df = model_df(db, LiveTradelog, strategy.id)
     equitycurve_df = model_df(db, LiveEquityCurve, strategy.id)
 
+    # ── Corporate Actions: symbol rename, ISIN sync, bonus/split ─────────
+    # Must run BEFORE tradelog fill processing so that active holdings have
+    # correct tradingsymbol, isin, buy_qty, buy_price before LTP refresh
+    # and equity curve calculations.
+    from app.services.corporate_action_service import apply_corporate_actions_to_strategy
+    tradelog_df = apply_corporate_actions_to_strategy(db, strategy, tradelog_df, TODAY)
+
     # Check for pending fills (rows not yet processed into tradelog)
     # update_tradelog skips rows where:
     #   - updated_in_tradelog = True (already processed, including REJECTED)
@@ -1899,7 +1906,7 @@ class LiveInvestmentService:
         # Stay ACTIVE, roll next_rebalance_date forward, still send email.
         if sell_df.empty and buy_df.empty:
             strategy.next_rebalance_date = next_trading_day(
-                next_rebalance_prepare_date(TODAY, strategy.rebalance_frequency)
+                next_rebalance_prepare_date(TODAY + timedelta(days=1), strategy.rebalance_frequency)
             )
             db.commit()
             db.refresh(strategy)

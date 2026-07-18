@@ -66,10 +66,12 @@ def run_custom_backtest(req: CustomBacktestRequest, db: Session = Depends(get_db
     return {"status": "success", "run_id": str(run_record.id)}
 
 @router.get("/{run_id}")
-def get_backtest_result(run_id: uuid.UUID, db: Session = Depends(get_db)):
+def get_backtest_result(run_id: uuid.UUID, user_id: str, db: Session = Depends(get_db)):
     run = db.query(BacktestRun).filter(BacktestRun.id == run_id).first()
     if not run:
         raise HTTPException(status_code=404, detail="Backtest run not found.")
+    if not run.user_id or str(run.user_id) != user_id:
+        raise HTTPException(status_code=403, detail="Not authorized to access this resource")
 
     summary = db.query(BacktestSummary).filter(BacktestSummary.backtest_run_id == run_id).first()
 

@@ -5,8 +5,10 @@ from typing import Any, Dict, List
 import pandas as pd
 import requests
 from .base import BrokerPublisherAdapter
+from sqlalchemy import text
 from app.core.config import settings
 from app.core.broker_token_store import get_broker_token
+from app.core.database import EquitycaseSessionLocal
 
 logger = logging.getLogger(__name__)
 
@@ -87,20 +89,38 @@ class ZerodhaPublisherAdapter(BrokerPublisherAdapter):
     def build_payload(self, *, strategy: Any, buy_df: pd.DataFrame, sell_df: pd.DataFrame) -> Dict[str, Any]:
         """
         Zerodha Kite Publisher / Offsite basket payload.
-        Uses LIMIT orders with real-time LTP from Kite as the limit price.
-        Frontend should submit `basket` to Zerodha offsite/publisher flow.
+        Uses MARKET orders. Frontend should submit `basket` to Zerodha offsite/publisher flow.
         """
-        # Collect all unique symbols from buy + sell to fetch LTP in one batch
+        # Collect all unique symbols from buy + sell
         all_symbols = set()
         if not sell_df.empty:
             all_symbols.update(sell_df["tradingsymbol"].dropna().unique())
         if not buy_df.empty:
             all_symbols.update(buy_df["tradingsymbol"].dropna().unique())
 
-        # Fetch live LTP from Kite API (single batch request)
-        ltp_map = self.fetch_ltp_bulk(list(all_symbols)) if all_symbols else {}
-        logger.info("[KiteBasket] LTP map has %d entries for %d symbols. LTP map: %s",
-                     len(ltp_map), len(all_symbols), ltp_map)
+        # ── LTP fetch commented out — not needed for MARKET orders ──
+        # Kept for future LIMIT order support.
+        # ltp_map = self.fetch_ltp_bulk(list(all_symbols)) if all_symbols else {}
+        # logger.info("[KiteBasket] LTP map has %d entries for %d symbols. LTP map: %s",
+        #              len(ltp_map), len(all_symbols), ltp_map)
+
+        # ── Look up BE series symbols from equitycase DB ──
+        # Kite requires '-BE' suffix for Trade-to-Trade (BE series) stocks.
+        be_symbols = set()
+        if all_symbols:
+            ec_db = EquitycaseSessionLocal()
+            try:
+                rows = ec_db.execute(
+                    text("SELECT tradingsymbol FROM equity.equity_metadata WHERE series = 'BE' AND tradingsymbol = ANY(:symbols)"),
+                    {"symbols": list(all_symbols)},
+                ).fetchall()
+                be_symbols = {row[0] for row in rows}
+            except Exception as e:
+                logger.warning("[KiteBasket] Failed to look up BE series from equity_metadata: %s", e)
+            finally:
+                ec_db.close()
+        if be_symbols:
+            logger.info("[KiteBasket] BE series symbols found: %s", be_symbols)
 
         orders = []
 
@@ -113,17 +133,16 @@ class ZerodhaPublisherAdapter(BrokerPublisherAdapter):
             if not tag:
                 logger.warning("[KiteBasket] SELL order for %s has EMPTY publisher_tag — postback matching will fail!", tradingsymbol)
 
-            # Use live LTP if available, otherwise fall back to existing price from DB
-            limit_price = ltp_map.get(tradingsymbol)
-            if limit_price is None or limit_price <= 0:
-                # Fallback: use price from buy/sell table (screener close or tradelog LTP)
-                fallback = row["price"]
-                limit_price = float(fallback) if fallback is not None and not pd.isna(fallback) else 0.0
-                logger.warning("[KiteBasket] No LTP for %s, using fallback price=%.2f", tradingsymbol, limit_price)
+            # ── LTP / limit_price commented out — not needed for MARKET orders ──
+            # limit_price = ltp_map.get(tradingsymbol)
+            # if limit_price is None or limit_price <= 0:
+            #     fallback = row["price"]
+            #     limit_price = float(fallback) if fallback is not None and not pd.isna(fallback) else 0.0
+            #     logger.warning("[KiteBasket] No LTP for %s, using fallback price=%.2f", tradingsymbol, limit_price)
 
             orders.append({
                 "exchange": "NSE",
-                "tradingsymbol": tradingsymbol,
+                "tradingsymbol": f"{tradingsymbol}-BE" if tradingsymbol in be_symbols else tradingsymbol,
                 "transaction_type": "SELL",
                 "quantity": int(row["qty"]),
                 "product": "CNC",
@@ -155,17 +174,16 @@ class ZerodhaPublisherAdapter(BrokerPublisherAdapter):
             if not tag:
                 logger.warning("[KiteBasket] BUY order for %s has EMPTY publisher_tag — postback matching will fail!", tradingsymbol)
 
-            # Use live LTP if available, otherwise fall back to existing price from DB
-            limit_price = ltp_map.get(tradingsymbol)
-            if limit_price is None or limit_price <= 0:
-                # Fallback: use price from buy/sell table (screener close)
-                fallback = row["price"]
-                limit_price = float(fallback) if fallback is not None and not pd.isna(fallback) else 0.0
-                logger.warning("[KiteBasket] No LTP for %s, using fallback price=%.2f", tradingsymbol, limit_price)
+            # ── LTP / limit_price commented out — not needed for MARKET orders ──
+            # limit_price = ltp_map.get(tradingsymbol)
+            # if limit_price is None or limit_price <= 0:
+            #     fallback = row["price"]
+            #     limit_price = float(fallback) if fallback is not None and not pd.isna(fallback) else 0.0
+            #     logger.warning("[KiteBasket] No LTP for %s, using fallback price=%.2f", tradingsymbol, limit_price)
 
             orders.append({
                 "exchange": "NSE",
-                "tradingsymbol": tradingsymbol,
+                "tradingsymbol": f"{tradingsymbol}-BE" if tradingsymbol in be_symbols else tradingsymbol,
                 "transaction_type": "BUY",
                 "quantity": int(row["qty"]),
                 "product": "CNC",

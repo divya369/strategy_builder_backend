@@ -48,6 +48,10 @@ class Settings:
     #   Format: flat CSV with tradingsymbol + all indicator columns
     SCREENER_CSV_DIR: str = os.getenv("SCREENER_CSV_DIR", "")
 
+    # Corporate Actions CSVs: daily NSE download, e.g. "all/2026-07-10_corporate_actions.csv"
+    #   Format: SYMBOL, COMPANY NAME, SERIES, PURPOSE, FACE VALUE, EX-DATE, ...
+    CORPORATE_ACTIONS_CSV_DIR: str = os.getenv("CORPORATE_ACTIONS_CSV_DIR", "")
+
     # ── Celery / Redis ────────────────────────────────────────────────────
     REDIS_URL: str = os.getenv("REDIS_URL", "redis://localhost:6379/2")
     CELERY_RESULT_BACKEND: str = os.getenv("CELERY_RESULT_BACKEND", "redis://localhost:6379/3")

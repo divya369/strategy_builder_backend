@@ -66,15 +66,17 @@ router = APIRouter()
 
 #     return value
 
-def get_run_or_404(run_id: uuid.UUID, db: Session):
+def get_run_or_404(run_id: uuid.UUID, db: Session, user_id: str):
     run = db.query(BacktestRun).filter(BacktestRun.id == run_id).first()
     if not run:
         raise HTTPException(status_code=404, detail="Backtest run not found.")
+    if not run.user_id or str(run.user_id) != user_id:
+        raise HTTPException(status_code=403, detail="Not authorized to access this resource")
     return run
 
 @router.get("/overview/{run_id}")
-def get_overview(run_id: uuid.UUID, db: Session = Depends(get_db)):
-    get_run_or_404(run_id, db)
+def get_overview(run_id: uuid.UUID, user_id: str, db: Session = Depends(get_db)):
+    get_run_or_404(run_id, db, user_id)
     s = db.query(BacktestSummary).filter(BacktestSummary.backtest_run_id == run_id).first()
     if not s:
         raise HTTPException(status_code=404, detail="Summary not found.")
@@ -96,8 +98,8 @@ def get_overview(run_id: uuid.UUID, db: Session = Depends(get_db)):
     return [{"section": sec, "metrics": metrics} for sec, metrics in sections.items()]
 
 @router.get("/dd-history/{run_id}")
-def get_drawdowns(run_id: uuid.UUID, db: Session = Depends(get_db)):
-    get_run_or_404(run_id, db)
+def get_drawdowns(run_id: uuid.UUID, user_id: str, db: Session = Depends(get_db)):
+    get_run_or_404(run_id, db, user_id)
     summary = db.query(BacktestSummary).filter(BacktestSummary.backtest_run_id == run_id).first()
     if not summary:
         raise HTTPException(status_code=404, detail="Summary not found.")
@@ -107,8 +109,8 @@ def get_drawdowns(run_id: uuid.UUID, db: Session = Depends(get_db)):
     return top_5_worst
 
 @router.get("/monthly-returns/{run_id}")
-def get_monthly_returns(run_id: uuid.UUID, db: Session = Depends(get_db)):
-    get_run_or_404(run_id, db)
+def get_monthly_returns(run_id: uuid.UUID, user_id: str, db: Session = Depends(get_db)):
+    get_run_or_404(run_id, db, user_id)
     summary = db.query(BacktestSummary).filter(BacktestSummary.backtest_run_id == run_id).first()
     if not summary:
         raise HTTPException(status_code=404, detail="Summary not found.")
@@ -139,25 +141,25 @@ def get_monthly_returns(run_id: uuid.UUID, db: Session = Depends(get_db)):
 
     return result
 
-@router.get("/rebalance-history/{run_id}")
-def get_rebalance_history(run_id: uuid.UUID, db: Session = Depends(get_db)):
-    get_run_or_404(run_id, db)
-    summary = db.query(BacktestSummary).filter(BacktestSummary.backtest_run_id == run_id).first()
-    if not summary:
-        raise HTTPException(status_code=404, detail="Summary not found.")
-    return summary.rebalance_events_json or []
+# @router.get("/rebalance-history/{run_id}")
+# def get_rebalance_history(run_id: uuid.UUID, user_id: str, db: Session = Depends(get_db)):
+#     get_run_or_404(run_id, db, user_id)
+#     summary = db.query(BacktestSummary).filter(BacktestSummary.backtest_run_id == run_id).first()
+#     if not summary:
+#         raise HTTPException(status_code=404, detail="Summary not found.")
+#     return summary.rebalance_events_json or []
 
 @router.get("/baskets/{run_id}")
-def get_baskets(run_id: uuid.UUID, db: Session = Depends(get_db)):
-    get_run_or_404(run_id, db)
+def get_baskets(run_id: uuid.UUID, user_id: str, db: Session = Depends(get_db)):
+    get_run_or_404(run_id, db, user_id)
     summary = db.query(BacktestSummary).filter(BacktestSummary.backtest_run_id == run_id).first()
     if not summary:
         raise HTTPException(status_code=404, detail="Summary not found.")
     return summary.constituents_json or []
 
 @router.get("/tradelog/{run_id}")
-def get_tradelog_data(run_id: uuid.UUID, db: Session = Depends(get_db)):
-    run = get_run_or_404(run_id, db)
+def get_tradelog_data(run_id: uuid.UUID, user_id: str, db: Session = Depends(get_db)):
+    run = get_run_or_404(run_id, db, user_id)
     periods = db.query(BacktestHoldingPeriod).filter(BacktestHoldingPeriod.backtest_run_id == run_id).order_by(BacktestHoldingPeriod.entry_date).all()
     response = []
     for p in periods:

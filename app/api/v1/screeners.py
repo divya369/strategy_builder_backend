@@ -143,7 +143,7 @@ def get_version_backtests(screener_id: uuid.UUID, version_id: uuid.UUID, db: Ses
     return result
 
 @router.get("/{screener_id}")
-def get_screener_detail(screener_id: uuid.UUID, vid: uuid.UUID = None, db: Session = Depends(get_db)):
+def get_screener_detail(screener_id: uuid.UUID, user_id: str, vid: uuid.UUID = None, db: Session = Depends(get_db)):
     """
     Get screener with version config.
       - ?vid=<uuid>  → returns that specific version
@@ -152,6 +152,8 @@ def get_screener_detail(screener_id: uuid.UUID, vid: uuid.UUID = None, db: Sessi
     screener = screener_service.get_screener(db, screener_id)
     if not screener:
         raise HTTPException(status_code=404, detail="Screener not found.")
+    if str(screener.user_id) != user_id:
+        raise HTTPException(status_code=403, detail="Not authorized to access this resource")
 
     if vid:
         version = db.query(ScreenerVersion).filter(

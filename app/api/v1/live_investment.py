@@ -596,7 +596,7 @@ def portfolio_summary(user_id: str, status: str = "ACTIVE", db: Session = Depend
 
 
 @router.get("/{live_id}/order-status", response_model=OrderStatusResponse)
-def get_order_status(live_id: UUID, db: Session = Depends(get_db)):
+def get_order_status(live_id: UUID, user_id: str, db: Session = Depends(get_db)):
     """Per-order status for the current basket (today only).
 
     Returns filled/rejected/pending/cancelled counts and per-order details
@@ -612,6 +612,8 @@ def get_order_status(live_id: UUID, db: Session = Depends(get_db)):
     strategy = db.query(LiveStrategy).filter(LiveStrategy.id == live_id).first()
     if not strategy:
         raise HTTPException(status_code=404, detail="Live strategy not found")
+    if str(strategy.user_id) != user_id:
+        raise HTTPException(status_code=403, detail="Not authorized to access this resource")
 
     # Get latest basket — but only if it was created today
     latest_basket = db.query(LivePublisherBasket).filter(
@@ -720,13 +722,15 @@ def get_order_status(live_id: UUID, db: Session = Depends(get_db)):
 
 
 @router.get("/{live_id}/dashboard", response_model=LiveDashboardResponse)
-def get_strategy_dashboard(live_id: UUID, db: Session = Depends(get_db)):
+def get_strategy_dashboard(live_id: UUID, user_id: str, db: Session = Depends(get_db)):
     """Strategy overview: strategy info, latest equity curve snapshot, pending basket."""
     strategy = db.query(LiveStrategy).filter(
         LiveStrategy.id == live_id,
     ).first()
     if not strategy:
         raise HTTPException(status_code=404, detail="Live strategy not found")
+    if str(strategy.user_id) != user_id:
+        raise HTTPException(status_code=403, detail="Not authorized to access this resource")
 
     # Latest equity curve point
     latest_eq = db.query(LiveEquityCurve).filter(
@@ -790,11 +794,13 @@ def get_strategy_dashboard(live_id: UUID, db: Session = Depends(get_db)):
 
 
 @router.get("/{live_id}/holdings", response_model=List[TradelogHoldingResponse])
-def get_active_holdings(live_id: UUID, status: str = "ACTIVE", db: Session = Depends(get_db)):
+def get_active_holdings(live_id: UUID, user_id: str, status: str = "ACTIVE", db: Session = Depends(get_db)):
     """Holdings for a strategy (from tradelog). Allows status=ALL for exited strategies."""
     strategy = db.query(LiveStrategy).filter(LiveStrategy.id == live_id).first()
     if not strategy:
         raise HTTPException(status_code=404, detail="Live strategy not found")
+    if str(strategy.user_id) != user_id:
+        raise HTTPException(status_code=403, detail="Not authorized to access this resource")
 
     query = db.query(LiveTradelog).filter(LiveTradelog.automate_equity_ra_id == live_id)
     if status == "ACTIVE":
@@ -827,11 +833,13 @@ def get_active_holdings(live_id: UUID, status: str = "ACTIVE", db: Session = Dep
 
 
 @router.get("/{live_id}/equity-curve-graph", response_model=EquityCurveGraphResponse)
-def get_equity_curve_graph(live_id: UUID, db: Session = Depends(get_db)):
+def get_equity_curve_graph(live_id: UUID, user_id: str, db: Session = Depends(get_db)):
     """Full equity curve data for chart (date, strategy_roc, index_roc, benchmark_roc)."""
     strategy = db.query(LiveStrategy).filter(LiveStrategy.id == live_id).first()
     if not strategy:
         raise HTTPException(status_code=404, detail="Live strategy not found")
+    if str(strategy.user_id) != user_id:
+        raise HTTPException(status_code=403, detail="Not authorized to access this resource")
 
     # Resolve benchmark label from strategy's universe_json
     uj = strategy.universe_json
