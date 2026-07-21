@@ -17,9 +17,9 @@ SPECIAL_TRADING_DAYS_FILE = CORE_DIR / "special_trading_days.json"
 
 IST = ZoneInfo("Asia/Kolkata")
 
-# NSE market hours: 09:15:00 to 15:19:59
+# NSE market hours: 09:15:00 to 15:29:59
 MARKET_OPEN = time(9, 15, 0)
-MARKET_CLOSE = time(15, 19, 59)
+MARKET_CLOSE = time(18, 29, 59)
 
 
 # ── Mtime-based JSON caching (auto-reloads when file is edited) ────────────
@@ -90,7 +90,7 @@ def is_trading_day(d: date) -> bool:
 
 
 def is_within_trading_hours() -> bool:
-    """Check if the current IST time is within NSE trading hours (09:15 - 15:19:59)."""
+    """Check if the current IST time is within NSE trading hours (09:15 - 15:29:59)."""
     now_ist = datetime.now(IST)
     return MARKET_OPEN <= now_ist.time() <= MARKET_CLOSE
 

@@ -24,12 +24,12 @@ import logging
 import numpy as np
 import pandas as pd
 from dataclasses import dataclass
-from datetime import date, timedelta, datetime
+from datetime import date, timedelta, datetime, timezone
 from typing import Any, Dict, Optional
 from fastapi import HTTPException
 from sqlalchemy import text
 from sqlalchemy.orm import Session
-from sqlalchemy import or_, func
+from sqlalchemy import or_, and_, func
 from app.core.database import equity_engine, EquitycaseSessionLocal
 from app.models.screener import ScreenerVersion
 from app.models.live_investment import (
@@ -384,7 +384,25 @@ def assign_publisher_tags(db: Session, strategy: LiveStrategy, basket_type: str,
         func.date(LivePublisherBasket.created_at) == date.today(),
     ).order_by(LivePublisherBasket.created_at.desc()).first()
     if existing_basket:
-        return existing_basket
+        # Only treat it as a genuine double-click (reuse the basket) when the strategy
+        # status actually matches this basket's pending phase. If the status has since
+        # moved on (e.g. it was reset to REBALANCE_READY by a re-prepare), the basket is
+        # STALE — reusing it would skip tag assignment + the status transition and wedge
+        # the flow. In that case, cancel the stale basket and fall through to create a
+        # fresh one.
+        expected_status = {
+            "INITIAL": {LiveStatus.PENDING_USER_APPROVAL},
+            "REBALANCE": {LiveStatus.REBALANCE_PENDING_USER_APPROVAL},
+            "REBALANCE_SELL": {LiveStatus.REBALANCE_PENDING_USER_APPROVAL},
+            "REBALANCE_BUY": {LiveStatus.REBALANCE_SELL_COMPLETE, LiveStatus.REBALANCE_PROCESSING},
+            "EXIT": {LiveStatus.EXIT_PENDING_USER_APPROVAL},
+        }.get(effective_basket_type, set())
+        if not expected_status or strategy.status in expected_status:
+            return existing_basket
+        logger.info("[AssignTags] Cancelling stale %s basket %s (strategy status=%s, not a live pending phase) — creating fresh basket",
+                    effective_basket_type, existing_basket.id, strategy.status.value)
+        existing_basket.status = "CANCELLED"
+        db.flush()
 
     buy_df = model_df(db, LiveBuyStock, strategy.id)
     sell_df = model_df(db, LiveSellStock, strategy.id)
@@ -454,8 +472,10 @@ def assign_publisher_tags(db: Session, strategy: LiveStrategy, basket_type: str,
     )
     db.add(basket)
 
-    if effective_basket_type in ("REBALANCE", "REBALANCE_SELL", "REBALANCE_BUY"):
+    if effective_basket_type in ("REBALANCE", "REBALANCE_SELL"):
         strategy.status = LiveStatus.REBALANCE_PENDING_USER_APPROVAL
+    elif effective_basket_type == "REBALANCE_BUY":
+        pass  # Keep REBALANCE_SELL_COMPLETE — upgrades to REBALANCE_PROCESSING on Kite redirect
     elif effective_basket_type == "EXIT":
         strategy.status = LiveStatus.EXIT_PENDING_USER_APPROVAL
     else:
@@ -1208,24 +1228,135 @@ def _delete_unapproved_preview_rows(db: Session, strategy_id, *, include_sell: b
             or_(LiveSellStock.actual_qty.is_(None), LiveSellStock.actual_qty == 0),
         ).delete(synchronize_session=False)
 
+    # 3. Cancel any leftover PENDING_USER_APPROVAL baskets whose rows we just deleted.
+    # Without this, a re-prepared rebalance leaves an orphaned PENDING basket behind,
+    # which then trips the double-click guard in assign_publisher_tags and silently
+    # blocks the next Sell/Buy click (status never advances, no tags assigned).
+    # Callers reach this only after confirming there are no in-flight/filled orders.
+    db.query(LivePublisherBasket).filter(
+        LivePublisherBasket.automate_equity_ra_id == strategy_id,
+        LivePublisherBasket.status == "PENDING_USER_APPROVAL",
+    ).update({"status": "CANCELLED"}, synchronize_session=False)
+
     db.commit()
 
 
 def _validate_trade_now_status(strategy: LiveStrategy, basket_type: str, side: str = "ALL") -> None:
+    # Block ALL trade_now calls during _PROCESSING — orders are in-flight on Kite
+    PROCESSING_STATUSES = {
+        LiveStatus.INITIAL_PROCESSING,
+        LiveStatus.REBALANCE_PROCESSING,
+        LiveStatus.EXIT_PROCESSING,
+    }
+    if strategy.status in PROCESSING_STATUSES:
+        raise HTTPException(status_code=400, detail="Your orders are being processed by the broker. Please wait for processing to complete.")
+
     if basket_type == "REBALANCE" and side == "BUY":
-        expected = {LiveStatus.REBALANCE_SELL_COMPLETE, LiveStatus.REBALANCE_READY}
+        expected = {LiveStatus.REBALANCE_SELL_COMPLETE}
     elif basket_type == "REBALANCE" and side == "SELL":
-        expected = {LiveStatus.REBALANCE_READY}
+        expected = {LiveStatus.REBALANCE_READY, LiveStatus.REBALANCE_PENDING_USER_APPROVAL}
     else:
         expected = {
             "INITIAL": {LiveStatus.PREVIEW_READY, LiveStatus.ALL_REJECTED},
             "REBALANCE": {LiveStatus.REBALANCE_READY},
-            "EXIT": {LiveStatus.ACTIVE},
+            "EXIT": {LiveStatus.ACTIVE, LiveStatus.EXIT_PENDING_USER_APPROVAL},
         }.get((basket_type or "INITIAL").upper(), set())
     if expected and strategy.status not in expected:
         current = strategy.status.value if hasattr(strategy.status, "value") else str(strategy.status)
         expected_str = ", ".join(s.value for s in expected)
         raise HTTPException(status_code=400, detail=f"Cannot create {basket_type} basket when status={current}. Expected one of: {expected_str}.")
+
+
+# -----------------------------------------------------------------------------
+# Same-day self-heal for strategies stuck in *_PROCESSING (lost/late postback)
+# -----------------------------------------------------------------------------
+
+# How long a strategy may sit in a *_PROCESSING state before a preview page load
+# proactively reconciles it against the broker orderbook.
+PROCESSING_STALE_SECONDS = 180
+
+_PROCESSING_STATUSES = {
+    LiveStatus.INITIAL_PROCESSING,
+    LiveStatus.REBALANCE_PROCESSING,
+    LiveStatus.EXIT_PROCESSING,
+}
+
+
+def _reconcile_stale_processing(db: Session, strategy: LiveStrategy) -> LiveStrategy:
+    """Self-heal a strategy stuck in *_PROCESSING because of a lost/late postback.
+
+    Normally a strategy leaves *_PROCESSING when the broker postback arrives and the
+    debounced orderbook-verify task processes it. If that postback is lost, nothing
+    unlocks the strategy until the 16:30 safety-net cron — the user is frozen on a
+    spinner for hours.
+
+    This runs on the preview page load: if the strategy has been in *_PROCESSING for
+    more than PROCESSING_STALE_SECONDS, it triggers the SAME reconciliation the cron
+    uses (verify_and_process_from_orderbook), which asks the broker orderbook what
+    actually happened and advances the state from the truth.
+
+    Safety: this never blindly resets status. It only advances based on real
+    kite.orders() data, so it cannot cause duplicate orders. Debounced via Redis
+    (60s) so repeated refreshes don't hammer the broker API. Best-effort — any
+    failure is swallowed and the strategy is returned unchanged.
+    """
+    if strategy.status not in _PROCESSING_STATUSES:
+        return strategy
+
+    updated_at = strategy.updated_at
+    if updated_at is None:
+        return strategy
+    if updated_at.tzinfo is None:
+        updated_at = updated_at.replace(tzinfo=timezone.utc)
+    age_seconds = (datetime.now(timezone.utc) - updated_at).total_seconds()
+    if age_seconds < PROCESSING_STALE_SECONDS:
+        return strategy
+
+    # Debounce: at most one reconcile per strategy per 60s window.
+    try:
+        is_first = LiveInvestmentService._redis_client.set(
+            f"preview_reconcile:{strategy.id}", "1", nx=True, ex=60
+        )
+        if not is_first:
+            return strategy
+    except Exception:
+        pass  # Redis unavailable — proceed anyway (better to reconcile than stay stuck)
+
+    basket = db.query(LivePublisherBasket).filter(
+        LivePublisherBasket.automate_equity_ra_id == strategy.id,
+    ).order_by(LivePublisherBasket.created_at.desc()).first()
+    if not basket:
+        return strategy
+
+    try:
+        logger.info("[PreviewReconcile] Strategy %s stuck in %s for %.0fs — reconciling basket %s from orderbook",
+                    strategy.id, strategy.status.value, age_seconds, basket.id)
+        LiveInvestmentService.verify_and_process_from_orderbook(db, str(basket.id))
+        db.refresh(strategy)
+    except Exception:
+        logger.exception("[PreviewReconcile] Reconcile failed for strategy %s — leaving as-is", strategy.id)
+        db.rollback()
+
+    return strategy
+
+
+def _lock_to_processing(db: Session, strategy: LiveStrategy, processing_status: LiveStatus, reason: str) -> LiveStrategy:
+    """Orders are in-flight but the strategy status hasn't caught up yet — e.g. the user
+    returned from Kite but the redirect callback was skipped (broker already connected
+    today), or a postback set order data before the status upgraded.
+
+    Instead of raising a 400 — which the frontend renders as a dead "Bad Request" page —
+    upgrade the strategy to its *_PROCESSING status and return it, so the preview renders
+    read-only with a spinner and disabled buttons. The debounced orderbook-verify /
+    _reconcile_stale_processing path then advances it to the real terminal state.
+    """
+    if strategy.status != processing_status:
+        logger.info("[PreviewLock] Strategy %s %s → %s (%s)",
+                    strategy.id, strategy.status.value, processing_status.value, reason)
+        strategy.status = processing_status
+        db.commit()
+        db.refresh(strategy)
+    return _reconcile_stale_processing(db, strategy)
 
 
 # -----------------------------------------------------------------------------
@@ -1500,9 +1631,9 @@ def _process_basket_orders(
 
     if total_filled == 0:
         # ALL orders rejected/cancelled — no fills at all
-        if previous_status == LiveStatus.EXIT_PENDING_USER_APPROVAL:
+        if previous_status in (LiveStatus.EXIT_PENDING_USER_APPROVAL, LiveStatus.EXIT_PROCESSING):
             strategy.status = LiveStatus.ACTIVE
-        elif previous_status == LiveStatus.REBALANCE_PENDING_USER_APPROVAL:
+        elif previous_status in (LiveStatus.REBALANCE_PENDING_USER_APPROVAL, LiveStatus.REBALANCE_PROCESSING):
             if basket.basket_type == "REBALANCE_SELL":
                 strategy.status = LiveStatus.REBALANCE_READY
             elif basket.basket_type == "REBALANCE_BUY":
@@ -1513,7 +1644,7 @@ def _process_basket_orders(
             strategy.status = LiveStatus.ALL_REJECTED
         logger.warning("[ProcessOrders] ALL orders failed | strategy=%s prev=%s new=%s reasons=%s source=%s",
                        strategy.id, previous_status.value, strategy.status.value, rejected_orders, source)
-    elif previous_status == LiveStatus.EXIT_PENDING_USER_APPROVAL:
+    elif previous_status in (LiveStatus.EXIT_PENDING_USER_APPROVAL, LiveStatus.EXIT_PROCESSING):
         strategy.status = LiveStatus.EXITED
         strategy.subscription_active = False
     elif basket.basket_type == "REBALANCE_SELL":
@@ -1689,6 +1820,15 @@ class LiveInvestmentService:
         strategy = db.query(LiveStrategy).filter(LiveStrategy.id == strategy_id).first()
         if not strategy:
             raise HTTPException(status_code=404, detail="Live strategy not found")
+        # ── INITIAL_PROCESSING — orders are in-flight on Kite ──
+        # Preview/read endpoint: return 200 with the existing rows so the frontend
+        # renders the preview read-only, disables the buttons and shows a spinner
+        # (driven by strategy.status == INITIAL_PROCESSING). A 400 here strands the
+        # user on a generic "Bad Request" screen. Duplicate-order protection stays in
+        # trade_now()/_validate_trade_now_status(), which still 400s.
+        if strategy.status == LiveStatus.INITIAL_PROCESSING:
+            return _reconcile_stale_processing(db, strategy)
+
         # ── Stale recovery: PENDING_USER_APPROVAL with 0 fills (user abandoned Kite) ──
         if strategy.status == LiveStatus.PENDING_USER_APPROVAL:
             # ── Safety check: did the user already visit Kite? ──
@@ -1700,9 +1840,21 @@ class LiveInvestmentService:
             ).order_by(LivePublisherBasket.created_at.desc()).first()
 
             if latest_basket and latest_basket.status == "REDIRECT_RECEIVED":
-                logger.warning("[InitialPreview] Blocked stale recovery for strategy %s — basket %s is REDIRECT_RECEIVED (orders may be in-flight)",
-                               strategy.id, latest_basket.id)
-                raise HTTPException(status_code=400, detail="Orders may have been placed on the exchange. Please wait for order processing to complete before retrying.")
+                # Orders are in-flight on Kite. Don't 400 (frontend shows a Bad Request
+                # page) — lock to INITIAL_PROCESSING and return 200 so the page renders
+                # read-only with a spinner.
+                return _lock_to_processing(db, strategy, LiveStatus.INITIAL_PROCESSING, "basket REDIRECT_RECEIVED")
+
+            # Also check if any rows have broker data (order_id or postback) — orders were placed
+            has_broker_data = db.query(LiveBuyStock).filter(
+                LiveBuyStock.automate_equity_ra_id == strategy.id,
+                or_(
+                    and_(LiveBuyStock.order_id.isnot(None), LiveBuyStock.order_id != ""),
+                    LiveBuyStock.broker_raw_postback.isnot(None),
+                ),
+            ).count() > 0
+            if has_broker_data:
+                return _lock_to_processing(db, strategy, LiveStatus.INITIAL_PROCESSING, "broker data present (orders sent)")
 
             filled = db.query(LiveBuyStock).filter(
                 LiveBuyStock.automate_equity_ra_id == strategy.id,
@@ -1722,7 +1874,9 @@ class LiveInvestmentService:
                 logger.info("[InitialPreview] Stale recovery for strategy %s — cancelled baskets + deleted unfilled rows", strategy.id)
                 # Fall through to re-create preview
             else:
-                raise HTTPException(status_code=400, detail="Orders were already filled. Wait for postback processing to complete.")
+                # Some orders already filled — lock to INITIAL_PROCESSING and return 200
+                # so the frontend shows processing state instead of a Bad Request page.
+                return _lock_to_processing(db, strategy, LiveStatus.INITIAL_PROCESSING, "orders already filled")
         elif strategy.status not in {LiveStatus.DRAFT, LiveStatus.PREVIEW_READY, LiveStatus.ALL_REJECTED}:
             current = strategy.status.value if hasattr(strategy.status, "value") else str(strategy.status)
             raise HTTPException(status_code=400, detail=f"Preview can be generated only from DRAFT/PREVIEW_READY/ALL_REJECTED. Current status={current}")
@@ -1794,6 +1948,19 @@ class LiveInvestmentService:
         if not strategy:
             raise HTTPException(status_code=404, detail="Live strategy not found")
         _stale_recovered = False
+        # ── REBALANCE_PROCESSING — orders are in-flight on Kite ──
+        # Do NOT raise 400 here. This is a preview/read endpoint: the frontend
+        # rebalance-preview page needs a 200 with the existing buy/sell rows so it
+        # can render the preview read-only, disable the Buy/Trade-Now buttons, and
+        # show a processing spinner (driven by strategy.status == REBALANCE_PROCESSING).
+        # A 400 makes the page fall into its generic error handler and the user gets
+        # stuck on a "Bad Request" screen with no preview.
+        # Return the strategy as-is (before _delete_unapproved_preview_rows) so the
+        # in-flight order rows stay intact. The real guard against duplicate orders
+        # lives in trade_now()/_validate_trade_now_status(), which still 400s.
+        if strategy.status == LiveStatus.REBALANCE_PROCESSING:
+            return _reconcile_stale_processing(db, strategy)
+
         if strategy.status in {LiveStatus.REBALANCE_SELL_COMPLETE, LiveStatus.REBALANCE_PENDING_USER_APPROVAL}:
             if strategy.status == LiveStatus.REBALANCE_PENDING_USER_APPROVAL:
                 # ── Safety check: did the user already visit Kite? ──
@@ -1802,12 +1969,35 @@ class LiveInvestmentService:
                 ).order_by(LivePublisherBasket.created_at.desc()).first()
 
                 if latest_basket and latest_basket.status == "REDIRECT_RECEIVED":
-                    logger.warning("[Rebalance] Blocked stale recovery for strategy %s — basket %s is REDIRECT_RECEIVED (orders may be in-flight)",
-                                   strategy.id, latest_basket.id)
-                    raise HTTPException(status_code=400, detail="Orders may have been placed on the exchange. Please wait for order processing to complete before retrying.")
+                    # Orders are in-flight on Kite (user returned from the redirect).
+                    # Don't 400 — lock to REBALANCE_PROCESSING and return 200 so the
+                    # preview renders read-only with a spinner instead of a Bad Request page.
+                    return _lock_to_processing(db, strategy, LiveStatus.REBALANCE_PROCESSING, "basket REDIRECT_RECEIVED")
 
                 # Check if any orders were actually filled by broker.
                 # If zero fills → user abandoned Kite without completing orders.
+                # Also check for broker data (order_id/postback) — if present, orders were placed
+                has_broker_data = db.query(LiveSellStock).filter(
+                    LiveSellStock.automate_equity_ra_id == strategy.id,
+                    or_(
+                        and_(LiveSellStock.order_id.isnot(None), LiveSellStock.order_id != ""),
+                        LiveSellStock.broker_raw_postback.isnot(None),
+                    ),
+                ).count() > 0
+                if not has_broker_data:
+                    has_broker_data = db.query(LiveBuyStock).filter(
+                        LiveBuyStock.automate_equity_ra_id == strategy.id,
+                        or_(
+                            and_(LiveBuyStock.order_id.isnot(None), LiveBuyStock.order_id != ""),
+                            LiveBuyStock.broker_raw_postback.isnot(None),
+                        ),
+                    ).count() > 0
+                if has_broker_data:
+                    # Orders were sent to the broker but the status hasn't been upgraded
+                    # (e.g. redirect callback skipped because already connected today).
+                    # Lock to REBALANCE_PROCESSING and return 200 instead of a Bad Request page.
+                    return _lock_to_processing(db, strategy, LiveStatus.REBALANCE_PROCESSING, "broker data present (orders sent)")
+
                 filled_sells = db.query(LiveSellStock).filter(
                     LiveSellStock.automate_equity_ra_id == strategy.id,
                     LiveSellStock.actual_qty > 0,
@@ -1964,6 +2154,15 @@ class LiveInvestmentService:
         strategy = db.query(LiveStrategy).filter(LiveStrategy.id == strategy_id).first()
         if not strategy:
             raise HTTPException(status_code=404, detail="Live strategy not found")
+        # ── EXIT_PROCESSING — orders are in-flight on Kite ──
+        # Preview/read endpoint: return 200 with the existing rows so the frontend
+        # renders the preview read-only, disables the buttons and shows a spinner
+        # (driven by strategy.status == EXIT_PROCESSING). A 400 here strands the user
+        # on a generic "Bad Request" screen. Duplicate-order protection stays in
+        # trade_now()/_validate_trade_now_status(), which still 400s.
+        if strategy.status == LiveStatus.EXIT_PROCESSING:
+            return _reconcile_stale_processing(db, strategy)
+
         # ── Stale recovery: EXIT_PENDING_USER_APPROVAL with 0 fills (user abandoned Kite) ──
         if strategy.status == LiveStatus.EXIT_PENDING_USER_APPROVAL:
             filled = db.query(LiveSellStock).filter(
@@ -2143,6 +2342,21 @@ class LiveInvestmentService:
                 strategy.status = LiveStatus.ACCOUNT_MISMATCH
                 db.commit()
                 return {"status": "ok", "detail": "account_mismatch"}
+
+        # ── Step 5b: Upgrade to _PROCESSING on first postback (backup for redirect callback) ──
+        # If redirect callback wasn't called (e.g., Exit redirects to portfolio list),
+        # the first postback confirms orders are in-flight and locks the strategy.
+        STATUS_TO_PROCESSING = {
+            LiveStatus.PENDING_USER_APPROVAL: LiveStatus.INITIAL_PROCESSING,
+            LiveStatus.REBALANCE_PENDING_USER_APPROVAL: LiveStatus.REBALANCE_PROCESSING,
+            LiveStatus.REBALANCE_SELL_COMPLETE: LiveStatus.REBALANCE_PROCESSING,  # Buy phase
+            LiveStatus.EXIT_PENDING_USER_APPROVAL: LiveStatus.EXIT_PROCESSING,
+        }
+        new_status = STATUS_TO_PROCESSING.get(strategy.status)
+        if new_status:
+            logger.info("[Postback] Upgrading strategy %s status %s → %s (first postback backup)",
+                        strategy.id, strategy.status.value, new_status.value)
+            strategy.status = new_status
 
         db.commit()
 
@@ -2502,10 +2716,13 @@ class LiveInvestmentService:
         valid_statuses = [
             LiveStatus.ACTIVE,
             LiveStatus.PENDING_USER_APPROVAL,
+            LiveStatus.INITIAL_PROCESSING,
             LiveStatus.REBALANCE_READY,
             LiveStatus.REBALANCE_SELL_COMPLETE,
             LiveStatus.REBALANCE_PENDING_USER_APPROVAL,
+            LiveStatus.REBALANCE_PROCESSING,
             LiveStatus.EXIT_PENDING_USER_APPROVAL,
+            LiveStatus.EXIT_PROCESSING,
         ]
         strategies = db.query(LiveStrategy).filter(
             LiveStrategy.status.in_(valid_statuses),
@@ -2519,7 +2736,8 @@ class LiveInvestmentService:
                 # Auto-skip ignored or stuck rebalances (only if zero fills)
                 stuck_statuses = {
                     LiveStatus.REBALANCE_READY,
-                    LiveStatus.REBALANCE_PENDING_USER_APPROVAL
+                    LiveStatus.REBALANCE_PENDING_USER_APPROVAL,
+                    LiveStatus.REBALANCE_PROCESSING,
                 }
                 if strategy.status in stuck_statuses:
                     # Check if any orders were filled before auto-skipping
@@ -2612,8 +2830,12 @@ class LiveInvestmentService:
         TODAY = TODAY or date.today()
         pending_statuses = [
             LiveStatus.PENDING_USER_APPROVAL,
+            LiveStatus.INITIAL_PROCESSING,
             LiveStatus.REBALANCE_PENDING_USER_APPROVAL,
+            LiveStatus.REBALANCE_PROCESSING,
+            LiveStatus.REBALANCE_SELL_COMPLETE,  # Buy basket may have been sent
             LiveStatus.EXIT_PENDING_USER_APPROVAL,
+            LiveStatus.EXIT_PROCESSING,
         ]
         stuck_strategies = db.query(LiveStrategy).filter(
             LiveStrategy.status.in_(pending_statuses),
@@ -2802,9 +3024,9 @@ class LiveInvestmentService:
         TODAY = TODAY or date.today()
         count = 0
 
-        # Case 1: PENDING_USER_APPROVAL → CANCELLED
+        # Case 1: PENDING_USER_APPROVAL / INITIAL_PROCESSING → CANCELLED
         pending_strategies = db.query(LiveStrategy).filter(
-            LiveStrategy.status == LiveStatus.PENDING_USER_APPROVAL,
+            LiveStrategy.status.in_([LiveStatus.PENDING_USER_APPROVAL, LiveStatus.INITIAL_PROCESSING]),
             LiveStrategy.updated_at < TODAY,  # Stuck since before today
         ).all()
         for strategy in pending_strategies:
@@ -2826,13 +3048,13 @@ class LiveInvestmentService:
                 LivePublisherBasket.automate_equity_ra_id == strategy.id,
                 LivePublisherBasket.status.in_(["PENDING_USER_APPROVAL", "REDIRECT_RECEIVED"]),
             ).update({"status": "CANCELLED"}, synchronize_session=False)
-            logger.info("[AutoTimeout] Strategy %s auto-cancelled from PENDING_USER_APPROVAL (no fills, stuck since %s)",
-                        strategy.id, strategy.updated_at)
+            logger.info("[AutoTimeout] Strategy %s auto-cancelled from %s (no fills, stuck since %s)",
+                        strategy.id, strategy.status.value, strategy.updated_at)
             count += 1
 
-        # Case 2: EXIT_PENDING_USER_APPROVAL → ACTIVE
+        # Case 2: EXIT_PENDING_USER_APPROVAL / EXIT_PROCESSING → ACTIVE
         exit_pending_strategies = db.query(LiveStrategy).filter(
-            LiveStrategy.status == LiveStatus.EXIT_PENDING_USER_APPROVAL,
+            LiveStrategy.status.in_([LiveStatus.EXIT_PENDING_USER_APPROVAL, LiveStatus.EXIT_PROCESSING]),
             LiveStrategy.updated_at < TODAY,  # Stuck since before today
         ).all()
         for strategy in exit_pending_strategies:
@@ -2858,8 +3080,8 @@ class LiveInvestmentService:
             ).update({"status": "CANCELLED"}, synchronize_session=False)
 
             strategy.status = LiveStatus.ACTIVE
-            logger.info("[AutoTimeout] Strategy %s restored to ACTIVE from EXIT_PENDING (no fills, stuck since %s)",
-                        strategy.id, strategy.updated_at)
+            logger.info("[AutoTimeout] Strategy %s restored to ACTIVE from %s (no fills, stuck since %s)",
+                        strategy.id, strategy.status.value, strategy.updated_at)
             count += 1
 
         # Case 3: REBALANCE_SELL_COMPLETE → ACTIVE (auto-skip stale buy window)
@@ -2937,10 +3159,29 @@ class LiveInvestmentService:
             and broker_account.token_date == date.today()
         ):
             logger.info("[RedirectCallback] Already connected today for strategy %s, skipping token exchange", live_id)
+            # IMPORTANT: even when we skip the token exchange, the user has still
+            # returned from a Kite redirect — orders are in-flight. We MUST still mark
+            # the basket REDIRECT_RECEIVED and lock the strategy into *_PROCESSING.
+            # Otherwise the status stays PENDING, and the preview endpoint then sees
+            # "orders sent" and (previously) 400'd → the frontend Bad Request page.
+            basket.status = "REDIRECT_RECEIVED"
+            STATUS_TO_PROCESSING = {
+                LiveStatus.PENDING_USER_APPROVAL: LiveStatus.INITIAL_PROCESSING,
+                LiveStatus.REBALANCE_PENDING_USER_APPROVAL: LiveStatus.REBALANCE_PROCESSING,
+                LiveStatus.REBALANCE_SELL_COMPLETE: LiveStatus.REBALANCE_PROCESSING,  # Buy phase
+                LiveStatus.EXIT_PENDING_USER_APPROVAL: LiveStatus.EXIT_PROCESSING,
+            }
+            new_status = STATUS_TO_PROCESSING.get(strategy.status)
+            if new_status:
+                logger.info("[RedirectCallback] Strategy %s status %s → %s (already-connected path)",
+                            live_id, strategy.status.value, new_status.value)
+                strategy.status = new_status
+            db.commit()
             return {
                 "status": "ok",
                 "detail": "already_connected_for_today",
                 "broker_user_id": broker_account.broker_user_id,
+                "strategy_status": strategy.status.value if hasattr(strategy.status, "value") else str(strategy.status),
             }
 
         # Exchange request_token → access_token via broker adapter
@@ -2979,6 +3220,20 @@ class LiveInvestmentService:
         broker_account.broker_profile = token_data.get("profile")
 
         basket.status = "REDIRECT_RECEIVED"
+
+        # ── Upgrade to _PROCESSING status (locks strategy during order processing) ──
+        STATUS_TO_PROCESSING = {
+            LiveStatus.PENDING_USER_APPROVAL: LiveStatus.INITIAL_PROCESSING,
+            LiveStatus.REBALANCE_PENDING_USER_APPROVAL: LiveStatus.REBALANCE_PROCESSING,
+            LiveStatus.REBALANCE_SELL_COMPLETE: LiveStatus.REBALANCE_PROCESSING,  # Buy phase
+            LiveStatus.EXIT_PENDING_USER_APPROVAL: LiveStatus.EXIT_PROCESSING,
+        }
+        new_status = STATUS_TO_PROCESSING.get(strategy.status)
+        if new_status:
+            logger.info("[RedirectCallback] Strategy %s status %s → %s",
+                        live_id, strategy.status.value, new_status.value)
+            strategy.status = new_status
+
         db.commit()
 
         logger.info("[RedirectCallback] Token exchanged successfully for strategy %s, broker_user=%s",

@@ -778,7 +778,7 @@ def get_strategy_dashboard(live_id: UUID, user_id: str, db: Session = Depends(ge
 
     # Check if exit orders were actually sent to broker
     exit_orders_sent = False
-    if strategy.status == LiveStatus.EXIT_PENDING_USER_APPROVAL:
+    if strategy.status in (LiveStatus.EXIT_PENDING_USER_APPROVAL, LiveStatus.EXIT_PROCESSING):
         exit_orders_sent = db.query(LiveSellStock).filter(
             LiveSellStock.automate_equity_ra_id == live_id,
             LiveSellStock.order_id.isnot(None),
