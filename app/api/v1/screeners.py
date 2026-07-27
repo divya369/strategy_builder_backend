@@ -93,6 +93,60 @@ def get_my_screeners(user_id: str, db: Session = Depends(get_db)):
     )
     return [{"id": str(s.id), "name": s.name, "description": s.description, "version_number": max_v or 0} for s, max_v in rows]
 
+@router.get("/platform-screeners")
+def get_platform_strategies(role: str = None, db: Session = Depends(get_db)):
+    """
+    List platform (ready-to-use) strategies.
+      - ?role=admin → all platform strategies incl. inactive (admin panel view)
+      - no role     → only active ones (user browse view)
+    """
+    q = db.query(Screener).filter(Screener.role == "platform")
+    if role != "ADMIN":
+        q = q.filter(Screener.is_active == True)
+    rows = q.order_by(Screener.created_at.desc()).all()
+
+    def base(s):
+        return {
+            "id": str(s.id), "name": s.name, "description": s.description, "is_active": s.is_active,
+            "created_at": s.created_at.replace(tzinfo=timezone.utc).astimezone(IST).isoformat() if s.created_at else None,
+        }
+
+    # Admin view: lean management list.
+    if role == "ADMIN":
+        return [base(s) for s in rows]
+
+    # User view: enrich each card with a live snapshot from the latest paper
+    # equity-curve row (formula-agnostic fields → always match the detail page).
+    from app.models.platform_paper import PaperPortfolio, PaperEquityCurve
+    screener_ids = [s.id for s in rows]
+    ports = db.query(PaperPortfolio).filter(
+        PaperPortfolio.screener_id.in_(screener_ids),
+        PaperPortfolio.status == "ACTIVE",
+    ).all() if screener_ids else []
+    port_by_screener = {p.screener_id: p for p in ports}
+    # Latest curve row per portfolio (few active portfolios → cheap).
+    latest_by_port = {
+        p.id: (
+            db.query(PaperEquityCurve)
+            .filter(PaperEquityCurve.automate_equity_ra_id == p.id)
+            .order_by(PaperEquityCurve.date.desc(), PaperEquityCurve.total_days.desc())
+            .first()
+        )
+        for p in ports
+    }
+
+    from app.services.platform_paper_service import PlatformPaperService
+    result = []
+    for s in rows:
+        item = base(s)
+        p = port_by_screener.get(s.id)
+        row = latest_by_port.get(p.id) if p else None
+        # Card metrics (CAGR, Max DD, Sharpe, NAV) read straight from the latest
+        # paper equity-curve row — cheap single-row fetch, like live investment.
+        item["live"] = PlatformPaperService.card_metrics(p, row) if (p and row) else None
+        result.append(item)
+    return result
+
 @router.post("", response_model=ScreenerVersionResponse)
 def create_screener(screener_in: ScreenerCreate, db: Session = Depends(get_db)):
     screener = screener_service.create_screener(db, screener_in, screener_in.user_id)
@@ -111,10 +165,31 @@ def create_screener_version(screener_id: uuid.UUID, version_in: ScreenerVersionC
 
 @router.delete("/{screener_id}")
 def delete_screener(screener_id: uuid.UUID, db: Session = Depends(get_db)):
-    screener = screener_service.soft_delete_screener(db, screener_id)
+    """Toggle: active screener → deactivated (soft delete); inactive screener → reactivated.
+
+    Guard: a platform strategy can only be ACTIVATED when it has ACTIVE paper
+    trading — otherwise users would see a strategy with no (or deleted) data.
+    So the admin must always complete backtest → start paper before activating,
+    both first time and after a stop (which deletes the data). Deactivation is
+    always allowed.
+    """
+    screener = screener_service.get_screener(db, screener_id)
     if not screener:
         raise HTTPException(status_code=404, detail="Screener not found")
-    return {"success": True, "message": "Screener deleted successfully", "data": {"id": str(screener.id), "is_active": screener.is_active, "deleted_at": screener.deleted_at.isoformat() if screener.deleted_at else None}}
+
+    activating = not screener.is_active  # inactive → active on this toggle
+    if activating and screener.role == "platform":
+        from app.models.platform_paper import PaperPortfolio
+        has_active_paper = db.query(PaperPortfolio).filter(
+            PaperPortfolio.screener_id == screener_id,
+            PaperPortfolio.status == "ACTIVE",
+        ).first() is not None
+        if not has_active_paper:
+            raise HTTPException(status_code=400, detail="Start paper trading before activating this strategy")
+
+    screener = screener_service.toggle_screener_active(db, screener_id)
+    action = "deactivated" if not screener.is_active else "reactivated"
+    return {"success": True, "message": f"Screener {action} successfully", "data": {"id": str(screener.id), "is_active": screener.is_active, "deleted_at": screener.deleted_at.isoformat() if screener.deleted_at else None}}
 
 @router.get("/{screener_id}/versions")
 def get_screener_versions(screener_id: uuid.UUID, db: Session = Depends(get_db)):
@@ -125,13 +200,24 @@ def get_screener_versions(screener_id: uuid.UUID, db: Session = Depends(get_db))
                 .isoformat()} for v in versions]
 
 @router.get("/{screener_id}/versions/{version_id}/backtests")
-def get_version_backtests(screener_id: uuid.UUID, version_id: uuid.UUID, db: Session = Depends(get_db)):
+def get_version_backtests(screener_id: uuid.UUID, version_id: uuid.UUID, role: str = None, db: Session = Depends(get_db)):
     runs = db.query(BacktestRun).filter(BacktestRun.screener_version_id == version_id).order_by(BacktestRun.created_at.desc()).all()
+
+    # ?role=ADMIN only: paper_started flag so the admin panel can
+    # disable/enable the "Start Paper Trading" button on this page.
+    active_paper = None
+    if role == "ADMIN":
+        from app.models.platform_paper import PaperPortfolio
+        active_paper = db.query(PaperPortfolio).filter(
+            PaperPortfolio.screener_id == screener_id,
+            PaperPortfolio.status == "ACTIVE",
+        ).first()
+
     result = []
     for run in runs:
         res = db.query(BacktestSummary).filter(BacktestSummary.backtest_run_id == run.id).first()
         error_type, error_message = classify_error(run.error_message) if run.status == "FAILED" else (None, None)
-        result.append({
+        item = {
             "run_id": str(run.id), "run_name": run.run_name or f"Run {run.id}",
             "period": f"{run.from_date} to {run.to_date}", "rebalance": run.rebalance_frequency,
             "portfolio_size": run.portfolio_size, "wrh": run.wrh,
@@ -139,7 +225,13 @@ def get_version_backtests(screener_id: uuid.UUID, version_id: uuid.UUID, db: Ses
             "total_return": format_metric_value(res.metrics_json.get("total_return"), '%') if res and res.metrics_json else None,
             "status": run.status, "created_at": run.created_at,
             "error_type": error_type, "error_message": error_message
-        })
+        }
+        if role == "ADMIN":
+            # paper_started for the screener; paper_run marks the exact run the
+            # active paper portfolio was started from.
+            item["paper_started"] = active_paper is not None
+            item["paper_run"] = bool(active_paper and active_paper.backtest_run_id == run.id)
+        result.append(item)
     return result
 
 @router.get("/{screener_id}")

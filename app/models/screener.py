@@ -18,6 +18,8 @@ class Screener(Base):
     user_id = Column(UUID(as_uuid=True), nullable=False, index=True)
     name = Column(String(255), nullable=False)
     description = Column(Text, nullable=True)
+    # "user" = normal user strategy; "platform" = ready-to-use strategy created by admin backend
+    role = Column(String(20), nullable=False, default="user", server_default="user", index=True)
     is_active = Column(Boolean, default=True, nullable=False)
     created_at = Column(DateTime, nullable=False)
     updated_at = Column(DateTime, nullable=False)
