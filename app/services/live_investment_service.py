@@ -1928,10 +1928,22 @@ class LiveInvestmentService:
             )
             insert_df_to_db(db, buy_df, LiveBuyStock)
 
-        # Clean up rejected rows when retrying BUY from REBALANCE_SELL_COMPLETE
-        # Rejected rows have updated_in_tradelog=True so assign_publisher_tags skips them
+        # Clean up ONLY terminal rejected/cancelled buy rows when retrying BUY from
+        # REBALANCE_SELL_COMPLETE, so they don't pile up across retries.
+        # IMPORTANT: do NOT call _delete_unapproved_preview_rows here — its Step 1
+        # deletes never-sent pending previews (order_id NULL, actual_qty 0,
+        # updated_in_tradelog False), which are the exact buy targets we are about to
+        # publish. Wiping them leaves an empty basket → "No pending orders available
+        # for Publisher basket." (assign_publisher_tags already skips rejected rows
+        # since they carry updated_in_tradelog=True, so keeping them is harmless — we
+        # only prune the terminal ones for hygiene.)
         if basket_type == "REBALANCE" and side == "BUY" and strategy.status == LiveStatus.REBALANCE_SELL_COMPLETE:
-            _delete_unapproved_preview_rows(db, strategy.id, include_sell=False)
+            db.query(LiveBuyStock).filter(
+                LiveBuyStock.automate_equity_ra_id == strategy.id,
+                LiveBuyStock.broker_status.in_(["REJECTED", "CANCELLED"]),
+                or_(LiveBuyStock.actual_qty.is_(None), LiveBuyStock.actual_qty == 0),
+            ).delete(synchronize_session=False)
+            db.commit()
 
         # Auto-refresh exit sell rows with latest LTP before sending basket
         # Same pattern as ALL_REJECTED auto-retry above
@@ -2043,7 +2055,68 @@ class LiveInvestmentService:
                     # Orders were filled — return as-is for frontend to render current state
                     return strategy
             else:
-                # REBALANCE_SELL_COMPLETE — sell basket completed, buy/sell rows exist
+                # REBALANCE_SELL_COMPLETE — sell basket already executed; the buy rows
+                # from the original prepare should still be present for the buy leg.
+                # If the pending buy leg is empty (e.g. the rows were previously wiped),
+                # regenerate ONLY the buy rows in this self-contained block so the
+                # strategy can finish its buy leg instead of wedging. We recompute the
+                # sell list purely for buy-sizing (same inputs as the original prepare)
+                # but NEVER re-insert sells — those are done. Status stays
+                # REBALANCE_SELL_COMPLETE throughout.
+                pending_buys = db.query(LiveBuyStock).filter(
+                    LiveBuyStock.automate_equity_ra_id == strategy.id,
+                    or_(LiveBuyStock.actual_qty.is_(None), LiveBuyStock.actual_qty == 0),
+                    LiveBuyStock.updated_in_tradelog == False,
+                ).count()
+                if pending_buys > 0:
+                    return strategy
+
+                logger.warning(
+                    "[Rebalance] REBALANCE_SELL_COMPLETE strategy %s has no pending buy rows — regenerating buy leg",
+                    strategy.id,
+                )
+                screener_df = get_strategy_builder_screener_df(
+                    db, strategy.screener_version_id, max(strategy.portfolio_size, strategy.worst_hold_rank)
+                )
+                tradelog_df = model_df(db, LiveTradelog, strategy.id)
+                equitycurve_df = model_df(db, LiveEquityCurve, strategy.id)
+                latest = equitycurve_df.iloc[-1] if not equitycurve_df.empty else {"aum": strategy.final_aum, "cash": strategy.cash}
+                aum = float(latest.get("aum") or strategy.final_aum or strategy.initial_aum)
+                cash = float(latest.get("cash") or strategy.cash or 0.0)
+
+                all_symbols = set(screener_df["tradingsymbol"]) if not screener_df.empty else set()
+                if not tradelog_df.empty:
+                    all_symbols.update(tradelog_df.loc[tradelog_df["active"] == True, "tradingsymbol"])
+                ltp_map = _fetch_live_ltp(strategy, list(all_symbols))
+
+                if ltp_map and not tradelog_df.empty:
+                    tradelog_df = tradelog_df.copy()
+                    tradelog_df["ltp"] = tradelog_df.apply(
+                        lambda row: ltp_map.get(row["tradingsymbol"], row.get("ltp") or 0), axis=1
+                    )
+
+                # Recompute sells for buy-sizing only — NOT inserted (already executed).
+                sell_df = get_sell_df_investment(
+                    TODAY, strategy, f"({strategy.id})", screener_df, tradelog_df, strategy.worst_hold_rank
+                )
+                amount_to_sell = float(sell_df["amount"].sum()) if not sell_df.empty else 0.0
+                cash_available = (cash + (amount_to_sell * 0.80)) * 0.98
+
+                buy_screener_df = screener_df.head(strategy.portfolio_size).copy()
+                if ltp_map and not buy_screener_df.empty:
+                    buy_screener_df["close"] = buy_screener_df.apply(
+                        lambda row: ltp_map.get(row["tradingsymbol"], row["close"]), axis=1
+                    )
+                buy_df = get_buy_df_investment(
+                    TODAY, strategy, f"({strategy.id})", buy_screener_df, tradelog_df,
+                    sell_stock_count=len(sell_df),
+                    portfolio_size=strategy.portfolio_size,
+                    cash_available=cash_available,
+                    aum=aum,
+                )
+                insert_df_to_db(db, buy_df, LiveBuyStock)
+                db.commit()
+                db.refresh(strategy)
                 return strategy
         if not _stale_recovered and strategy.status not in {LiveStatus.ACTIVE, LiveStatus.REBALANCE_READY}:
             raise HTTPException(status_code=400, detail=f"Strategy must be ACTIVE or REBALANCE_READY to prepare rebalance. Current status={strategy.status.value}")
@@ -2309,8 +2382,19 @@ class LiveInvestmentService:
             raise HTTPException(status_code=404, detail="Live strategy not found for order")
 
         # ── Step 3: Safety — verify tradingsymbol matches ──
+        # Compare on the BASE symbol only. Kite appends an exchange/series suffix
+        # in postbacks (e.g. "MTARTECH-BE" for Trade-to-Trade / BE-series stocks)
+        # while we store the bare symbol ("MTARTECH"). The row is already uniquely
+        # located by publisher_tag above, so this is only a sanity check — stripping
+        # the suffix prevents a legitimate BE-series fill from being rejected (which
+        # would otherwise force the slow orderbook-reconcile fallback instead of
+        # instant postback processing).
         order_symbol = getattr(row_obj, "tradingsymbol", None)
-        if postback_symbol and order_symbol and postback_symbol.upper() != order_symbol.upper():
+        if (
+            postback_symbol
+            and order_symbol
+            and postback_symbol.split("-")[0].upper() != order_symbol.split("-")[0].upper()
+        ):
             logger.warning("[Postback] SYMBOL MISMATCH | tag=%s expected=%s got=%s", raw_tag, order_symbol, postback_symbol)
             raise HTTPException(status_code=400, detail=f"Symbol mismatch: expected {order_symbol}, got {postback_symbol}")
 
