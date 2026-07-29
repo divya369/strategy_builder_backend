@@ -96,6 +96,14 @@ class LiveStrategy(Base):
     screener_version_id = Column(UUID(as_uuid=True), ForeignKey("screener_versions.id", ondelete="SET NULL"), nullable=False, index=True)
     screener_version = relationship("ScreenerVersion", primaryjoin="LiveStrategy.screener_version_id == ScreenerVersion.id")
 
+    # Set when this strategy was started by adopting a platform (ready-to-use)
+    # strategy via 'Invest Now' AND the user's own screener has not been created
+    # yet. Until the strategy first goes ACTIVE it references the PLATFORM version
+    # directly; on activation the platform screener is cloned into a user screener
+    # and screener_id/screener_version_id are re-pointed to it. NULL for ordinary
+    # user-built strategies and once the strategy already runs on a user screener.
+    source_platform_screener_id = Column(UUID(as_uuid=True), nullable=True, index=True)
+
     # User-provided live params at Go Live time. Do NOT copy these from backtest.
     strategy_name = Column(String(255), nullable=True)
     portfolio_size = Column(Integer, nullable=False)

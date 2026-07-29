@@ -9,7 +9,7 @@ from sqlalchemy.orm import Session
 from app.core.rate_limiter import rate_limit   
 from datetime import datetime, timezone
 from app.core.database import get_db
-from app.core.filter_registry import FILTER_CONFIG_MAP, EXTRA_SORT_FIELDS
+from app.core.filter_registry import FILTER_CONFIG_MAP, EXTRA_SORT_FIELDS, build_sort_options
 from app.core.backtest_metric_formatter import format_metric_value
 from app.schemas.screener import ScreenerCreate, ScreenerVersionResponse, ScreenerVersionCreate, FilterConfig,ScreenerNewVersionResponse
 from app.services.screener_service import screener_service
@@ -34,26 +34,7 @@ def get_filter_config():
 
 @router.get("/config/sort-options")
 def get_sort_options():
-    dynamic = []
-    for key, conf in FILTER_CONFIG_MAP.items():
-        if not conf.get("sortable"):
-            continue
-        base_key = conf.get("dbKey", key)
-        desc = conf.get("description", "")
-        if conf.get("periods") and conf.get("periodValues"):
-            for i, p_label in enumerate(conf["periods"]):
-                p_value = conf["periodValues"][i]
-                label = conf["label"].replace(" (%)", "")
-                sort_label = f"{label} {p_label}"
-                # Replace the ## heading in description with the actual sort label
-                sort_desc = desc
-                first_break = desc.find("\n\n")
-                if first_break != -1 and desc.startswith("## "):
-                    sort_desc = f"## {sort_label}" + desc[first_break:]
-                dynamic.append({"value": f"{p_value}_{base_key}", "label": sort_label, "group": conf.get("sortGroup","Filter-based"), "description": sort_desc})
-        else:
-            dynamic.append({"value": base_key, "label": conf["label"], "group": conf.get("sortGroup","Filter-based"), "description": desc})
-    return dynamic + EXTRA_SORT_FIELDS
+    return build_sort_options()
 
 @router.get("/universes")
 def get_universes():

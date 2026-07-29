@@ -49,6 +49,7 @@ from app.models.result import BacktestSummary
 from app.models.screener import Screener, ScreenerVersion
 from app.core.config import settings
 from app.core.backtest_metric_formatter import format_metric_value
+from app.core.filter_registry import get_sort_label
 from app.core.performance_metrics import compute_summary_from_nav
 # Shared equitycase-style machinery — imported, NEVER modified.
 from app.services.live_investment_service import (
@@ -325,12 +326,32 @@ class PlatformPaperService:
         screener = db.query(Screener).filter(Screener.id == portfolio.screener_id).first()
         version = db.query(ScreenerVersion).filter(
             ScreenerVersion.id == portfolio.screener_version_id).first()
+        # Send filters in the compact shape the frontend uses — drop the keys
+        # that are null for this filter type (period/relation/left_field/...).
+        raw_filters = (version.filters_json if version else None) or []
+        clean_filters = [
+            {k: v for k, v in f.items() if v is not None} if isinstance(f, dict) else f
+            for f in raw_filters
+        ]
+        # Ranking: keep the raw field/order, but add a human-readable label +
+        # direction so this display-only page needn't map the key client-side.
+        rk = (version.ranking_json if version else None) or {}
+        ranking = None
+        if rk.get("field"):
+            order = (rk.get("order") or "desc").lower()
+            ranking = {
+                "field": rk.get("field"),
+                "period": rk.get("period"),
+                "order": order,
+                "label": get_sort_label(rk.get("field"), rk.get("period")),
+                "direction": "Ascending" if order == "asc" else "Descending",
+            }
         strategy_block = {
             "name": portfolio.strategy_name or (screener.name if screener else None),
             "description": screener.description if screener else None,
             "universe": portfolio.universe_json,
-            "ranking": version.ranking_json if version else None,
-            "filters": version.filters_json if version else None,
+            "ranking": ranking,
+            "filters": clean_filters,
         }
 
         out, nav, bench_by_date = PlatformPaperService._stitched_summary(db, portfolio)
