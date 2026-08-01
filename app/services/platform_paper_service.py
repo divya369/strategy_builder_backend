@@ -169,6 +169,11 @@ class PlatformPaperService:
             portfolio.pnl = float(last_curve.total_pnl or (last_aum - initial_capital))
             portfolio.last_updated_date = last_curve.date
 
+        # Store institutional headline ratios on the latest row so the card
+        # matches the detail page from the very first (backfill-only) render.
+        db.flush()
+        PlatformPaperService._store_institutional_on_latest_row(db, portfolio)
+
         db.commit()
         db.refresh(portfolio)
         logger.info("[Paper] Started portfolio %s for screener %s — %d curve rows, %d trades backfilled",
@@ -279,14 +284,39 @@ class PlatformPaperService:
         return out, nav, bench_by_date
 
     @staticmethod
+    def _store_institutional_on_latest_row(db: Session, portfolio: PaperPortfolio) -> None:
+        """Write the INSTITUTIONAL headline ratios (the same numbers the detail
+        page shows) onto the LATEST paper equity-curve row, so the card — which
+        reads that row cheaply — matches the detail exactly. One computation, one
+        storage, both surfaces agree. Called after backfill and after each daily
+        update. Fully defensive: never breaks the caller.
+        """
+        try:
+            out, _, _ = PlatformPaperService._stitched_summary(db, portfolio)
+            m = out["metrics"]
+            latest = db.query(PaperEquityCurve).filter(
+                PaperEquityCurve.automate_equity_ra_id == portfolio.id,
+            ).order_by(PaperEquityCurve.date.desc(), PaperEquityCurve.total_days.desc()).first()
+            if latest is None:
+                return
+            if m.get("cagr") is not None:
+                latest.cagr_percent = round(float(m["cagr"]) * 100.0, 2)
+            if m.get("sharpe") is not None:
+                latest.sharpe = round(float(m["sharpe"]), 2)
+            if m.get("max_drawdown") is not None:
+                latest.max_dd_percent = round(float(m["max_drawdown"]) * 100.0, 2)
+        except Exception:
+            logger.exception("[Paper] institutional metric store failed for %s", portfolio.id)
+
+    @staticmethod
     def card_metrics(portfolio: PaperPortfolio, latest_row: "PaperEquityCurve") -> dict:
         """Headline card metrics (CAGR, Max DD, Sharpe, NAV) read straight from
         the latest paper equity-curve row — same cheap, single-row fetch the
         live-investment cards use. No recompute.
 
-        NOTE: these ratios use the live-investment (equitycurve) formula, so they
-        may differ slightly from the detail page, which recomputes with the
-        backtest methodology. This matches how live-investment cards behave.
+        The row's cagr_percent/sharpe/max_dd_percent are written with the
+        INSTITUTIONAL methodology by _store_institutional_on_latest_row (after
+        backfill and each daily update), so the card matches the detail page.
         """
         def r2(v):
             return round(float(v), 2) if v is not None else None
@@ -356,6 +386,7 @@ class PlatformPaperService:
             "name": portfolio.strategy_name or (screener.name if screener else None),
             "description": screener.description if screener else None,
             "universe": portfolio.universe_json,
+            "rebalance_frequency": portfolio.rebalance_frequency,  # WEEKLY / MONTHLY
             "ranking": ranking,
             "filters": clean_filters,
         }
@@ -678,6 +709,11 @@ class PlatformPaperService:
             portfolio.next_rebalance_date = next_trading_day(
                 next_rebalance_prepare_date(TODAY + timedelta(days=1), portfolio.rebalance_frequency)
             )
+
+        # Overwrite the just-written row's headline ratios with the institutional
+        # values (same as the detail page) so the card and detail always agree.
+        db.flush()
+        PlatformPaperService._store_institutional_on_latest_row(db, portfolio)
         return True
 
     @staticmethod
