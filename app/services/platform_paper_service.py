@@ -27,6 +27,7 @@ import uuid
 from datetime import date, timedelta
 from typing import Optional
 
+import numpy as np
 import pandas as pd
 from fastapi import HTTPException
 from sqlalchemy.orm import Session
@@ -49,7 +50,7 @@ from app.models.result import BacktestSummary
 from app.models.screener import Screener, ScreenerVersion
 from app.core.config import settings
 from app.core.backtest_metric_formatter import format_metric_value
-from app.core.filter_registry import get_sort_label
+from app.core.filter_registry import get_filter_label, get_sort_label
 from app.core.performance_metrics import compute_summary_from_nav
 # Shared equitycase-style machinery — imported, NEVER modified.
 from app.services.live_investment_service import (
@@ -327,12 +328,17 @@ class PlatformPaperService:
         version = db.query(ScreenerVersion).filter(
             ScreenerVersion.id == portfolio.screener_version_id).first()
         # Send filters in the compact shape the frontend uses — drop the keys
-        # that are null for this filter type (period/relation/left_field/...).
+        # that are null for this filter type (period/relation/left_field/...),
+        # and add a human-readable `label` (same registry the builder uses) so
+        # the display page needn't map raw field keys client-side.
         raw_filters = (version.filters_json if version else None) or []
-        clean_filters = [
-            {k: v for k, v in f.items() if v is not None} if isinstance(f, dict) else f
-            for f in raw_filters
-        ]
+        def _clean_filter(f):
+            if not isinstance(f, dict):
+                return f
+            c = {k: v for k, v in f.items() if v is not None}
+            c["label"] = get_filter_label(c.get("field"), c.get("period"))
+            return c
+        clean_filters = [_clean_filter(f) for f in raw_filters]
         # Ranking: keep the raw field/order, but add a human-readable label +
         # direction so this display-only page needn't map the key client-side.
         rk = (version.ranking_json if version else None) or {}
@@ -459,12 +465,25 @@ class PlatformPaperService:
         rows = []
         prev_aum = None
         running_max_dd = 0.0
+        # Running cagr_percent/sharpe so the card (which reads the latest row) has
+        # real values immediately after backfill — same formula update_equitycurve
+        # uses for live rows, so there is no discontinuity at handover.
+        first_date = pd.to_datetime(summary.daily_nav_json[0]["trade_date"]).date()
+        base_nav = float(summary.daily_nav_json[0].get("portfolio_nav_net") or 100.0) or 100.0
+        nav_series: list[float] = []
         for i, e in enumerate(summary.daily_nav_json):
             d = pd.to_datetime(e["trade_date"]).date()
             nav = float(e.get("portfolio_nav_net") or 0.0)
             aum = round(initial_capital * nav / 100.0, 2)
             dd = round(float(e.get("drawdown") or 0.0) * 100.0, 2)
             running_max_dd = min(running_max_dd, dd)
+
+            nav_series.append(nav)
+            total_calender_day = (d - first_date).days + 1
+            cagr_percent = round(((((nav / base_nav) ** (1 / (total_calender_day / 365))) - 1) * 100), 2) \
+                if total_calender_day > 0 and base_nav else 0.0
+            _std = float(np.std(np.array(nav_series, dtype=float)))
+            sharpe = round((nav - 100.0) / _std, 2) if _std != 0 else 0.0
             rows.append({
                 "id": uuid.uuid4(),
                 "automate_equity_ra_id": portfolio.id,
@@ -492,9 +511,11 @@ class PlatformPaperService:
                 "max_dd_percent": round(running_max_dd, 2),
                 "max_dd_absolute": round(running_max_dd * initial_capital / 100.0, 2),
                 "current_dd_percent": dd,
-                "sqn": 0.0, "k_multiple": 0.0, "sharpe": 0.0, "calmar": 0.0, "sortino_ratio": 0.0,
+                "sqn": 0.0, "k_multiple": 0.0, "sharpe": sharpe,
+                "calmar": round(cagr_percent / abs(running_max_dd), 2) if running_max_dd != 0 else 0.0,
+                "sortino_ratio": 0.0,
                 "equitycurve_percent": round(nav, 2),
-                "cagr_percent": 0.0,
+                "cagr_percent": cagr_percent,
                 "neg_2sd": 0.0, "equitycurve_avg": 0.0, "pos_2sd": 0.0,
                 "total_charges": 0.0,
                 "rebalance": False,
