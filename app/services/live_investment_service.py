@@ -369,10 +369,34 @@ def assign_publisher_tags(db: Session, strategy: LiveStrategy, basket_type: str,
     - "SELL" — include only sell orders (rebalance step 1)
     - "BUY"  — include only buy orders (rebalance step 2, after sells complete)
     """
-    # Resolve the effective basket_type for storage (e.g., REBALANCE_SELL, REBALANCE_BUY)
+    # Resolve the effective basket_type for storage, driven by what orders actually
+    # exist — NOT blindly by `side`. The two-phase split (REBALANCE_SELL → REBALANCE_BUY)
+    # is only needed when BOTH sells and buys exist (buys need the sell proceeds as cash).
+    # A single-side rebalance (only sells OR only buys) is a single "REBALANCE" basket
+    # that completes straight to ACTIVE — reusing the already-wired REBALANCE (ALL) path.
+    #   only sells → REBALANCE        (no buy phase → ACTIVE)
+    #   only buys  → REBALANCE        (no sell phase → ACTIVE)
+    #   both       → REBALANCE_SELL then REBALANCE_BUY (two-phase)
     effective_basket_type = basket_type
     if basket_type == "REBALANCE" and side in ("SELL", "BUY"):
-        effective_basket_type = f"REBALANCE_{side}"
+        pending_sells = db.query(LiveSellStock).filter(
+            LiveSellStock.automate_equity_ra_id == strategy.id,
+            LiveSellStock.updated_in_tradelog == False,
+            or_(LiveSellStock.actual_qty.is_(None), LiveSellStock.actual_qty == 0),
+        ).count()
+        pending_buys = db.query(LiveBuyStock).filter(
+            LiveBuyStock.automate_equity_ra_id == strategy.id,
+            LiveBuyStock.updated_in_tradelog == False,
+            or_(LiveBuyStock.actual_qty.is_(None), LiveBuyStock.actual_qty == 0),
+        ).count()
+        if side == "SELL":
+            # Two-phase sell leg only if buys are also pending; otherwise single-phase.
+            effective_basket_type = "REBALANCE_SELL" if pending_buys > 0 else "REBALANCE"
+        else:  # side == "BUY"
+            # Two-phase buy leg only from SELL_COMPLETE; buy-only from READY is single-phase.
+            effective_basket_type = (
+                "REBALANCE_BUY" if strategy.status == LiveStatus.REBALANCE_SELL_COMPLETE else "REBALANCE"
+            )
 
     # Guard: prevent double Trade Now — return existing pending basket if any
     # Must check by effective_basket_type so BUY request doesn't return old SELL basket
@@ -1252,7 +1276,10 @@ def _validate_trade_now_status(strategy: LiveStrategy, basket_type: str, side: s
         raise HTTPException(status_code=400, detail="Your orders are being processed by the broker. Please wait for processing to complete.")
 
     if basket_type == "REBALANCE" and side == "BUY":
-        expected = {LiveStatus.REBALANCE_SELL_COMPLETE}
+        # SELL_COMPLETE = two-phase buy leg; READY = buy-only rebalance (no sells).
+        # assign_publisher_tags still blocks a buy while sells are pending, so a
+        # both-present rebalance can't skip the sell phase from READY.
+        expected = {LiveStatus.REBALANCE_SELL_COMPLETE, LiveStatus.REBALANCE_READY}
     elif basket_type == "REBALANCE" and side == "SELL":
         expected = {LiveStatus.REBALANCE_READY, LiveStatus.REBALANCE_PENDING_USER_APPROVAL}
     else:
