@@ -1856,6 +1856,12 @@ class LiveInvestmentService:
         if strategy.status == LiveStatus.INITIAL_PROCESSING:
             return _reconcile_stale_processing(db, strategy)
 
+        # ── ACCOUNT_MISMATCH — orders came back from the wrong broker account. ──
+        # Return 200 with the status so the frontend can render the "resolve account
+        # mismatch" screen (which calls /resolve-mismatch) instead of a blank/400 page.
+        if strategy.status == LiveStatus.ACCOUNT_MISMATCH:
+            return strategy
+
         # ── Stale recovery: PENDING_USER_APPROVAL with 0 fills (user abandoned Kite) ──
         if strategy.status == LiveStatus.PENDING_USER_APPROVAL:
             # ── Safety check: did the user already visit Kite? ──
@@ -1999,6 +2005,10 @@ class LiveInvestmentService:
         # lives in trade_now()/_validate_trade_now_status(), which still 400s.
         if strategy.status == LiveStatus.REBALANCE_PROCESSING:
             return _reconcile_stale_processing(db, strategy)
+
+        # ── ACCOUNT_MISMATCH — return 200 so the frontend shows the resolve screen. ──
+        if strategy.status == LiveStatus.ACCOUNT_MISMATCH:
+            return strategy
 
         if strategy.status in {LiveStatus.REBALANCE_SELL_COMPLETE, LiveStatus.REBALANCE_PENDING_USER_APPROVAL}:
             if strategy.status == LiveStatus.REBALANCE_PENDING_USER_APPROVAL:
@@ -2208,6 +2218,15 @@ class LiveInvestmentService:
             return strategy
 
         strategy.status = LiveStatus.REBALANCE_READY
+        # Roll next_rebalance_date forward to the next cycle at PREPARE time (same formula
+        # as the empty-rebalance branch above). Otherwise the displayed "next rebalance
+        # date" stays frozen at the current/old cycle until the rebalance fully completes
+        # — and freezes indefinitely if the user never executes it. The REBALANCE_READY
+        # status (plus the email) is what tells the user to act now; this field just shows
+        # when the following rebalance is due.
+        strategy.next_rebalance_date = next_trading_day(
+            next_rebalance_prepare_date(TODAY + timedelta(days=1), strategy.rebalance_frequency)
+        )
         db.commit()
         db.refresh(strategy)
 
@@ -2263,6 +2282,10 @@ class LiveInvestmentService:
         if strategy.status == LiveStatus.EXIT_PROCESSING:
             return _reconcile_stale_processing(db, strategy)
 
+        # ── ACCOUNT_MISMATCH — return 200 so the frontend shows the resolve screen. ──
+        if strategy.status == LiveStatus.ACCOUNT_MISMATCH:
+            return strategy
+
         # ── Stale recovery: EXIT_PENDING_USER_APPROVAL with 0 fills (user abandoned Kite) ──
         if strategy.status == LiveStatus.EXIT_PENDING_USER_APPROVAL:
             filled = db.query(LiveSellStock).filter(
@@ -2287,26 +2310,61 @@ class LiveInvestmentService:
                 logger.info("[ExitPreview] Stale recovery for strategy %s — cancelled baskets + deleted unfilled exit rows, restored to ACTIVE", strategy.id)
             else:
                 raise HTTPException(status_code=400, detail="Exit orders were already filled. Wait for postback processing to complete.")
+        elif strategy.status == LiveStatus.REBALANCE_PROCESSING:
+            # Rebalance orders are in-flight on Kite — can't exit mid-order. Return 200
+            # with the processing status so the frontend shows a spinner, not a blank page.
+            return _reconcile_stale_processing(db, strategy)
+        elif strategy.status in {
+            LiveStatus.REBALANCE_READY,
+            LiveStatus.REBALANCE_SELL_COMPLETE,
+            LiveStatus.REBALANCE_PENDING_USER_APPROVAL,
+        }:
+            # User wants to EXIT instead of finishing a prepared/partway rebalance.
+            # A prepared rebalance (REBALANCE_READY) hasn't touched holdings; a
+            # REBALANCE_SELL_COMPLETE already sold some. Either way we discard the
+            # prepared/pending rebalance and exit whatever is actually held.
+            # Safety: if the user already went to Kite for the rebalance
+            # (basket REDIRECT_RECEIVED), those orders may be in-flight — block with a
+            # spinner instead of exiting holdings that are mid-transaction.
+            latest_basket = db.query(LivePublisherBasket).filter(
+                LivePublisherBasket.automate_equity_ra_id == strategy.id,
+            ).order_by(LivePublisherBasket.created_at.desc()).first()
+            if latest_basket and latest_basket.status == "REDIRECT_RECEIVED":
+                return _lock_to_processing(db, strategy, LiveStatus.REBALANCE_PROCESSING,
+                                           "rebalance orders in-flight — cannot exit yet")
+            logger.info("[ExitPreview] Strategy %s: exit requested from %s — discarding rebalance, proceeding to exit holdings",
+                        strategy.id, strategy.status.value)
+            # Settle to ACTIVE; the common cleanup + fill-processing below discards the
+            # prepared rebalance rows/baskets and folds any executed sells into the
+            # tradelog so exit quantities reflect current holdings.
+            strategy.status = LiveStatus.ACTIVE
+            db.commit()
         elif strategy.status != LiveStatus.ACTIVE:
             current = strategy.status.value if hasattr(strategy.status, "value") else str(strategy.status)
             raise HTTPException(status_code=400, detail=f"Exit preview can be generated only from ACTIVE. Current status={current}")
         _delete_unapproved_preview_rows(db, strategy.id, include_sell=True)
 
         # ── Same-day exit support ──
-        # If user bought stocks today and wants to exit before 16:30 daily job,
-        # the tradelog won't have entries yet. Process pending fills into tradelog
-        # on-demand so exit preview can read them. Scoped to THIS strategy only.
+        # If the user filled orders today the tradelog may not reflect them yet:
+        #  - initial/pyramiding BUYS bought today, and
+        #  - the executed SELLS of a REBALANCE_SELL_COMPLETE they're now exiting from.
+        # Process any pending BUY *or* SELL fills into the tradelog on-demand so exit
+        # quantities reflect current holdings. Scoped to THIS strategy only.
         buy_df = model_df(db, LiveBuyStock, strategy.id)
-        if not buy_df.empty:
-            pending_buys = buy_df.loc[
-                (buy_df["updated_in_tradelog"].fillna(False) == False) &
-                (buy_df["actual_qty"].fillna(0) > 0)
-            ]
-            if not pending_buys.empty:
-                logger.info("[ExitPreview] Found %d pending fills for strategy %s — processing into tradelog now",
-                            len(pending_buys), strategy.id)
-                _process_strategy_daily_update(db, strategy, TODAY)
-                db.commit()
+        sell_df = model_df(db, LiveSellStock, strategy.id)
+        pending_buy_fills = (not buy_df.empty) and not buy_df.loc[
+            (buy_df["updated_in_tradelog"].fillna(False) == False) &
+            (buy_df["actual_qty"].fillna(0) > 0)
+        ].empty
+        pending_sell_fills = (not sell_df.empty) and not sell_df.loc[
+            (sell_df["updated_in_tradelog"].fillna(False) == False) &
+            (sell_df["actual_qty"].fillna(0) > 0)
+        ].empty
+        if pending_buy_fills or pending_sell_fills:
+            logger.info("[ExitPreview] Processing pending fills into tradelog for strategy %s before exit preview (buys=%s sells=%s)",
+                        strategy.id, pending_buy_fills, pending_sell_fills)
+            _process_strategy_daily_update(db, strategy, TODAY)
+            db.commit()
 
         tradelog_df = model_df(db, LiveTradelog, strategy.id)
         active_df = tradelog_df.loc[tradelog_df["active"] == True] if not tradelog_df.empty else pd.DataFrame()

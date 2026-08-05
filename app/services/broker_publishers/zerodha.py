@@ -15,6 +15,53 @@ logger = logging.getLogger(__name__)
 # Kite LTP API supports up to 1000 instruments per request.
 _KITE_LTP_CHUNK_SIZE = 500
 
+# NSE cash-market tick size. Kite rejects LIMIT prices that aren't a multiple of this.
+_NSE_TICK = 0.05
+
+# BE-series (Trade-to-Trade) stocks below this market cap cannot take MARKET orders
+# on the Publisher Offsite flow (market_protection is unsupported there), so we place
+# LIMIT orders for them to avoid rejection. EQ series and larger BE stocks stay MARKET.
+_BE_MARKET_ORDER_MIN_MCAP_CRORES = 500.0
+
+
+def _round_to_tick(price: float, side: str) -> float:
+    """Round a price to a valid NSE tick (₹0.05), nudged toward the fill side.
+
+    A BUY limit rounds UP and a SELL limit rounds DOWN, so the limit is slightly
+    aggressive and more likely to fill on illiquid BE stocks. Returns 0.0 for a
+    non-positive/invalid price.
+    """
+    import math
+    if price is None or price <= 0:
+        return 0.0
+    ticks = price / _NSE_TICK
+    if str(side).upper() == "BUY":
+        rounded = math.ceil(ticks - 1e-9) * _NSE_TICK
+    else:  # SELL
+        rounded = math.floor(ticks + 1e-9) * _NSE_TICK
+    return round(rounded, 2)
+
+
+def _resolve_order_type(is_be: bool, mcap_crores, side: str, base_price) -> Dict[str, Any]:
+    """Decide MARKET vs LIMIT for one order and compute the LIMIT price if needed.
+
+    Rule: BE-series AND (market cap unknown OR < ₹500 Cr) → LIMIT; everything else
+    (EQ, or BE ≥ 500 Cr) → MARKET. Unknown market cap defaults to LIMIT because we
+    cannot confirm the stock is above the threshold, so limit-ordering avoids a reject.
+
+    Returns {"order_type": "MARKET"} or {"order_type": "LIMIT", "price": <tick-rounded>}.
+    """
+    needs_limit = is_be and (
+        mcap_crores is None or float(mcap_crores) < _BE_MARKET_ORDER_MIN_MCAP_CRORES
+    )
+    if not needs_limit:
+        return {"order_type": "MARKET"}
+    try:
+        price = float(base_price) if base_price is not None and not pd.isna(base_price) else None
+    except (TypeError, ValueError):
+        price = None
+    return {"order_type": "LIMIT", "price": _round_to_tick(price, side) if price else 0.0}
+
 
 class ZerodhaPublisherAdapter(BrokerPublisherAdapter):
     broker = "ZERODHA"
@@ -89,7 +136,9 @@ class ZerodhaPublisherAdapter(BrokerPublisherAdapter):
     def build_payload(self, *, strategy: Any, buy_df: pd.DataFrame, sell_df: pd.DataFrame) -> Dict[str, Any]:
         """
         Zerodha Kite Publisher / Offsite basket payload.
-        Uses MARKET orders. Frontend should submit `basket` to Zerodha offsite/publisher flow.
+        Uses MARKET orders, except BE-series stocks under ₹500 Cr market cap which use
+        tick-aligned LIMIT orders (MARKET is rejected for those on the offsite flow).
+        Frontend should submit `basket` to the Zerodha offsite/publisher flow.
         """
         # Collect all unique symbols from buy + sell
         all_symbols = set()
@@ -122,6 +171,28 @@ class ZerodhaPublisherAdapter(BrokerPublisherAdapter):
         if be_symbols:
             logger.info("[KiteBasket] BE series symbols found: %s", be_symbols)
 
+        # ── Look up market cap (₹ Cr) from the daily screener CSV ──
+        # Used only to decide MARKET vs LIMIT for BE stocks (see _resolve_order_type).
+        # The daily screener CSV is the full universe, so it covers buys AND sells.
+        # If it can't be loaded, BE stocks default to LIMIT (safe — avoids rejection).
+        mcap_map: Dict[str, float] = {}
+        if all_symbols:
+            try:
+                from app.services import csv_data_service
+                from datetime import date as _date
+                latest = csv_data_service.get_latest_screener_date() or _date.today()
+                sdf = csv_data_service.get_screener_data(latest)
+                if sdf is not None and not sdf.empty and \
+                        "tradingsymbol" in sdf.columns and "market_cap_crores" in sdf.columns:
+                    sub = sdf[["tradingsymbol", "market_cap_crores"]].dropna(subset=["tradingsymbol"])
+                    mcap_map = {
+                        str(sym): (float(mc) if pd.notna(mc) else None)
+                        for sym, mc in zip(sub["tradingsymbol"], sub["market_cap_crores"])
+                    }
+            except Exception as e:
+                logger.warning("[KiteBasket] Could not load market caps from screener CSV — "
+                               "BE stocks will default to LIMIT orders: %s", e)
+
         orders = []
 
         for _, row in sell_df.iterrows():
@@ -133,37 +204,24 @@ class ZerodhaPublisherAdapter(BrokerPublisherAdapter):
             if not tag:
                 logger.warning("[KiteBasket] SELL order for %s has EMPTY publisher_tag — postback matching will fail!", tradingsymbol)
 
-            # ── LTP / limit_price commented out — not needed for MARKET orders ──
-            # limit_price = ltp_map.get(tradingsymbol)
-            # if limit_price is None or limit_price <= 0:
-            #     fallback = row["price"]
-            #     limit_price = float(fallback) if fallback is not None and not pd.isna(fallback) else 0.0
-            #     logger.warning("[KiteBasket] No LTP for %s, using fallback price=%.2f", tradingsymbol, limit_price)
-
-            orders.append({
+            is_be = tradingsymbol in be_symbols
+            resolved = _resolve_order_type(is_be, mcap_map.get(tradingsymbol), "SELL", row.get("price"))
+            order = {
                 "exchange": "NSE",
-                "tradingsymbol": f"{tradingsymbol}-BE" if tradingsymbol in be_symbols else tradingsymbol,
+                "tradingsymbol": f"{tradingsymbol}-BE" if is_be else tradingsymbol,
                 "transaction_type": "SELL",
                 "quantity": int(row["qty"]),
                 "product": "CNC",
-                "order_type": "MARKET",
+                "order_type": resolved["order_type"],
                 "validity": "DAY",
                 "readonly": False,
                 "tag": tag,
-            })
-
-            # orders.append({
-            #     "exchange": "NSE",
-            #     "tradingsymbol": tradingsymbol,
-            #     "transaction_type": "SELL",
-            #     "quantity": int(row["qty"]),
-            #     "product": "CNC",
-            #     "order_type": "LIMIT",
-            #     "price": round(limit_price, 2),
-            #     "validity": "DAY",
-            #     "readonly": False,
-            #     "tag": tag,
-            # })
+            }
+            if resolved["order_type"] == "LIMIT":
+                order["price"] = resolved["price"]
+                logger.info("[KiteBasket] SELL %s → LIMIT @ %.2f (BE, mcap=%s Cr)",
+                            tradingsymbol, resolved["price"], mcap_map.get(tradingsymbol))
+            orders.append(order)
 
         for _, row in buy_df.iterrows():
             if int(row.get("qty") or 0) <= 0:
@@ -174,37 +232,24 @@ class ZerodhaPublisherAdapter(BrokerPublisherAdapter):
             if not tag:
                 logger.warning("[KiteBasket] BUY order for %s has EMPTY publisher_tag — postback matching will fail!", tradingsymbol)
 
-            # ── LTP / limit_price commented out — not needed for MARKET orders ──
-            # limit_price = ltp_map.get(tradingsymbol)
-            # if limit_price is None or limit_price <= 0:
-            #     fallback = row["price"]
-            #     limit_price = float(fallback) if fallback is not None and not pd.isna(fallback) else 0.0
-            #     logger.warning("[KiteBasket] No LTP for %s, using fallback price=%.2f", tradingsymbol, limit_price)
-
-            orders.append({
+            is_be = tradingsymbol in be_symbols
+            resolved = _resolve_order_type(is_be, mcap_map.get(tradingsymbol), "BUY", row.get("price"))
+            order = {
                 "exchange": "NSE",
-                "tradingsymbol": f"{tradingsymbol}-BE" if tradingsymbol in be_symbols else tradingsymbol,
+                "tradingsymbol": f"{tradingsymbol}-BE" if is_be else tradingsymbol,
                 "transaction_type": "BUY",
                 "quantity": int(row["qty"]),
                 "product": "CNC",
-                "order_type": "MARKET",
+                "order_type": resolved["order_type"],
                 "validity": "DAY",
                 "readonly": False,
                 "tag": tag,
-            })
-
-            # orders.append({
-            #     "exchange": "NSE",
-            #     "tradingsymbol": tradingsymbol,
-            #     "transaction_type": "BUY",
-            #     "quantity": int(row["qty"]),
-            #     "product": "CNC",
-            #     "order_type": "LIMIT",
-            #     "price": round(limit_price, 2),
-            #     "validity": "DAY",
-            #     "readonly": False,
-            #     "tag": tag,
-            # })
+            }
+            if resolved["order_type"] == "LIMIT":
+                order["price"] = resolved["price"]
+                logger.info("[KiteBasket] BUY %s → LIMIT @ %.2f (BE, mcap=%s Cr)",
+                            tradingsymbol, resolved["price"], mcap_map.get(tradingsymbol))
+            orders.append(order)
 
         return {
             "broker": self.broker,
