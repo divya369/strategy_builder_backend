@@ -92,7 +92,6 @@ FILTER_CONFIG_MAP: Dict[str, dict] = {
         "label": "Turnover",
         "description": "## Turnover\n\n**What it means:** Measures the total value of shares traded.\n\n**Example:** Higher turnover means more market participation and easier buying/selling.\n\n**Why investors use it:** Important for liquidity-focused investors.",
         "type": "metric_value",
-        "dbKey": "volume_rupees",
         "operators": [">=", "<=", ">", "<", "=="],
         "sortable": True,
         "sortGroup": "Liquidity",
@@ -107,7 +106,15 @@ FILTER_CONFIG_MAP: Dict[str, dict] = {
         "sortGroup": "Fundamentals",
     },
     "volume": {
-        "label": "Volume (in rupees)",
+        "label": "Volume",
+        "description": "## Volume\n\n**What it means:** Measures the number of shares traded during the day.\n\n**Example:** A stock with 8 lakh shares traded is more actively dealt in than one with 8 thousand.\n\n**Why investors use it:** Used to gauge trading activity in share terms.",
+        "type": "metric_value",
+        "operators": [">=", "<=", ">", "<", "=="],
+        "sortable": True,
+        "sortGroup": "Liquidity",
+    },
+    "volume_rupees": {
+        "label": "Volume (in Rupees)",
         "description": "## Volume (in Rupees)\n\n**What it means:** Measures the total traded value in rupee terms.\n\n**Example:** High-volume stocks generally have better liquidity and lower execution issues.\n\n**Why investors use it:** Momentum strategies often prefer high-volume stocks.",
         "type": "metric_value",
         "operators": [">=", "<=", ">", "<", "=="],
@@ -145,7 +152,7 @@ FILTER_CONFIG_MAP: Dict[str, dict] = {
         "operators": [">=", "<=", ">", "<", "=="],
         "comparableFields": [
             "return_pct", "sharpe_return_pct", "positive_days_pct",
-            "marketcap", "turnover", "price", "volume", "beta",
+            "marketcap", "turnover", "price", "volume", "volume_rupees", "beta",
             "moving_average", "ema",
         ],
     },

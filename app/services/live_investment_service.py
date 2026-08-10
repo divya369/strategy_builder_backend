@@ -3291,10 +3291,16 @@ class LiveInvestmentService:
         """Handle the frontend callback after Kite Publisher redirect.
 
         1. Verifies the strategy belongs to the calling user.
-        2. Finds the latest basket for the strategy.
-        3. Exchanges request_token for access_token via the broker adapter.
-        4. Encrypts and stores the access_token in broker_account.
-        5. Verifies the broker user_id matches the locked strategy account.
+        2. Exchanges request_token for access_token via the broker adapter.
+        3. Encrypts and stores the access_token in broker_account.
+        4. Verifies the broker user_id matches the locked strategy account.
+        5. If a still-pending basket exists, marks it REDIRECT_RECEIVED and locks the
+           strategy into *_PROCESSING.
+
+        Step 5 is best-effort: storing the token is the job that must always succeed.
+        A basket that has already closed means the postbacks beat the user back from
+        Kite — normal, not an error — so we leave basket and strategy status untouched
+        and still return 200.
 
         Returns a dict with status information for the frontend.
         """
@@ -3308,13 +3314,48 @@ class LiveInvestmentService:
         if str(strategy.user_id) != str(user_id):
             raise HTTPException(status_code=403, detail="Strategy does not belong to this user")
 
-        # Find the latest PENDING basket for this strategy (don't revive cancelled ones)
+        # Find the latest PENDING basket for this strategy (don't revive cancelled ones).
+        #
+        # A missing pending basket is NOT an error. Kite postbacks arrive the moment the
+        # orders fill — while the user is still reading the Kite confirmation screen — and
+        # the debounced orderbook verification closes the basket (COMPLETE/ALL_REJECTED)
+        # about 5s later. Only then does the user click "Finish" and land here. Previously
+        # this raised 404 "Publisher basket not found": the access_token was never stored
+        # and the frontend redirect page spun forever, even though the orders were fine.
         basket = db.query(LivePublisherBasket).filter(
             LivePublisherBasket.automate_equity_ra_id == live_id,
             LivePublisherBasket.status.in_(["PENDING_USER_APPROVAL", "CREATED"]),
         ).order_by(LivePublisherBasket.created_at.desc()).first()
         if not basket:
-            raise HTTPException(status_code=404, detail="Publisher basket not found")
+            logger.info("[RedirectCallback] No pending basket for strategy %s (status=%s) — orders "
+                        "already processed; exchanging token without touching status",
+                        live_id, strategy.status.value if hasattr(strategy.status, "value") else strategy.status)
+
+        # ── Upgrade to _PROCESSING status (locks strategy during order processing) ──
+        STATUS_TO_PROCESSING = {
+            LiveStatus.PENDING_USER_APPROVAL: LiveStatus.INITIAL_PROCESSING,
+            LiveStatus.REBALANCE_PENDING_USER_APPROVAL: LiveStatus.REBALANCE_PROCESSING,
+            LiveStatus.REBALANCE_SELL_COMPLETE: LiveStatus.REBALANCE_PROCESSING,  # Buy phase
+            LiveStatus.EXIT_PENDING_USER_APPROVAL: LiveStatus.EXIT_PROCESSING,
+        }
+
+        def _mark_redirect_received(path_label: str) -> None:
+            """Mark the pending basket REDIRECT_RECEIVED and lock the strategy.
+
+            Only ever runs when a still-pending basket was found. If the basket already
+            closed, the postback/orderbook path has ALREADY set the correct terminal
+            status and re-applying the map would move the strategy BACKWARDS — a finished
+            REBALANCE_SELL leg sits at REBALANCE_SELL_COMPLETE, and forcing it to
+            REBALANCE_PROCESSING makes the buy leg unreachable and wedges the rebalance.
+            """
+            if basket is None:
+                return
+            basket.status = "REDIRECT_RECEIVED"
+            new_status = STATUS_TO_PROCESSING.get(strategy.status)
+            if new_status:
+                logger.info("[RedirectCallback] Strategy %s status %s → %s (%s)",
+                            live_id, strategy.status.value, new_status.value, path_label)
+                strategy.status = new_status
 
         broker_account = db.query(LiveBrokerAccount).filter(
             LiveBrokerAccount.id == strategy.broker_account_id
@@ -3333,22 +3374,11 @@ class LiveInvestmentService:
             # the basket REDIRECT_RECEIVED and lock the strategy into *_PROCESSING.
             # Otherwise the status stays PENDING, and the preview endpoint then sees
             # "orders sent" and (previously) 400'd → the frontend Bad Request page.
-            basket.status = "REDIRECT_RECEIVED"
-            STATUS_TO_PROCESSING = {
-                LiveStatus.PENDING_USER_APPROVAL: LiveStatus.INITIAL_PROCESSING,
-                LiveStatus.REBALANCE_PENDING_USER_APPROVAL: LiveStatus.REBALANCE_PROCESSING,
-                LiveStatus.REBALANCE_SELL_COMPLETE: LiveStatus.REBALANCE_PROCESSING,  # Buy phase
-                LiveStatus.EXIT_PENDING_USER_APPROVAL: LiveStatus.EXIT_PROCESSING,
-            }
-            new_status = STATUS_TO_PROCESSING.get(strategy.status)
-            if new_status:
-                logger.info("[RedirectCallback] Strategy %s status %s → %s (already-connected path)",
-                            live_id, strategy.status.value, new_status.value)
-                strategy.status = new_status
+            _mark_redirect_received("already-connected path")
             db.commit()
             return {
                 "status": "ok",
-                "detail": "already_connected_for_today",
+                "detail": "already_connected_for_today" if basket else "already_connected_no_pending_basket",
                 "broker_user_id": broker_account.broker_user_id,
                 "strategy_status": strategy.status.value if hasattr(strategy.status, "value") else str(strategy.status),
             }
@@ -3377,6 +3407,7 @@ class LiveInvestmentService:
                 "status": "account_mismatch",
                 "expected": broker_account.broker_user_id,
                 "actual": zerodha_user_id,
+                "strategy_status": strategy.status.value if hasattr(strategy.status, "value") else str(strategy.status),
             }
 
         # Store encrypted access_token + metadata in broker_account
@@ -3388,20 +3419,7 @@ class LiveInvestmentService:
         broker_account.auth_status = "CONNECTED"
         broker_account.broker_profile = token_data.get("profile")
 
-        basket.status = "REDIRECT_RECEIVED"
-
-        # ── Upgrade to _PROCESSING status (locks strategy during order processing) ──
-        STATUS_TO_PROCESSING = {
-            LiveStatus.PENDING_USER_APPROVAL: LiveStatus.INITIAL_PROCESSING,
-            LiveStatus.REBALANCE_PENDING_USER_APPROVAL: LiveStatus.REBALANCE_PROCESSING,
-            LiveStatus.REBALANCE_SELL_COMPLETE: LiveStatus.REBALANCE_PROCESSING,  # Buy phase
-            LiveStatus.EXIT_PENDING_USER_APPROVAL: LiveStatus.EXIT_PROCESSING,
-        }
-        new_status = STATUS_TO_PROCESSING.get(strategy.status)
-        if new_status:
-            logger.info("[RedirectCallback] Strategy %s status %s → %s",
-                        live_id, strategy.status.value, new_status.value)
-            strategy.status = new_status
+        _mark_redirect_received("token-exchange path")
 
         db.commit()
 
@@ -3410,8 +3428,9 @@ class LiveInvestmentService:
 
         return {
             "status": "ok",
-            "detail": "broker_connected_for_today",
+            "detail": "broker_connected_for_today" if basket else "broker_connected_no_pending_basket",
             "broker_user_id": zerodha_user_id,
+            "strategy_status": strategy.status.value if hasattr(strategy.status, "value") else str(strategy.status),
         }
 
 
