@@ -168,6 +168,7 @@ def delete_broker_account(broker_account_id: UUID, db: Session = Depends(get_db)
 def serialize_strategy(obj: LiveStrategy) -> LiveStrategyResponse:
     return LiveStrategyResponse(
         id=obj.id,
+        screener_id=obj.screener_id,
         version_number=obj.screener_version.version_number if obj.screener_version else 0,
         status=obj.status.value if hasattr(obj.status, "value") else str(obj.status),
         strategy_name=obj.strategy_name,
@@ -299,41 +300,11 @@ def go_live(payload: GoLiveRequest, db: Session = Depends(get_db), _mkt=Depends(
         LiveStrategy.status.in_(running_statuses),
     ).first()
 
-    # If duplicate is PENDING_USER_APPROVAL with zero fills, the user never
-    # completed Kite flow (failed login, closed popup, etc.). Auto-cancel it
-    # so they can retry Go Live without friction.
-    if duplicate and duplicate.status == LiveStatus.PENDING_USER_APPROVAL:
-        # ── Safety check: did the user already visit Kite? ──
-        # If basket is REDIRECT_RECEIVED, the user went to Kite and came back.
-        # Orders might have been placed — postbacks could still be in transit.
-        # Do NOT auto-cancel; let postback/verify flow complete.
-        latest_basket = db.query(LivePublisherBasket).filter(
-            LivePublisherBasket.automate_equity_ra_id == duplicate.id,
-        ).order_by(LivePublisherBasket.created_at.desc()).first()
-
-        if latest_basket and latest_basket.status == "REDIRECT_RECEIVED":
-            logger.warning("[GoLive] Blocked auto-cancel for strategy %s — basket %s is REDIRECT_RECEIVED (orders may be in-flight)",
-                           duplicate.id, latest_basket.id)
-            # Fall through to the duplicate guard below (will return 409)
-        else:
-            filled = db.query(LiveBuyStock).filter(
-                LiveBuyStock.automate_equity_ra_id == duplicate.id,
-                LiveBuyStock.actual_qty > 0,
-            ).count()
-            if filled == 0:
-                # No orders filled and user never reached Kite — safe to cancel
-                db.query(LiveBuyStock).filter(LiveBuyStock.automate_equity_ra_id == duplicate.id).delete(synchronize_session=False)
-                db.query(LiveSellStock).filter(LiveSellStock.automate_equity_ra_id == duplicate.id).delete(synchronize_session=False)
-                db.query(LiveCircuitStock).filter(LiveCircuitStock.automate_equity_ra_id == duplicate.id).delete(synchronize_session=False)
-                db.query(LivePublisherBasket).filter(
-                    LivePublisherBasket.automate_equity_ra_id == duplicate.id,
-                    LivePublisherBasket.status == "PENDING_USER_APPROVAL",
-                ).update({"status": "CANCELLED"}, synchronize_session=False)
-                duplicate.status = LiveStatus.CANCELLED
-                duplicate.subscription_active = False
-                db.commit()
-                logger.info("[GoLive] Auto-cancelled stale PENDING strategy %s (0 fills) to allow retry", duplicate.id)
-                duplicate = None  # Clear so the guard below doesn't block
+    # If duplicate is a stale PENDING (0 fills, user never reached Kite), cancel
+    # it so the user can retry without friction. Shared helper — the same logic
+    # is reused by the platform 'Invest Now' guard.
+    if duplicate and LiveInvestmentService.auto_cancel_stale_pending(db, duplicate):
+        duplicate = None  # cleared — the guard below won't block
 
     if duplicate:
         raise HTTPException(

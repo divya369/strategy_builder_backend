@@ -1,6 +1,6 @@
 import uuid
 from pydantic import BaseModel, Field, ConfigDict, model_validator
-from typing import List, Any, Optional
+from typing import List, Any, Optional, Literal
 
 class UniverseConfig(BaseModel):
     type: str
@@ -40,6 +40,8 @@ class ScreenerCreate(BaseModel):
     description: Optional[str] = None
     is_active: bool = True
     user_id: str
+    # "user" = normal user strategy; "platform" = ready-to-use strategy from admin backend
+    role: Literal["user", "platform"] = "user"
     universe: UniverseConfig
     filters: List[FilterConfig]
     ranking: Optional[RankingConfig] = None

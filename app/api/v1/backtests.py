@@ -22,8 +22,11 @@ def run_custom_backtest(req: CustomBacktestRequest, db: Session = Depends(get_db
     screener_version_id = req.screener_version_id
 
     if screener_id is not None:
-        screener = db.query(Screener).filter(Screener.id == screener_id, Screener.is_active == True).first()
-        if not screener:
+        screener = db.query(Screener).filter(Screener.id == screener_id).first()
+        # Platform screeners start inactive (admin reviews backtest BEFORE activating),
+        # so allow backtests on inactive platform screeners. User screeners keep the
+        # original rule: soft-deleted (inactive) → 404.
+        if not screener or (not screener.is_active and screener.role != "platform"):
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Screener not found.")
 
     if screener_version_id is not None and screener_id is not None:

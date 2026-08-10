@@ -252,3 +252,53 @@ def get_db_key(field: str) -> Optional[str]:
     if conf:
         return conf.get("dbKey")
     return None
+
+
+def build_sort_options() -> List[dict]:
+    """Full list of selectable sort fields ({value, label, group, description}).
+
+    Combines period-expanded filter-based sorts with the extra sort-only fields.
+    Single source of truth for the /config/sort-options API and for resolving a
+    stored ranking field back to its display label (get_sort_label).
+    """
+    dynamic: List[dict] = []
+    for key, conf in FILTER_CONFIG_MAP.items():
+        if not conf.get("sortable"):
+            continue
+        base_key = conf.get("dbKey", key)
+        desc = conf.get("description", "")
+        if conf.get("periods") and conf.get("periodValues"):
+            for i, p_label in enumerate(conf["periods"]):
+                p_value = conf["periodValues"][i]
+                label = conf["label"].replace(" (%)", "")
+                sort_label = f"{label} {p_label}"
+                sort_desc = desc
+                first_break = desc.find("\n\n")
+                if first_break != -1 and desc.startswith("## "):
+                    sort_desc = f"## {sort_label}" + desc[first_break:]
+                dynamic.append({"value": f"{p_value}_{base_key}", "label": sort_label,
+                                "group": conf.get("sortGroup", "Filter-based"), "description": sort_desc})
+        else:
+            dynamic.append({"value": base_key, "label": conf["label"],
+                            "group": conf.get("sortGroup", "Filter-based"), "description": desc})
+    return dynamic + EXTRA_SORT_FIELDS
+
+
+def get_sort_label(field: str, period: str = None) -> Optional[str]:
+    """Resolve a stored ranking field to its human-readable sort label.
+
+    E.g. "average_sharpe_12_9_6_3_months" -> "Avg Sharpe Return 12 9 6 3 months",
+         ("sharpe_return_pct", "1y")       -> "1Y Sharpe Return".
+    Falls back to a title-cased version of the raw key if unknown.
+    """
+    if not field:
+        return None
+    field = str(field)
+    options = {o["value"]: o["label"] for o in build_sort_options()}
+    if field in options:
+        return options[field]
+    if period and f"{period}_{field}" in options:
+        return options[f"{period}_{field}"]
+    if field in FILTER_CONFIG_MAP:
+        return get_filter_label(field, period)
+    return field.replace("_", " ").title()
