@@ -1691,6 +1691,39 @@ def _process_basket_orders(
     db.commit()
     db.refresh(strategy)
 
+    # Platform 'Invest Now': materialise the user's own screener on first activation.
+    adopt_platform_clone_on_activation(db, strategy)
+
+
+def adopt_platform_clone_on_activation(db: Session, strategy: LiveStrategy) -> None:
+    """On a platform-invested strategy's FIRST activation, clone the platform
+    screener into the user's own screener and re-point this strategy to it, so it
+    appears in the user's strategy builder. Deferred until here so an abandoned
+    preview never leaves a throwaway screener.
+
+    The detector (screener_id still == the platform source) makes this run exactly
+    once — later process_orders passes (rebalance/exit) skip it. Fully defensive:
+    a failure must never break order processing / the postback.
+    """
+    if not (strategy.status == LiveStatus.ACTIVE
+            and strategy.source_platform_screener_id
+            and strategy.screener_id == strategy.source_platform_screener_id):
+        return
+    try:
+        from app.services.screener_service import screener_service
+        v = screener_service.adopt_platform_screener_for_user(
+            db, strategy.source_platform_screener_id, strategy.user_id, strategy.strategy_name,
+        )
+        strategy.screener_id = v.screener_id
+        strategy.screener_version_id = v.id
+        db.commit()
+        db.refresh(strategy)
+        logger.info("[Activate] platform strategy %s adopted into user screener %s (v%s)",
+                    strategy.id, v.screener_id, v.version_number)
+    except Exception:
+        db.rollback()
+        logger.exception("[Activate] platform clone failed for %s — leaving on platform version", strategy.id)
+
 
 # -----------------------------------------------------------------------------
 # Daily per-strategy tradelog + equity curve processing helper
@@ -1779,6 +1812,52 @@ def _process_strategy_daily_update(db: Session, strategy: LiveStrategy, TODAY: d
 # -----------------------------------------------------------------------------
 
 class LiveInvestmentService:
+    @staticmethod
+    def auto_cancel_stale_pending(db: Session, strategy: "LiveStrategy") -> bool:
+        """Cancel a strategy stuck in PENDING_USER_APPROVAL with zero fills where
+        the user never actually reached Kite (latest basket != REDIRECT_RECEIVED).
+
+        This lets the user retry Go Live without friction. Returns True if it was
+        cancelled (caller can then treat it as gone), False if it must be left as
+        a genuine running duplicate.
+
+        Single source of truth — reused by both the initial Go Live guard and the
+        platform 'Invest Now' guard.
+        """
+        if not strategy or strategy.status != LiveStatus.PENDING_USER_APPROVAL:
+            return False
+
+        # Did the user already visit Kite? If so, orders may be in-flight — do
+        # NOT cancel; let the postback/verify flow complete.
+        latest_basket = db.query(LivePublisherBasket).filter(
+            LivePublisherBasket.automate_equity_ra_id == strategy.id,
+        ).order_by(LivePublisherBasket.created_at.desc()).first()
+        if latest_basket and latest_basket.status == "REDIRECT_RECEIVED":
+            logger.warning("[GoLive] Blocked auto-cancel for strategy %s — basket %s is REDIRECT_RECEIVED (orders may be in-flight)",
+                           strategy.id, latest_basket.id)
+            return False
+
+        filled = db.query(LiveBuyStock).filter(
+            LiveBuyStock.automate_equity_ra_id == strategy.id,
+            LiveBuyStock.actual_qty > 0,
+        ).count()
+        if filled > 0:
+            return False
+
+        # No orders filled and user never reached Kite — safe to cancel.
+        db.query(LiveBuyStock).filter(LiveBuyStock.automate_equity_ra_id == strategy.id).delete(synchronize_session=False)
+        db.query(LiveSellStock).filter(LiveSellStock.automate_equity_ra_id == strategy.id).delete(synchronize_session=False)
+        db.query(LiveCircuitStock).filter(LiveCircuitStock.automate_equity_ra_id == strategy.id).delete(synchronize_session=False)
+        db.query(LivePublisherBasket).filter(
+            LivePublisherBasket.automate_equity_ra_id == strategy.id,
+            LivePublisherBasket.status == "PENDING_USER_APPROVAL",
+        ).update({"status": "CANCELLED"}, synchronize_session=False)
+        strategy.status = LiveStatus.CANCELLED
+        strategy.subscription_active = False
+        db.commit()
+        logger.info("[GoLive] Auto-cancelled stale PENDING strategy %s (0 fills) to allow retry", strategy.id)
+        return True
+
     @staticmethod
     def create_go_live(
         db: Session,

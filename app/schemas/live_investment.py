@@ -36,8 +36,33 @@ class GoLiveRequest(BaseModel):
     broker_account_label: Optional[str] = Field(default=None, description="Account Nickname / Label")
 
 
+class PlatformInvestRequest(BaseModel):
+    """User clicks 'Invest Now' on a platform (ready-to-use) strategy.
+
+    Same fields as GoLiveRequest, except the source is a platform SCREENER
+    (one version per platform screener, so no version id is needed) and the
+    user supplies a name + description for their own cloned copy.
+    """
+    user_id: str
+    platform_screener_id: UUID
+    strategy_name: str
+    description: Optional[str] = None
+
+    # Fresh user input from Go Live popup. Do not copy these from backtest.
+    portfolio_size: int = Field(gt=0)
+    wrh: int = Field(gt=0, description="Worst Hold Rank")
+    rebalance_frequency: str = Field(pattern="^(weekly|monthly)$")
+    aum: float = Field(gt=0)
+
+    # Broker selection (inline — no separate broker-accounts step)
+    broker: str = Field(default="zerodha", description="Broker selection dropdown")
+    broker_user_id: str = Field(description="Broker User ID / expected client ID")
+    broker_account_label: Optional[str] = Field(default=None, description="Account Nickname / Label")
+
+
 class LiveStrategyResponse(BaseModel):
     id: UUID
+    screener_id: Optional[UUID] = None
     version_number: int
     status: str
     strategy_name: str
