@@ -9,6 +9,7 @@ Structure:
         ├── 2026-06-10_live_investment.log    ← go-live, orders, postback
         ├── 2026-06-10_daily_mtm.log          ← 16:30 daily equity curve update
         ├── 2026-06-10_rebalance.log          ← 16:45 rebalance preparation
+        ├── 2026-06-10_paper_trading.log      ← 16:30 platform paper-trading update
         └── 2026-06-10_celery.log             ← celery worker internals
 
 Usage:
@@ -106,6 +107,9 @@ COMPONENT_LOGGERS: dict[str, list[str]] = {
     ],
     "rebalance": [
         "rebalance",
+    ],
+    "paper_trading": [
+        "paper_trading",
     ],
     "broker_token": [
         "broker_token",
