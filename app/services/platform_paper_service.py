@@ -387,6 +387,10 @@ class PlatformPaperService:
             "description": screener.description if screener else None,
             "universe": portfolio.universe_json,
             "rebalance_frequency": portfolio.rebalance_frequency,  # WEEKLY / MONTHLY
+            # Params the admin's backtest ran with, copied onto the portfolio at
+            # start — the user gets these as defaults and may edit them on invest.
+            "portfolio_size": portfolio.portfolio_size,
+            "wrh": portfolio.worst_hold_rank,
             "ranking": ranking,
             "filters": clean_filters,
         }

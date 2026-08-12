@@ -15,7 +15,7 @@ from app.schemas.screener import ScreenerCreate, ScreenerVersionResponse, Screen
 from app.services.screener_service import screener_service
 from app.services.screener_version_service import screener_version_service
 from app.services.screener_execution_service import screener_execution_service
-from app.services import csv_data_service
+from app.services import csv_data_service, universe_service
 from app.models.screener import ScreenerVersion, Screener
 from app.models.backtest import BacktestRun
 from app.models.result import BacktestSummary
@@ -258,6 +258,10 @@ def get_screener_detail(screener_id: uuid.UUID, user_id: str, vid: uuid.UUID = N
     else:
         oldest = csv_data_service.get_index_start_date(universe.get("value", ""))
         universe["start_date"] = str(oldest) if oldest else None
+
+    # Declared universe size from the registry (null for ALL / unregistered index).
+    # Resolved on read, so versions saved before this field existed also carry it.
+    universe["size"] = universe_service.get_universe_size(universe)
 
     return {
         "id": str(screener.id),
