@@ -1682,7 +1682,13 @@ def _process_basket_orders(
         # INITIAL, REBALANCE (ALL), REBALANCE_BUY, EXIT — go to ACTIVE
         strategy.status = LiveStatus.ACTIVE
         strategy.subscription_active = True
-        strategy.next_rebalance_date = next_trading_day(next_rebalance_prepare_date(TODAY, strategy.rebalance_frequency))
+        # This cycle is done, so look for the NEXT one from tomorrow. Without the +1 day,
+        # executing on the prepare day itself (possible via the manual preview endpoint on
+        # a Friday/month-end) would re-return today as the prepare date and point the user
+        # at the very next trading day instead of the following cycle.
+        strategy.next_rebalance_date = next_trading_day(
+            next_rebalance_prepare_date(TODAY + timedelta(days=1), strategy.rebalance_frequency)
+        )
 
     # ── Step 5: Update basket status ──
     basket.raw_postback = {"source": source, "processed_at": str(datetime.utcnow())}
@@ -2297,15 +2303,14 @@ class LiveInvestmentService:
             return strategy
 
         strategy.status = LiveStatus.REBALANCE_READY
-        # Roll next_rebalance_date forward to the next cycle at PREPARE time (same formula
-        # as the empty-rebalance branch above). Otherwise the displayed "next rebalance
-        # date" stays frozen at the current/old cycle until the rebalance fully completes
-        # — and freezes indefinitely if the user never executes it. The REBALANCE_READY
-        # status (plus the email) is what tells the user to act now; this field just shows
-        # when the following rebalance is due.
-        strategy.next_rebalance_date = next_trading_day(
-            next_rebalance_prepare_date(TODAY + timedelta(days=1), strategy.rebalance_frequency)
-        )
+        # There ARE buy/sell changes, so the user must trade on the next trading day —
+        # that is the date to show, not the following cycle. (The empty-rebalance branch
+        # above skips a whole cycle instead, because there is nothing to execute.)
+        # Prepared Fri 14-08 → user acts Mon 17-08. Uses TODAY rather than the prepare-date
+        # helper so a manual mid-week preview also points at the next trading day.
+        # The date cannot freeze if the user never acts: the 16:30 daily update auto-skips
+        # a zero-fill REBALANCE_READY back to ACTIVE and rolls this forward.
+        strategy.next_rebalance_date = next_trading_day(TODAY)
         db.commit()
         db.refresh(strategy)
 
@@ -2339,9 +2344,12 @@ class LiveInvestmentService:
             LivePublisherBasket.status.in_(["PENDING_USER_APPROVAL", "REDIRECT_RECEIVED"]),
         ).update({"status": "CANCELLED"}, synchronize_session=False)
 
-        # Reset to active and roll over date
+        # Reset to active and roll over date. +1 day for the same reason as process_orders:
+        # this cycle is abandoned, so search for the next prepare date from tomorrow.
         strategy.status = LiveStatus.ACTIVE
-        strategy.next_rebalance_date = next_trading_day(next_rebalance_prepare_date(TODAY, strategy.rebalance_frequency))
+        strategy.next_rebalance_date = next_trading_day(
+            next_rebalance_prepare_date(TODAY + timedelta(days=1), strategy.rebalance_frequency)
+        )
         db.commit()
         db.refresh(strategy)
         return strategy
