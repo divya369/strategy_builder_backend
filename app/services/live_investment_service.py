@@ -54,6 +54,19 @@ from app.services.notifications import notify_all
 logger = logging.getLogger(__name__)
 
 
+def norm_client_id(value: Optional[str]) -> Optional[str]:
+    """Trim + uppercase a broker client id before comparing two of them.
+
+    Client ids reach us from three places — the Go Live form, the postback and
+    the token exchange — and only the last two are guaranteed uppercase. Rows
+    predating input normalization can still hold 'xyz1234'. Comparing raw would
+    flip a strategy to the terminal ACCOUNT_MISMATCH purely on casing.
+    """
+    if value is None:
+        return None
+    return value.strip().upper() or None
+
+
 # -----------------------------------------------------------------------------
 # Small DB dataframe helpers equivalent to database_equity.py style
 # -----------------------------------------------------------------------------
@@ -348,6 +361,62 @@ def _publisher_tag(strategy_id, side: str, row_id: int) -> str:
     Each order gets a unique random tag (uuid4 hex prefix).
     """
     return uuid.uuid4().hex[:8]
+
+
+def _order_tag(order: Dict[str, Any]) -> Optional[str]:
+    """Read the publisher tag off a broker orderbook entry.
+
+    Kite returns both a singular `tag` and a plural `tags` list. They normally
+    agree, but `tag` has been observed empty while `tags` was populated — and an
+    order we fail to recognise is an order we silently drop. Prefer `tag`, fall
+    back to the first entry of `tags`.
+    """
+    tag = order.get("tag")
+    if tag:
+        return str(tag)
+    tags = order.get("tags") or []
+    if isinstance(tags, (list, tuple)) and tags and tags[0]:
+        return str(tags[0])
+    return None
+
+
+# Which order tables a basket type is allowed to claim orders from. A split
+# rebalance runs a SELL basket and a BUY basket on the same day against the same
+# orderbook, so each must only claim its own side or it would process — and
+# status-transition on — the other basket's orders.
+_BASKET_TYPE_MODELS = {
+    "REBALANCE_SELL": ("sell",),
+    "REBALANCE_BUY": ("buy",),
+    "EXIT": ("sell",),
+}
+
+
+def strategy_publisher_tags(db: Session, strategy_id, basket_type: Optional[str] = None) -> set:
+    """Every publisher_tag persisted on this strategy's order rows.
+
+    This — not publisher_payload — is the authoritative record of what we tagged.
+    The payload is a snapshot of a *filtered* dataframe (only rows with
+    actual_qty == 0 and updated_in_tradelog == False at build time), so it can be
+    a strict subset of the orders actually sitting in the broker's orderbook.
+
+    Safe to use unscoped by date: the broker orderbook only ever returns the
+    current day's orders, so stale tags from earlier cycles can never match.
+
+    basket_type restricts which side's tags are returned (see _BASKET_TYPE_MODELS);
+    omit it to get every side.
+    """
+    by_side = {"buy": LiveBuyStock, "sell": LiveSellStock, "circuit": LiveCircuitStock}
+    sides = _BASKET_TYPE_MODELS.get(basket_type or "", tuple(by_side))
+
+    tags = set()
+    for side in sides:
+        model = by_side[side]
+        rows = db.query(model.publisher_tag).filter(
+            model.automate_equity_ra_id == strategy_id,
+            model.publisher_tag.isnot(None),
+        ).all()
+        tags.update(r[0] for r in rows if r[0])
+    return tags
 
 
 def build_publisher_payload(strategy: LiveStrategy, buy_df: pd.DataFrame, sell_df: pd.DataFrame) -> Dict[str, Any]:
@@ -1486,6 +1555,7 @@ def _process_basket_orders(
     basket_tags: set,
     source: str,
     TODAY: date,
+    force: bool = False,
 ) -> None:
     """Bulk update order rows and transition strategy status.
 
@@ -1503,17 +1573,27 @@ def _process_basket_orders(
         basket_tags: Set of publisher_tags for this basket
         source: "orderbook" or "postback_fallback" (for logging)
         TODAY: Current date
+        force: EOD reconcile mode. Bypasses the "already processed" idempotency
+               guards so the broker's final state overwrites whatever the in-day
+               path guessed. The market is closed by then, so filled quantities
+               can no longer change — the orderbook is the last word.
     """
     TERMINAL_STATUSES = {"COMPLETE", "REJECTED", "CANCELLED"}
 
     # ── Guard: skip already-completed baskets (idempotency) ──
-    if basket.status in ("COMPLETE", "ALL_REJECTED"):
+    # force=True (EOD reconcile) deliberately re-processes them: the in-day path
+    # may have sealed the basket on incomplete data.
+    if basket.status in ("COMPLETE", "ALL_REJECTED") and not force:
         logger.info("[ProcessOrders] Basket %s already %s — skipping re-process | source=%s",
                     basket.id, basket.status, source)
         return
 
     # ── Guard: don't revert EXITED strategies ──
-    if strategy.status == LiveStatus.EXITED:
+    # The EOD reconcile still records their fills: an exit sell that only resolves
+    # after the in-day path closed the strategy is real money, and skipping it would
+    # leave the tradelog holding stock that was actually sold. The status transition
+    # below is what must not run — see the EXITED check on previous_status.
+    if strategy.status == LiveStatus.EXITED and not force:
         logger.info("[ProcessOrders] Strategy %s already EXITED — skipping | source=%s",
                     strategy.id, source)
         return
@@ -1544,10 +1624,19 @@ def _process_basket_orders(
             logger.warning("[ProcessOrders] No order row found for tag=%s — skipping", tag)
             continue
 
-        # Skip if already processed (idempotent)
-        if hasattr(row_obj, "broker_status") and row_obj.broker_status in TERMINAL_STATUSES:
+        # Skip if already processed (idempotent).
+        # force=True (EOD reconcile) overwrites terminal rows on purpose — an in-day
+        # timeout can stamp a row CANCELLED long before the broker actually resolves it.
+        if (
+            not force
+            and hasattr(row_obj, "broker_status")
+            and row_obj.broker_status in TERMINAL_STATUSES
+        ):
             logger.info("[ProcessOrders] Tag %s already terminal (%s) — skipping", tag, row_obj.broker_status)
             continue
+
+        prev_actual_qty = int(row_obj.actual_qty or 0)
+        prev_in_tradelog = bool(row_obj.updated_in_tradelog)
 
         # Update order row from the order data
         if kite_order_id:
@@ -1555,11 +1644,16 @@ def _process_basket_orders(
         row_obj.broker_status = status
         row_obj.broker_status_message = order.get("status_message")
 
+        # A partial fill is simply a smaller position — we do NOT chase the
+        # remainder with a circuit follow-up row. If the stock is still ranked at
+        # the next rebalance it gets topped up then, which is the same mechanism
+        # that already handles a fully-cancelled order.
+        row_obj.circuit = False
+
         if status == "COMPLETE" and filled_qty > 0:
             row_obj.actual_qty = filled_qty
             row_obj.actual_price = avg_price
             row_obj.actual_amount = round(filled_qty * avg_price, 2)
-            row_obj.circuit = filled_qty < int(row_obj.qty)
             row_obj.updated_in_tradelog = False
             logger.info("[ProcessOrders] FILLED | tag=%s symbol=%s qty=%d price=%.2f source=%s",
                         tag, row_obj.tradingsymbol, filled_qty, avg_price, source)
@@ -1568,7 +1662,6 @@ def _process_basket_orders(
             row_obj.actual_qty = 0
             row_obj.actual_price = 0.0
             row_obj.actual_amount = 0.0
-            row_obj.circuit = False
             row_obj.updated_in_tradelog = True
             logger.info("[ProcessOrders] REJECTED | tag=%s symbol=%s reason=%s source=%s",
                         tag, row_obj.tradingsymbol, order.get("status_message"), source)
@@ -1579,41 +1672,25 @@ def _process_basket_orders(
                 row_obj.actual_qty = partial_qty
                 row_obj.actual_price = avg_price
                 row_obj.actual_amount = round(partial_qty * avg_price, 2)
-                row_obj.circuit = True
                 row_obj.updated_in_tradelog = False
             else:
                 row_obj.actual_qty = 0
                 row_obj.actual_price = 0.0
                 row_obj.actual_amount = 0.0
-                row_obj.circuit = False  # No circuit row for unplaced/fully-cancelled orders — next rebalance handles it
                 row_obj.updated_in_tradelog = True
             logger.info("[ProcessOrders] CANCELLED | tag=%s symbol=%s partial_qty=%d source=%s",
                         tag, row_obj.tradingsymbol, partial_qty, source)
 
-        # Create circuit stock row if needed (partial fill or cancelled)
-        if row_obj.circuit and order_table in ("buy", "sell"):
-            lower_upper = "upper" if order_table == "buy" else "lower"
-            circuit_row = LiveCircuitStock(
-                automate_equity_ra_id=strategy.id,
-                tradingsymbol=row_obj.tradingsymbol,
-                isin=getattr(row_obj, "isin", ""),
-                date=TODAY,
-                qty=int(row_obj.qty) - int(row_obj.actual_qty or 0),
-                price=float(row_obj.price),
-                amount=round((int(row_obj.qty) - int(row_obj.actual_qty or 0)) * float(row_obj.price), 2),
-                weightage=getattr(row_obj, "weightage", 0.0),
-                actual_qty=0,
-                actual_price=0.0,
-                actual_amount=0.0,
-                stoploss=getattr(row_obj, "stoploss", 0.0),
-                volatility=getattr(row_obj, "volatility", 0.0),
-                order_id=None,
-                updated_in_tradelog=False,
-                lower_upper=lower_upper,
-                action=order_table,
-                active=True,
-            )
-            db.add(circuit_row)
+        # ── EOD reconcile: only disturb updated_in_tradelog if the quantity
+        # actually changed. Re-running the daily job must be a no-op, otherwise
+        # re-opening an already-consumed row would duplicate its tradelog entry.
+        if force:
+            new_actual_qty = int(row_obj.actual_qty or 0)
+            if new_actual_qty == prev_actual_qty:
+                row_obj.updated_in_tradelog = prev_in_tradelog
+            else:
+                logger.warning("[ProcessOrders] EOD revision | tag=%s symbol=%s qty %d → %d | source=%s",
+                               tag, row_obj.tradingsymbol, prev_actual_qty, new_actual_qty, source)
 
     # ── Step 2: Client ID lock from orderbook data ──
     first_order = next(iter(orders_data.values()), {})
@@ -1629,13 +1706,18 @@ def _process_basket_orders(
     db.flush()
 
     # ── Step 3: Count filled vs rejected for status transition ──
+    # Count on actual_qty, NOT broker_status == "COMPLETE". A partially filled order
+    # settles as CANCELLED while still carrying a real quantity, and it is a real
+    # position — counting only COMPLETE would report "nothing filled" for a basket
+    # that actually bought stock, and bounce the strategy into ALL_REJECTED /
+    # REBALANCE_READY, risking a duplicate order on the next attempt.
     filled_buy = db.query(LiveBuyStock).filter(
         LiveBuyStock.publisher_tag.in_(basket_tags),
-        LiveBuyStock.broker_status == "COMPLETE",
+        LiveBuyStock.actual_qty > 0,
     ).count()
     filled_sell = db.query(LiveSellStock).filter(
         LiveSellStock.publisher_tag.in_(basket_tags),
-        LiveSellStock.broker_status == "COMPLETE",
+        LiveSellStock.actual_qty > 0,
     ).count()
     total_filled = filled_buy + filled_sell
 
@@ -1656,6 +1738,17 @@ def _process_basket_orders(
     # ── Step 4: Strategy status transition ──
     previous_status = strategy.status
 
+    # An already-EXITED strategy is terminal. Its rows were just refreshed above so
+    # the tradelog gets any late fills, but nothing may reopen it — falling through
+    # the chain below would send it back to ACTIVE and resurrect a closed strategy.
+    if previous_status == LiveStatus.EXITED:
+        basket.raw_postback = {"source": source, "processed_at": str(datetime.utcnow())}
+        db.commit()
+        db.refresh(strategy)
+        logger.info("[ProcessOrders] Strategy %s is EXITED — rows refreshed, status left unchanged | source=%s",
+                    strategy.id, source)
+        return
+
     if total_filled == 0:
         # ALL orders rejected/cancelled — no fills at all
         if previous_status in (LiveStatus.EXIT_PENDING_USER_APPROVAL, LiveStatus.EXIT_PROCESSING):
@@ -1672,8 +1765,27 @@ def _process_basket_orders(
         logger.warning("[ProcessOrders] ALL orders failed | strategy=%s prev=%s new=%s reasons=%s source=%s",
                        strategy.id, previous_status.value, strategy.status.value, rejected_orders, source)
     elif previous_status in (LiveStatus.EXIT_PENDING_USER_APPROVAL, LiveStatus.EXIT_PROCESSING):
-        strategy.status = LiveStatus.EXITED
-        strategy.subscription_active = False
+        # Only close the strategy if the exit actually sold everything. Every other
+        # stage can lean on "the next rebalance will pick it up" — exit cannot, because
+        # there is no next cycle. Going EXITED on a partial sale strands the remainder:
+        # it stays active in the tradelog but the strategy drops out of the daily MTM
+        # set, so the position freezes and is never marked to market again.
+        unsold = db.query(LiveSellStock).filter(
+            LiveSellStock.publisher_tag.in_(basket_tags),
+            func.coalesce(LiveSellStock.actual_qty, 0) < LiveSellStock.qty,
+        ).all()
+        if unsold:
+            strategy.status = LiveStatus.ACTIVE
+            strategy.subscription_active = True
+            logger.warning("[ProcessOrders] EXIT INCOMPLETE — %d holding(s) not fully sold, keeping strategy %s ACTIVE "
+                           "so the user can exit again | leftovers=%s | source=%s",
+                           len(unsold), strategy.id,
+                           [(r.tradingsymbol, int(r.qty) - int(r.actual_qty or 0)) for r in unsold], source)
+        else:
+            strategy.status = LiveStatus.EXITED
+            strategy.subscription_active = False
+            logger.info("[ProcessOrders] EXIT COMPLETE | strategy=%s — all holdings sold | source=%s",
+                        strategy.id, source)
     elif basket.basket_type == "REBALANCE_SELL":
         strategy.status = LiveStatus.REBALANCE_SELL_COMPLETE
         logger.info("[ProcessOrders] REBALANCE_SELL complete | strategy=%s — now awaiting BUY basket | source=%s",
@@ -2589,12 +2701,12 @@ class LiveInvestmentService:
                     LiveBrokerAccount.id == strategy.broker_account_id,
                 ).first()
                 if broker_account and broker_account.broker_user_id:
-                    if client_id != broker_account.broker_user_id:
+                    if norm_client_id(client_id) != norm_client_id(broker_account.broker_user_id):
                         strategy.status = LiveStatus.ACCOUNT_MISMATCH
                         db.commit()
                         return {"status": "ok", "detail": "account_mismatch"}
-                strategy.locked_client_id = client_id
-            elif strategy.locked_client_id != client_id:
+                strategy.locked_client_id = norm_client_id(client_id)
+            elif norm_client_id(strategy.locked_client_id) != norm_client_id(client_id):
                 strategy.status = LiveStatus.ACCOUNT_MISMATCH
                 db.commit()
                 return {"status": "ok", "detail": "account_mismatch"}
@@ -2657,6 +2769,7 @@ class LiveInvestmentService:
         basket_id: str,
         retry_count: int = 0,
         TODAY: Optional[date] = None,
+        force: bool = False,
     ) -> dict:
         """Verify all basket orders from kite.orders() and bulk-update if all terminal.
 
@@ -2669,6 +2782,10 @@ class LiveInvestmentService:
         4. If all orders terminal → bulk update actual_qty/price/status → status transition
         5. If not all terminal → reschedule (up to 20 retries × 5s = ~100s)
         6. If token/API fails → fall back to stored postback data
+
+        force=True switches this into EOD reconcile mode (see eod_reconcile_baskets):
+        no retries, no postback fallback, and the already-processed guards are
+        bypassed so the broker's final state overwrites the in-day guess.
 
         Returns dict with processing result.
         """
@@ -2683,8 +2800,9 @@ class LiveInvestmentService:
             logger.error("[OrderbookVerify] Basket %s not found", basket_id)
             return {"status": "error", "detail": "basket_not_found"}
 
-        # Early guard: skip already-processed baskets (saves a wasted kite.orders() call)
-        if basket.status in ("COMPLETE", "ALL_REJECTED"):
+        # Early guard: skip already-processed baskets (saves a wasted kite.orders() call).
+        # EOD reconcile must look anyway — "processed" may mean "processed from a guess".
+        if basket.status in ("COMPLETE", "ALL_REJECTED") and not force:
             logger.info("[OrderbookVerify] Basket %s already %s — skipping", basket_id, basket.status)
             return {"status": "ok", "detail": "already_processed"}
 
@@ -2695,20 +2813,42 @@ class LiveInvestmentService:
             logger.error("[OrderbookVerify] Strategy not found for basket %s", basket_id)
             return {"status": "error", "detail": "strategy_not_found"}
 
-        # Early guard: don't revert EXITED strategies
-        if strategy.status == LiveStatus.EXITED:
+        # Early guard: don't revert EXITED strategies.
+        # EOD reconcile still looks, so a late-settling exit sell is recorded; the
+        # status itself is protected inside _process_basket_orders.
+        if strategy.status == LiveStatus.EXITED and not force:
             logger.info("[OrderbookVerify] Strategy %s already EXITED — skipping", strategy.id)
             return {"status": "ok", "detail": "already_exited"}
 
-        # Extract basket's publisher_tags
-        basket_tags = set()
+        # ── Intent: the tags we asked the broker to place ──
+        # publisher_payload is a filtered snapshot, so treat it as the record of
+        # INTENT only — useful for spotting orders that never reached the broker,
+        # but not trustworthy as the definitive list of what is ours.
+        intent_tags = set()
         if basket.publisher_payload:
-            basket_tags = {
+            intent_tags = {
                 o.get("tag") for o in (basket.publisher_payload.get("basket") or [])
                 if o.get("tag")
             }
-        if not basket_tags:
-            logger.warning("[OrderbookVerify] No tags in basket %s — nothing to verify", basket_id)
+
+        # ── Ownership: tags persisted on this strategy's order rows, restricted to
+        # this basket's side, minus anything another basket explicitly claims.
+        # Used to adopt orderbook entries the payload forgot to mention.
+        owned_tags = strategy_publisher_tags(db, strategy.id, basket.basket_type)
+
+        sibling_baskets = db.query(LivePublisherBasket).filter(
+            LivePublisherBasket.automate_equity_ra_id == strategy.id,
+            LivePublisherBasket.id != basket.id,
+        ).all()
+        for sibling in sibling_baskets:
+            if sibling.publisher_payload:
+                owned_tags -= {
+                    o.get("tag") for o in (sibling.publisher_payload.get("basket") or [])
+                    if o.get("tag")
+                }
+
+        if not intent_tags and not owned_tags:
+            logger.warning("[OrderbookVerify] No tags for basket %s — nothing to verify", basket_id)
             return {"status": "ok", "detail": "no_tags"}
 
         # ── Try fetching orderbook from broker API ──
@@ -2724,24 +2864,46 @@ class LiveInvestmentService:
                     adapter = get_publisher_adapter(strategy.broker)
                     full_orderbook = adapter.fetch_orderbook(access_token)
 
-                    # Filter by our basket's tags only
+                    # Claim every orderbook entry that is ours — by intent OR by a
+                    # publisher_tag we persisted. Asking "which of these are mine?"
+                    # rather than "where are the ones I expected?" means an order
+                    # missing from the payload can no longer be silently dropped.
                     orderbook_orders = {}
                     for order in full_orderbook:
-                        tag = order.get("tag")
-                        if tag and tag in basket_tags:
+                        tag = _order_tag(order)
+                        if tag and (tag in intent_tags or tag in owned_tags):
                             orderbook_orders[tag] = order
 
-                    logger.info("[OrderbookVerify] Fetched %d total orders, %d match our tags | basket=%s",
+                    claimed_beyond_intent = set(orderbook_orders) - intent_tags
+                    if claimed_beyond_intent:
+                        logger.warning("[OrderbookVerify] %d order(s) claimed via publisher_tag but absent from "
+                                       "basket payload — payload is out of sync | basket=%s tags=%s",
+                                       len(claimed_beyond_intent), basket_id, sorted(claimed_beyond_intent))
+
+                    logger.info("[OrderbookVerify] Fetched %d total orders, %d are ours | basket=%s",
                                 len(full_orderbook), len(orderbook_orders), basket_id)
             except Exception as e:
                 logger.error("[OrderbookVerify] Failed to fetch orderbook for basket %s: %s", basket_id, e)
                 orderbook_orders = None  # Fall through to fallback
 
+        # ── EOD reconcile with no orderbook: do nothing at all ──
+        # A failed read tells us nothing about what filled. Writing zeros from it is
+        # exactly the mistake that loses real fills, so leave every row untouched and
+        # make the failure loud instead. Tomorrow's run picks it up.
+        if force and orderbook_orders is None:
+            logger.error("[EODReconcile] Could not fetch orderbook for basket %s (token missing/expired or API down) "
+                         "— leaving all order rows UNTOUCHED. Fills for this basket are unverified.", basket_id)
+            return {"status": "error", "detail": "orderbook_unavailable_rows_untouched"}
+
         # ── Check if all basket orders are terminal ──
         if orderbook_orders is not None:
-            # We have orderbook data — check if all tagged orders are terminal
             found_tags = set(orderbook_orders.keys())
-            missing_tags = basket_tags - found_tags
+            # Anything we intended to place but cannot see in the orderbook. Tags we
+            # claimed via publisher_tag are by definition present, so only intent can
+            # go missing here.
+            missing_tags = intent_tags - found_tags
+            # Process everything we intended plus everything we claimed.
+            basket_tags = intent_tags | found_tags
 
             all_terminal = True
             for tag in found_tags:
@@ -2757,7 +2919,7 @@ class LiveInvestmentService:
                 all_terminal = False
 
             if not all_terminal:
-                if retry_count < MAX_RETRIES:
+                if not force and retry_count < MAX_RETRIES:
                     # Reschedule — not all orders are terminal yet
                     from app.tasks.orderbook_sync_tasks import verify_basket_from_orderbook_task
                     verify_basket_from_orderbook_task.apply_async(
@@ -2767,45 +2929,58 @@ class LiveInvestmentService:
                     logger.info("[OrderbookVerify] Not all terminal (%d/%d found, %d missing) — retry %d/%d | basket=%s",
                                 len(found_tags), len(basket_tags), len(missing_tags), retry_count + 1, MAX_RETRIES, basket_id)
                     return {"status": "ok", "detail": "rescheduled", "retry": retry_count + 1}
-                else:
-                    # ── Max retries reached: treat missing/non-terminal tags as CANCELLED ──
-                    # Orders that never appeared in the orderbook were never placed by the
-                    # broker. Waiting longer won't help — proceed with what we have so the
-                    # strategy isn't stuck forever. Next rebalance will pick up any missing stocks.
-                    logger.warning("[OrderbookVerify] Max retries (%d) reached — treating %d missing tags as CANCELLED | basket=%s",
-                                   MAX_RETRIES, len(missing_tags), basket_id)
-                    for mtag in missing_tags:
-                        orderbook_orders[mtag] = {
-                            "tag": mtag,
-                            "order_id": "",
-                            "status": "CANCELLED",
-                            "filled_quantity": 0,
-                            "average_price": 0,
-                            "tradingsymbol": "",
-                            "transaction_type": "",
-                            "status_message": "Order never placed — not found in orderbook after max retries",
-                        }
-                    # Also handle found-but-non-terminal orders (e.g. stuck in OPEN)
-                    for tag in found_tags:
-                        status = (orderbook_orders[tag].get("status") or "").upper()
-                        if status == "CANCEL":
-                            status = "CANCELLED"
-                        if status not in TERMINAL_STATUSES:
-                            logger.warning("[OrderbookVerify] Tag %s still non-terminal (%s) after max retries — treating as CANCELLED | basket=%s",
-                                           tag, status, basket_id)
-                            orderbook_orders[tag]["status"] = "CANCELLED"
-                            orderbook_orders[tag]["filled_quantity"] = 0
-                            orderbook_orders[tag]["status_message"] = f"Order stuck in {status} — treated as CANCELLED after max retries"
-                    # Fall through to process all orders
 
-            # ── ALL TERMINAL — Bulk update from orderbook ──
-            source = "orderbook"
+                # ── Settle with whatever the broker actually reports ──
+                # In force mode the market is closed, so filled quantities are final.
+                # In retry-exhausted mode we settle early rather than wedge the strategy;
+                # either way the EOD reconcile gets the last word.
+                reason = "EOD reconcile" if force else f"max retries ({MAX_RETRIES})"
+
+                # Orders we intended but never saw: never placed by the broker. Nothing
+                # filled, nothing to record — the next rebalance re-picks the stock if
+                # it is still ranked.
+                if missing_tags:
+                    logger.warning("[OrderbookVerify] %s — %d intended order(s) NEVER PLACED (absent from orderbook) "
+                                   "| basket=%s tags=%s", reason, len(missing_tags), basket_id, sorted(missing_tags))
+                for mtag in missing_tags:
+                    orderbook_orders[mtag] = {
+                        "tag": mtag,
+                        "order_id": "",
+                        "status": "CANCELLED",
+                        "filled_quantity": 0,
+                        "average_price": 0,
+                        "tradingsymbol": "",
+                        "transaction_type": "",
+                        "status_message": f"Order never placed — not found in orderbook ({reason})",
+                    }
+
+                # Orders still OPEN: keep the REAL filled quantity. A partial fill is a
+                # real position and must never be zeroed — only the status label is
+                # unresolved, and after 15:30 the quantity cannot change anyway.
+                for tag in found_tags:
+                    status = (orderbook_orders[tag].get("status") or "").upper()
+                    if status == "CANCEL":
+                        status = "CANCELLED"
+                    if status not in TERMINAL_STATUSES:
+                        real_filled = int(orderbook_orders[tag].get("filled_quantity") or 0)
+                        logger.warning("[OrderbookVerify] Tag %s still %s at %s — settling with filled_quantity=%d | basket=%s",
+                                       tag, status, reason, real_filled, basket_id)
+                        orderbook_orders[tag]["status"] = "CANCELLED"
+                        orderbook_orders[tag]["status_message"] = (
+                            f"Order still {status} at {reason} — settled with filled qty {real_filled}"
+                        )
+                # Fall through to process all orders
+
+            # ── Bulk update from orderbook ──
+            source = "eod_orderbook" if force else "orderbook"
             orders_data = orderbook_orders  # {tag: order_dict}
         else:
             # ── FALLBACK: No orderbook data available — use stored postback data ──
+            # Only reachable in the in-day path; EOD returns early rather than guess.
             logger.warning("[OrderbookVerify] No orderbook data — falling back to postback data | basket=%s", basket_id)
             source = "postback_fallback"
             orders_data = {}  # {tag: order_dict from postback}
+            basket_tags = intent_tags
 
             for tag in basket_tags:
                 # Try to find stored postback data on each order row
@@ -2863,19 +3038,23 @@ class LiveInvestmentService:
                             "transaction_type": "",
                             "status_message": "Order never placed — no postback received after max retries",
                         }
-                    # Also handle non-terminal postback orders
+                    # Also handle non-terminal postback orders — keeping the real
+                    # filled quantity. The EOD reconcile will revise this from the
+                    # orderbook; zeroing it here would destroy a genuine partial fill.
                     for tag in list(orders_data.keys()):
                         status = (orders_data[tag].get("status") or "").upper()
                         if status not in TERMINAL_STATUSES:
-                            logger.warning("[OrderbookVerify] Fallback: tag %s non-terminal (%s) — treating as CANCELLED | basket=%s",
-                                           tag, status, basket_id)
+                            real_filled = int(orders_data[tag].get("filled_quantity") or 0)
+                            logger.warning("[OrderbookVerify] Fallback: tag %s non-terminal (%s) — settling with filled_quantity=%d | basket=%s",
+                                           tag, status, real_filled, basket_id)
                             orders_data[tag]["status"] = "CANCELLED"
-                            orders_data[tag]["filled_quantity"] = 0
-                            orders_data[tag]["status_message"] = f"Order stuck in {status} — treated as CANCELLED after max retries"
+                            orders_data[tag]["status_message"] = (
+                                f"Order still {status} after max retries — settled with filled qty {real_filled}"
+                            )
                     # Fall through to process all orders
 
         # ── Process all orders — bulk update from orderbook/postback data ──
-        _process_basket_orders(db, strategy, basket, orders_data, basket_tags, source, TODAY)
+        _process_basket_orders(db, strategy, basket, orders_data, basket_tags, source, TODAY, force=force)
 
         # Clear Redis debounce key
         LiveInvestmentService._redis_client.delete(f"orderbook_verify:{basket_id}")
@@ -2889,6 +3068,51 @@ class LiveInvestmentService:
             "detail": f"processed_from_{source}",
             "strategy_status": strategy.status.value if hasattr(strategy.status, 'value') else str(strategy.status),
         }
+
+    @staticmethod
+    def eod_reconcile_baskets(db: Session, TODAY: Optional[date] = None) -> int:
+        """Settle every basket placed today against the broker's final orderbook.
+
+        Runs at the top of the daily job, BEFORE the tradelog and equity curve, so
+        those read settled numbers rather than whatever the in-day path guessed.
+
+        Why this is the last word: the market closes at 15:30, so filled quantities
+        can no longer change by the time this runs. An order still showing OPEN is
+        worth exactly the quantity it has already filled — only the status label is
+        outstanding, and that label does not affect the position.
+
+        Whatever filled is recorded. Whatever did not fill is left alone; if the
+        stock is still ranked at the next rebalance it gets bought then.
+
+        Returns the number of baskets reconciled.
+        """
+        TODAY = TODAY or date.today()
+
+        baskets = db.query(LivePublisherBasket).filter(
+            func.date(LivePublisherBasket.created_at) == TODAY,
+            LivePublisherBasket.status != "CANCELLED",
+        ).all()
+
+        if not baskets:
+            logger.info("[EODReconcile] No baskets created on %s — nothing to reconcile", TODAY)
+            return 0
+
+        count = 0
+        for basket in baskets:
+            try:
+                result = LiveInvestmentService.verify_and_process_from_orderbook(
+                    db, basket_id=str(basket.id), retry_count=0, TODAY=TODAY, force=True,
+                )
+                logger.info("[EODReconcile] Basket %s → %s", basket.id, result.get("detail"))
+                if str(result.get("detail", "")).startswith("processed_from"):
+                    count += 1
+            except Exception:
+                logger.exception("[EODReconcile] Error reconciling basket %s", basket.id)
+                db.rollback()
+                continue
+
+        logger.info("[EODReconcile] Reconciled %d/%d baskets for %s", count, len(baskets), TODAY)
+        return count
 
     @staticmethod
     def duplicate_strategy(db: Session, strategy_id, *, broker_account_id, strategy_name: Optional[str], aum: Optional[float]) -> LiveStrategy:
@@ -3164,6 +3388,12 @@ class LiveInvestmentService:
                 account_tags[ba_id] = set()
                 account_strategy_map[ba_id] = strategy
 
+            # Tags actually persisted on the strategy's order rows — the complete
+            # record. publisher_payload is a filtered snapshot and can miss orders
+            # that were placed, which would silently drop them from the backup.
+            account_tags[ba_id].update(strategy_publisher_tags(db, strategy.id))
+
+            # Intent from the payload too, so a row-less tag still gets captured.
             if basket.publisher_payload:
                 for o in (basket.publisher_payload.get("basket") or []):
                     tag = o.get("tag")
@@ -3197,7 +3427,7 @@ class LiveInvestmentService:
                 # Filter to only our tagged orders
                 filtered = [
                     order for order in full_orderbook
-                    if order.get("tag") in tags
+                    if _order_tag(order) in tags
                 ]
 
                 # Serialize datetime objects for JSON storage
@@ -3486,7 +3716,7 @@ class LiveInvestmentService:
 
         # Verify broker user_id matches (prevent accidental login with wrong account)
         zerodha_user_id = token_data.get("user_id")
-        if broker_account.broker_user_id and zerodha_user_id != broker_account.broker_user_id:
+        if broker_account.broker_user_id and norm_client_id(zerodha_user_id) != norm_client_id(broker_account.broker_user_id):
             strategy.status = LiveStatus.ACCOUNT_MISMATCH
             broker_account.auth_status = "ACCOUNT_MISMATCH"
             db.commit()

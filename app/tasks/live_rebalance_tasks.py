@@ -97,6 +97,29 @@ def daily_equity_curve_update(today: date | None = None) -> int:
     mtm_logger.info("[DailyMTM] Starting daily_equity_curve_update for %s", today)
     db = SessionLocal()
     try:
+        # ── Store the raw orderbook backup FIRST ──
+        # Capture the broker's evidence before anything else runs, so it survives
+        # a failure in a later step.
+        try:
+            backup_count = LiveInvestmentService.store_daily_orderbook_backup(db, today)
+            if backup_count:
+                mtm_logger.info("[DailyMTM] Stored orderbook backups for %d broker_accounts", backup_count)
+        except Exception:
+            mtm_logger.exception("[DailyMTM] Orderbook backup failed — non-blocking")
+
+        # ── Settle today's baskets against the broker's final orderbook ──
+        # MUST run before the tradelog/equity curve below. The in-day verifier gives
+        # up ~100s after the first terminal postback, which is far too early for a
+        # LIMIT order on an illiquid stock — it can fill hours later. This overwrites
+        # those guesses with what actually filled. The market closed at 15:30, so the
+        # quantities read here are final.
+        try:
+            eod_count = LiveInvestmentService.eod_reconcile_baskets(db, today)
+            if eod_count:
+                mtm_logger.info("[DailyMTM] EOD reconcile settled %d baskets", eod_count)
+        except Exception:
+            mtm_logger.exception("[DailyMTM] EOD reconcile failed — non-blocking")
+
         count = LiveInvestmentService.daily_equity_curve_update(db, today)
         mtm_logger.info("[DailyMTM] Completed — updated %d strategies for %s", count, today)
 
@@ -109,14 +132,6 @@ def daily_equity_curve_update(today: date | None = None) -> int:
                 mtm_logger.info("[DailyMTM] Safety net resolved %d stuck strategies", safety_count)
         except Exception:
             mtm_logger.exception("[DailyMTM] Safety net failed — non-blocking")
-
-        # Store daily orderbook backup (tag-filtered JSON per broker_account)
-        try:
-            backup_count = LiveInvestmentService.store_daily_orderbook_backup(db, today)
-            if backup_count:
-                mtm_logger.info("[DailyMTM] Stored orderbook backups for %d broker_accounts", backup_count)
-        except Exception:
-            mtm_logger.exception("[DailyMTM] Orderbook backup failed — non-blocking")
 
         # Auto-cancel strategies stuck in PENDING_USER_APPROVAL with no fills
         timeout_count = LiveInvestmentService.auto_timeout_stale_strategies(db, today)

@@ -1,7 +1,7 @@
 from datetime import date
 from typing import Optional, List, Dict, Any
 from uuid import UUID
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 
@@ -19,7 +19,43 @@ class BrokerAccountResponse(BaseModel):
     strategies: List[BrokerLinkedStrategy] = []
 
 
-class GoLiveRequest(BaseModel):
+class BrokerSelectionRequest(BaseModel):
+    """Inline broker selection shared by Go Live and platform 'Invest Now'.
+
+    These three fields are typed by hand into the Go Live popup, so the same
+    Zerodha account arrives as 'xyz1234', 'XYZ1234 ' and 'XYZ1234' on different
+    attempts. The broker-account upsert looks accounts up by broker_user_id, so
+    unnormalized input misses the user's own account and falls through to an
+    INSERT that collides on the (user_id, broker, label) unique index.
+    """
+    broker: str = Field(default="zerodha", description="Broker selection dropdown")
+    broker_user_id: str = Field(description="Broker User ID / expected client ID")
+    broker_account_label: Optional[str] = Field(default=None, description="Account Nickname / Label")
+
+    @field_validator("broker")
+    @classmethod
+    def _normalize_broker(cls, v: str) -> str:
+        return v.strip().lower()
+
+    @field_validator("broker_user_id")
+    @classmethod
+    def _normalize_broker_user_id(cls, v: str) -> str:
+        # Zerodha client IDs are uppercase alphanumeric.
+        v = v.strip().upper()
+        if not v:
+            raise ValueError("broker_user_id must not be blank")
+        return v
+
+    @field_validator("broker_account_label")
+    @classmethod
+    def _normalize_label(cls, v: Optional[str]) -> Optional[str]:
+        # A whitespace-only nickname is the same as not supplying one, which
+        # lets it fall back to broker_user_id.
+        v = (v or "").strip()
+        return v or None
+
+
+class GoLiveRequest(BrokerSelectionRequest):
     user_id: str
     screener_version_id: UUID
     strategy_name: str
@@ -30,13 +66,8 @@ class GoLiveRequest(BaseModel):
     rebalance_frequency: str = Field(pattern="^(weekly|monthly)$")
     aum: float = Field(gt=0)
 
-    # Broker selection (inline — no separate broker-accounts step)
-    broker: str = Field(default="zerodha", description="Broker selection dropdown")
-    broker_user_id: str = Field(description="Broker User ID / expected client ID")
-    broker_account_label: Optional[str] = Field(default=None, description="Account Nickname / Label")
 
-
-class PlatformInvestRequest(BaseModel):
+class PlatformInvestRequest(BrokerSelectionRequest):
     """User clicks 'Invest Now' on a platform (ready-to-use) strategy.
 
     Same fields as GoLiveRequest, except the source is a platform SCREENER
@@ -53,11 +84,6 @@ class PlatformInvestRequest(BaseModel):
     wrh: int = Field(gt=0, description="Worst Hold Rank")
     rebalance_frequency: str = Field(pattern="^(weekly|monthly)$")
     aum: float = Field(gt=0)
-
-    # Broker selection (inline — no separate broker-accounts step)
-    broker: str = Field(default="zerodha", description="Broker selection dropdown")
-    broker_user_id: str = Field(description="Broker User ID / expected client ID")
-    broker_account_label: Optional[str] = Field(default=None, description="Account Nickname / Label")
 
 
 class LiveStrategyResponse(BaseModel):

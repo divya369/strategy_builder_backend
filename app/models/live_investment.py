@@ -11,7 +11,7 @@ import enum
 import uuid
 from sqlalchemy import (
     Column, Integer, String, Float, Boolean, Date, DateTime, ForeignKey,
-    Enum, Text, text, func, UniqueConstraint
+    Enum, Index, Text, text, func, UniqueConstraint
 )
 from sqlalchemy.orm import relationship
 from sqlalchemy.dialects.postgresql import UUID, JSONB
@@ -52,7 +52,15 @@ class LiveBrokerAccount(Base):
     """
     __tablename__ = "broker_account"
     __table_args__ = (
-        UniqueConstraint("user_id", "broker", "broker_account_label", name="uq_broker_account_user_broker_label"),
+        # Partial on is_active: deletion is a soft delete, and a full unique
+        # constraint let a deleted row keep its nickname reserved forever —
+        # every later attempt to reuse that nickname died on the constraint.
+        Index(
+            "uq_broker_account_user_broker_label_active",
+            "user_id", "broker", "broker_account_label",
+            unique=True,
+            postgresql_where=text("is_active"),
+        ),
     )
 
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4, nullable=False)

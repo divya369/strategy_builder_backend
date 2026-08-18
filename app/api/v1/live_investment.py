@@ -2,6 +2,8 @@ import json
 import logging
 from uuid import UUID
 from datetime import date
+from sqlalchemy import func
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, joinedload
 from app.core.database import get_db
 from typing import Any, Dict, List, Optional
@@ -241,13 +243,22 @@ def go_live(payload: GoLiveRequest, db: Session = Depends(get_db), _mkt=Depends(
     Broker account is created-or-found inline.
     """
     # ── Inline broker account upsert (replaces old POST /broker-accounts) ──
+    # broker / broker_user_id / broker_account_label arrive trimmed and
+    # case-folded from GoLiveRequest.
     broker_value = payload.broker
     label = payload.broker_account_label or payload.broker_user_id  # Default label to broker_user_id
 
+    # Rows written before that normalization existed may still hold 'xyz1234'
+    # or 'XYZ1234 ', so match them case/whitespace-insensitively. An exact
+    # match would miss the user's own account and drop us into the INSERT
+    # branch, where the label unique index rejects the duplicate.
+    same_broker = func.lower(func.btrim(LiveBrokerAccount.broker)) == broker_value
+    same_broker_user_id = func.upper(func.btrim(LiveBrokerAccount.broker_user_id)) == payload.broker_user_id
+
     # Guard: is this broker_user_id already registered by a DIFFERENT active user?
     conflict = db.query(LiveBrokerAccount).filter(
-        LiveBrokerAccount.broker_user_id == payload.broker_user_id,
-        LiveBrokerAccount.broker == broker_value,
+        same_broker_user_id,
+        same_broker,
         LiveBrokerAccount.user_id != payload.user_id,
         LiveBrokerAccount.is_active == True,
     ).first()
@@ -264,26 +275,65 @@ def go_live(payload: GoLiveRequest, db: Session = Depends(get_db), _mkt=Depends(
     # Find existing account for THIS user by broker_user_id (not label)
     existing_account = db.query(LiveBrokerAccount).filter(
         LiveBrokerAccount.user_id == payload.user_id,
-        LiveBrokerAccount.broker == broker_value,
-        LiveBrokerAccount.broker_user_id == payload.broker_user_id,
+        same_broker,
+        same_broker_user_id,
         LiveBrokerAccount.is_active == True,
     ).first()
-    if existing_account:
-        broker_account = existing_account
-        # Update label if user changed it
-        if broker_account.broker_account_label != label:
-            broker_account.broker_account_label = label
-            db.commit()
-    else:
-        broker_account = LiveBrokerAccount(
-            user_id=payload.user_id,
-            broker=broker_value,
-            broker_account_label=label,
-            broker_user_id=payload.broker_user_id,
+
+    # Accounts are looked up by broker_user_id but made unique by label, so a
+    # nickname the user already spent on a DIFFERENT account would otherwise
+    # only surface as an IntegrityError — a bare 500 with nothing the UI can
+    # show. Resolve it here into something the user can act on.
+    label_owner = db.query(LiveBrokerAccount).filter(
+        LiveBrokerAccount.user_id == payload.user_id,
+        same_broker,
+        LiveBrokerAccount.broker_account_label == label,
+        LiveBrokerAccount.is_active == True,
+    ).first()
+    if label_owner is not None and (existing_account is None or label_owner.id != existing_account.id):
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": f"You already use the nickname '{label}' for broker user id "
+                           f"{label_owner.broker_user_id}. Please choose a different nickname.",
+                "broker_account_label": label,
+                "broker_user_id": label_owner.broker_user_id,
+            },
         )
-        db.add(broker_account)
-        db.commit()
-        db.refresh(broker_account)
+
+    try:
+        if existing_account:
+            broker_account = existing_account
+            # Update label if user changed it
+            if broker_account.broker_account_label != label:
+                broker_account.broker_account_label = label
+            # Heal legacy casing/whitespace in place, so locked_client_id and the
+            # postback client-id check downstream compare against clean values.
+            broker_account.broker = broker_value
+            broker_account.broker_user_id = payload.broker_user_id
+            db.commit()
+        else:
+            broker_account = LiveBrokerAccount(
+                user_id=payload.user_id,
+                broker=broker_value,
+                broker_account_label=label,
+                broker_user_id=payload.broker_user_id,
+            )
+            db.add(broker_account)
+            db.commit()
+            db.refresh(broker_account)
+    except IntegrityError:
+        # Backstop for the double-submit race the pre-check above cannot close.
+        db.rollback()
+        logger.warning("[GoLive] Broker account upsert conflicted for user %s label %r", payload.user_id, label)
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": f"The nickname '{label}' is already in use for another of your "
+                           f"{broker_value} accounts. Please choose a different nickname.",
+                "broker_account_label": label,
+            },
+        )
 
     # ── Guard: same broker_user_id + screener_version_id already running? ──
     # Only truly running strategies should block. DRAFT/PREVIEW_READY/CANCELLED
@@ -294,9 +344,12 @@ def go_live(payload: GoLiveRequest, db: Session = Depends(get_db), _mkt=Depends(
         LiveStatus.REBALANCE_SELL_COMPLETE,
         LiveStatus.EXIT_PENDING_USER_APPROVAL,
     }
+    # locked_client_id is compared case/whitespace-insensitively for the same
+    # reason as above — a strategy locked to 'xyz1234' must still block a retry
+    # that types 'XYZ1234', or this guard is trivially bypassed.
     duplicate = db.query(LiveStrategy).filter(
         LiveStrategy.screener_version_id == payload.screener_version_id,
-        LiveStrategy.locked_client_id == payload.broker_user_id,
+        func.upper(func.btrim(LiveStrategy.locked_client_id)) == payload.broker_user_id,
         LiveStrategy.status.in_(running_statuses),
     ).first()
 
