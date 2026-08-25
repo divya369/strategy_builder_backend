@@ -1749,6 +1749,31 @@ def _process_basket_orders(
                     strategy.id, source)
         return
 
+    # A basket that a LATER basket has already settled is history. Its rows were
+    # refreshed above so a late fill still reaches the tradelog, but the chain below
+    # picks the new status from basket_type alone, with no notion of when the basket
+    # ran. Replaying a settled REBALANCE_SELL after its REBALANCE_BUY has completed
+    # would therefore drag an ACTIVE strategy back to REBALANCE_SELL_COMPLETE — and
+    # prepare_due_rebalances only looks at ACTIVE, so the strategy would silently sit
+    # out its next rebalance. The EOD reconcile replays every basket of the day, in
+    # unspecified order, which is exactly when this happens.
+    superseded_by = db.query(LivePublisherBasket).filter(
+        LivePublisherBasket.automate_equity_ra_id == strategy.id,
+        LivePublisherBasket.id != basket.id,
+        LivePublisherBasket.created_at > basket.created_at,
+        LivePublisherBasket.status.in_(("COMPLETE", "ALL_REJECTED")),
+    ).order_by(LivePublisherBasket.created_at.desc()).first()
+    if superseded_by:
+        basket.raw_postback = {"source": source, "processed_at": str(datetime.utcnow())}
+        basket.status = "ALL_REJECTED" if total_filled == 0 else "COMPLETE"
+        db.commit()
+        db.refresh(strategy)
+        logger.info("[ProcessOrders] Basket %s (%s) superseded by later settled basket %s (%s) — rows refreshed, "
+                    "strategy %s left at %s | source=%s",
+                    basket.id, basket.basket_type, superseded_by.id, superseded_by.basket_type,
+                    strategy.id, previous_status.value, source)
+        return
+
     if total_filled == 0:
         # ALL orders rejected/cancelled — no fills at all
         if previous_status in (LiveStatus.EXIT_PENDING_USER_APPROVAL, LiveStatus.EXIT_PROCESSING):
@@ -3088,10 +3113,16 @@ class LiveInvestmentService:
         """
         TODAY = TODAY or date.today()
 
+        # Chronological, so a two-phase rebalance replays in the order it actually
+        # happened (SELL then BUY) and lands on the same status the in-day path
+        # reached. Without the ORDER BY the row order is whatever the DB returns,
+        # which made the final status depend on it. The supersede guard in
+        # _process_basket_orders is what actually enforces correctness — this just
+        # stops the replay from being needlessly out of order.
         baskets = db.query(LivePublisherBasket).filter(
             func.date(LivePublisherBasket.created_at) == TODAY,
             LivePublisherBasket.status != "CANCELLED",
-        ).all()
+        ).order_by(LivePublisherBasket.created_at.asc()).all()
 
         if not baskets:
             logger.info("[EODReconcile] No baskets created on %s — nothing to reconcile", TODAY)
@@ -3331,6 +3362,40 @@ class LiveInvestmentService:
 
                 if not basket:
                     continue
+
+                # ── Repair an inconsistent REBALANCE_SELL_COMPLETE ──
+                # If this cycle's buy leg has already settled, the strategy has no
+                # business sitting in REBALANCE_SELL_COMPLETE. verify_and_process_from_orderbook
+                # cannot fix it: the latest basket is COMPLETE, so it returns
+                # already_processed without ever comparing basket state to strategy
+                # state. Left alone the strategy is invisible to prepare_due_rebalances
+                # (ACTIVE only) and quietly skips its next rebalance.
+                if strategy.status == LiveStatus.REBALANCE_SELL_COMPLETE:
+                    latest_sell = db.query(LivePublisherBasket).filter(
+                        LivePublisherBasket.automate_equity_ra_id == strategy.id,
+                        LivePublisherBasket.basket_type == "REBALANCE_SELL",
+                    ).order_by(LivePublisherBasket.created_at.desc()).first()
+                    # Scoped to a buy basket NEWER than the sell leg, so a COMPLETE
+                    # buy from a previous cycle can never satisfy this.
+                    settled_buy = db.query(LivePublisherBasket).filter(
+                        LivePublisherBasket.automate_equity_ra_id == strategy.id,
+                        LivePublisherBasket.basket_type == "REBALANCE_BUY",
+                        LivePublisherBasket.status == "COMPLETE",
+                        LivePublisherBasket.created_at > latest_sell.created_at,
+                    ).order_by(LivePublisherBasket.created_at.desc()).first() if latest_sell else None
+                    if settled_buy:
+                        strategy.status = LiveStatus.ACTIVE
+                        strategy.subscription_active = True
+                        if not strategy.next_rebalance_date or strategy.next_rebalance_date <= TODAY:
+                            strategy.next_rebalance_date = next_trading_day(
+                                next_rebalance_prepare_date(TODAY + timedelta(days=1), strategy.rebalance_frequency)
+                            )
+                        db.commit()
+                        count += 1
+                        logger.warning("[SafetyNet] Strategy %s was REBALANCE_SELL_COMPLETE but its buy basket %s "
+                                       "is already COMPLETE — corrected to ACTIVE | next_rebalance=%s",
+                                       strategy.id, settled_buy.id, strategy.next_rebalance_date)
+                        continue
 
                 logger.info("[SafetyNet] Verifying stuck strategy %s (status=%s) via orderbook",
                             strategy.id, strategy.status.value)
