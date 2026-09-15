@@ -2215,6 +2215,9 @@ class LiveInvestmentService:
         if not strategy:
             raise HTTPException(status_code=404, detail="Live strategy not found")
         _stale_recovered = False
+        # Captured before the status is overwritten below: tells the date-stamping step
+        # at the end whether this is a fresh cycle or a re-open of one already prepared.
+        _was_rebalance_ready = strategy.status == LiveStatus.REBALANCE_READY
         # ── REBALANCE_PROCESSING — orders are in-flight on Kite ──
         # Do NOT raise 400 here. This is a preview/read endpoint: the frontend
         # rebalance-preview page needs a 200 with the existing buy/sell rows so it
@@ -2447,7 +2450,18 @@ class LiveInvestmentService:
         # helper so a manual mid-week preview also points at the next trading day.
         # The date cannot freeze if the user never acts: the 16:30 daily update auto-skips
         # a zero-fill REBALANCE_READY back to ACTIVE and rolls this forward.
-        strategy.next_rebalance_date = next_trading_day(TODAY)
+        #
+        # Stamp it once per cycle. This is a preview endpoint and stays callable while the
+        # strategy is already REBALANCE_READY, so an unconditional re-stamp walked the
+        # execution date forward one trading day every time the user re-opened the
+        # rebalance screen. WEEKLY hid the drift (it stays inside the ~7-day cycle);
+        # MONTHLY surfaced it as a date a month early — prepared 31-08, re-opened 01-09,
+        # shown 02-09 instead of 01-10. A date already behind TODAY is a leftover from an
+        # abandoned cycle and is recomputed rather than preserved.
+        if not (_was_rebalance_ready
+                and strategy.next_rebalance_date
+                and strategy.next_rebalance_date >= TODAY):
+            strategy.next_rebalance_date = next_trading_day(TODAY)
         db.commit()
         db.refresh(strategy)
 
