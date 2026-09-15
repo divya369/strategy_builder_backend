@@ -39,6 +39,7 @@ from app.schemas.live_investment import (
     OrderDetail,
     ZerodhaPublisherCallbackRequest,
 )
+from app.core.filter_registry import build_display_filters
 from app.core.trading_calendar import require_market_open
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from app.services.live_investment_service import LiveInvestmentService
@@ -769,6 +770,7 @@ def get_strategy_dashboard(live_id: UUID, user_id: str, db: Session = Depends(ge
             aum=latest_eq.aum,
             strategy_roc=latest_eq.strategy_roc,
             strategy_daily_return=latest_eq.strategy_daily_return,
+            strategy_daily_performance=latest_eq.strategy_daily_performance,
             equitycurve_percent=latest_eq.equitycurve_percent,
             max_dd_percent=latest_eq.max_dd_percent,
             total_pnl=latest_eq.total_pnl,
@@ -809,11 +811,16 @@ def get_strategy_dashboard(live_id: UUID, user_id: str, db: Session = Depends(ge
             LiveSellStock.order_id != "",
         ).count() > 0
 
+    # Filters the user selected, read off the snapshot copied onto the strategy
+    # at go-live (so an edit to the screener doesn't change what's shown here).
+    filters = build_display_filters(strategy.filters_json)
+
     return LiveDashboardResponse(
         strategy=serialize_strategy(strategy),
         latest_equity_curve=latest_equity_curve,
         pending_basket=pending_basket,
         exit_orders_sent=exit_orders_sent,
+        filters=filters,
     )
 
 

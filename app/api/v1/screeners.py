@@ -202,6 +202,7 @@ def get_version_backtests(screener_id: uuid.UUID, version_id: uuid.UUID, role: s
             "run_id": str(run.id), "run_name": run.run_name or f"Run {run.id}",
             "period": f"{run.from_date} to {run.to_date}", "rebalance": run.rebalance_frequency,
             "portfolio_size": run.portfolio_size, "wrh": run.wrh,
+            "initial_capital": float(run.initial_capital),
             "cagr": format_metric_value(res.metrics_json.get("cagr"), "%") if res and res.metrics_json else None,
             "total_return": format_metric_value(res.metrics_json.get("total_return"), '%') if res and res.metrics_json else None,
             "status": run.status, "created_at": run.created_at,

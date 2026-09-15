@@ -3,6 +3,7 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
 from app.core.database import get_db
 from app.core.backtest_metric_formatter import format_metric_value
+from app.core.filter_registry import build_display_filters
 
 from app.schemas.backtest import CustomBacktestRequest
 from app.services.backtest_engine import backtest_engine_service
@@ -100,4 +101,12 @@ def get_backtest_result(run_id: uuid.UUID, user_id: str, db: Session = Depends(g
             "final_nav": round(daily_nav_data[-1]["portfolio_nav_net"], 2) if daily_nav_data else 0.0,
         }
 
-    return {"run_name": run.run_name, "status": run.status, "initial_capital": float(run.initial_capital), "metrics": metrics, "equity_curve": chart_data, "benchmark_curve": benchmark_curve, "benchmark_label": run.benchmark_symbol or "NIFTY 50"}
+    # Filters the user selected for this run. Versions are append-only (an edit
+    # writes a new row), so the run's screener_version_id is itself the snapshot.
+    # It is nullable / ON DELETE SET NULL, so a missing version just yields [].
+    version = db.query(ScreenerVersion).filter(
+        ScreenerVersion.id == run.screener_version_id
+    ).first() if run.screener_version_id else None
+    filters = build_display_filters(version.filters_json if version else None)
+
+    return {"run_name": run.run_name, "status": run.status, "initial_capital": float(run.initial_capital), "metrics": metrics, "equity_curve": chart_data, "benchmark_curve": benchmark_curve, "benchmark_label": run.benchmark_symbol or "NIFTY 50", "filters": filters}

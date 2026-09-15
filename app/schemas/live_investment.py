@@ -169,6 +169,7 @@ class EquityCurvePointResponse(BaseModel):
     aum: Optional[float] = None
     strategy_roc: Optional[float] = None
     strategy_daily_return: Optional[float] = None
+    strategy_daily_performance: Optional[float] = None
     equitycurve_percent: Optional[float] = None
     max_dd_percent: Optional[float] = None
     total_pnl: Optional[float] = None
@@ -221,6 +222,9 @@ class LiveDashboardResponse(BaseModel):
     latest_equity_curve: Optional[EquityCurvePointResponse] = None
     pending_basket: Optional[PendingBasketResponse] = None
     exit_orders_sent: bool = False
+    # Filters the user selected, snapshotted on the strategy at go-live.
+    # Null keys are dropped; `label` is pre-rendered server-side.
+    filters: List[Dict[str, Any]] = []
 
 
 class LiveStrategyListItem(BaseModel):

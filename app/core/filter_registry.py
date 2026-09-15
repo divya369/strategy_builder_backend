@@ -250,6 +250,26 @@ def get_filter_label(field: str, period: str = None) -> str:
     return base
 
 
+def build_display_filters(filters_json) -> list:
+    """
+    Turn a stored filters_json blob into the compact shape display pages send:
+    drop the keys that are null for this filter type (period/relation/left_field/...)
+    and add a human-readable `label`, so the frontend needn't map raw field keys.
+
+    Two-sided comparison filters carry no `field`, so their `label` is None —
+    render those from left_field/relation/right_field instead.
+    """
+    out = []
+    for f in (filters_json or []):
+        if not isinstance(f, dict):
+            out.append(f)
+            continue
+        c = {k: v for k, v in f.items() if v is not None}
+        c["label"] = get_filter_label(c.get("field"), c.get("period"))
+        out.append(c)
+    return out
+
+
 def get_db_key(field: str) -> Optional[str]:
     """
     Return the CSV column name override for a UI field, or None if the field
