@@ -30,7 +30,7 @@ class EmailNotificationChannel(BaseNotificationChannel):
     def send_rebalance_ready(
         self,
         *,
-        user_email: str,
+        user_email: str | None,
         user_name: str | None,
         strategy_name: str,
         strategy_id: str,
@@ -38,9 +38,13 @@ class EmailNotificationChannel(BaseNotificationChannel):
         dashboard_url: str,
         timestamp: str,
         rebalance_date: str = "",
+        user_phone: str | None = None,
     ) -> bool:
         if not settings.RESEND_API_KEY:
             logger.warning("[Email] RESEND_API_KEY not configured — skipping rebalance email")
+            return False
+        if not user_email:
+            logger.info("[Email] No email for strategy=%s — skipping rebalance email", strategy_id)
             return False
 
         resend.api_key = settings.RESEND_API_KEY
@@ -62,11 +66,19 @@ class EmailNotificationChannel(BaseNotificationChannel):
 
         to_addr = f"{user_name} <{user_email}>" if user_name else user_email
 
+        # An empty rebalance is still worth telling the user about, but it must not
+        # arrive titled "Rebalance Ready" — the subject is all most people read, and
+        # promising an execution they don't have to make is the confusing part.
+        subject = (
+            f"Rebalance Ready — {strategy_name}" if ordered_changes
+            else f"No Action Needed — {strategy_name}"
+        )
+
         try:
             params: resend.Emails.SendParams = {
                 "from": settings.EMAIL_FROM,
                 "to": [to_addr],
-                "subject": f"Rebalance Ready — {strategy_name}",
+                "subject": subject,
                 "html": html_body,
             }
             result = resend.Emails.send(params)

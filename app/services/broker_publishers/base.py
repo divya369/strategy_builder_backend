@@ -47,7 +47,7 @@ class BrokerPublisherAdapter(ABC):
         """
         return None
 
-    def fetch_orderbook(self, user_access_token: str) -> list:
+    def fetch_orderbook(self, user_access_token: str) -> list | None:
         """Fetch full day's orderbook for a user via broker API.
 
         Uses the Publisher/app API key + the user's access_token (obtained
@@ -55,7 +55,9 @@ class BrokerPublisherAdapter(ABC):
         orderbook for that user for the current day.
 
         Returns:
-            List of order dicts from the broker, or empty list on failure.
+            List of order dicts from the broker ([] means the broker genuinely
+            reported no orders), or None when the fetch FAILED. Callers must not
+            read None as "no orders" — that turns a failed call into zero fills.
 
         Raises:
             NotImplementedError if the broker doesn't support orderbook fetch.

@@ -109,6 +109,11 @@ class Settings:
     EMAIL_FROM: str = os.getenv("EMAIL_FROM", "EquityCase <noreply@equitycase.com>")
     FRONTEND_BASE_URL: str = os.getenv("FRONTEND_BASE_URL", "https://www.equitycase.com")
 
+    # ── WhatsApp (Meta Cloud API) ─────────────────────────────────────────
+    WHATSAPP_TOKEN: str = os.getenv("WHATSAPP_TOKEN", "")
+    WHATSAPP_PHONE_NUMBER_ID: str = os.getenv("WHATSAPP_PHONE_NUMBER_ID", "1245147385342997")
+    WHATSAPP_GRAPH_API_VERSION: str = os.getenv("WHATSAPP_GRAPH_API_VERSION", "v23.0")
+
     @property
     def sqlalchemy_database_uri(self) -> str:
         return (

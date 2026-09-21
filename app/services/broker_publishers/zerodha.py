@@ -330,7 +330,7 @@ class ZerodhaPublisherAdapter(BrokerPublisherAdapter):
 
     # ── Orderbook fetch (read-only via Publisher access_token) ─────────────
 
-    def fetch_orderbook(self, user_access_token: str) -> list:
+    def fetch_orderbook(self, user_access_token: str) -> list | None:
         """Fetch full day's orderbook for a user via Kite Connect API.
 
         Uses the PUBLISHER API key (ZERODHA_PUBLISHER_API_KEY) + the user's
@@ -341,14 +341,15 @@ class ZerodhaPublisherAdapter(BrokerPublisherAdapter):
         Authorization: token <publisher_api_key>:<user_access_token>
 
         Returns:
-            List of order dicts from Kite, or empty list on failure.
+            List of order dicts from Kite, or None on failure. An empty list is a
+            real answer ("no orders today"); None means we could not find out.
             Each order has: tag, order_id, status, filled_quantity,
             average_price, tradingsymbol, transaction_type, placed_by, etc.
         """
         api_key = settings.ZERODHA_PUBLISHER_API_KEY
         if not api_key or not user_access_token:
             logger.warning("[Orderbook] Missing API key or access_token — cannot fetch orderbook")
-            return []
+            return None
 
         try:
             resp = requests.get(
@@ -365,10 +366,10 @@ class ZerodhaPublisherAdapter(BrokerPublisherAdapter):
             return data
         except requests.exceptions.HTTPError as e:
             logger.error("[Orderbook] Kite API HTTP error: %s — %s", e, getattr(e.response, 'text', ''))
-            return []
+            return None
         except Exception as e:
             logger.error("[Orderbook] Failed to fetch orderbook: %s", e)
-            return []
+            return None
 
     # ── Token exchange (Publisher redirect → access_token) ────────────────
 

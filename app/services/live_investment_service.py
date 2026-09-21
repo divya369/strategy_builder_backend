@@ -1464,26 +1464,30 @@ def _gather_and_notify_rebalance(db: Session, strategy: LiveStrategy, TODAY: dat
     Gather rebalance details from buy/sell tables and fire notification.
     This is fire-and-forget — failures are logged but never raised.
 
-    User email is fetched from the equitycase DB (separate from screener_backtest_db)
-    because on the server the users table lives there.
+    User email/phone are fetched from the equitycase DB (separate from screener_backtest_db)
+    because on the server the users table lives there. Email goes out if the user has an
+    email, WhatsApp if they have a verified phone — each channel skips on its own.
     """
     try:
-        # Fetch user email from equitycase DB (separate database)
+        # Fetch user contact details from equitycase DB (separate database)
         ec_db = EquitycaseSessionLocal()
         try:
             row = ec_db.execute(
-                text('SELECT email FROM "user" WHERE id = :user_id LIMIT 1'),
+                text('SELECT email, phone, is_phone_verified FROM "user" WHERE id = :user_id LIMIT 1'),
                 {"user_id": str(strategy.user_id)},
             ).fetchone()
         finally:
             ec_db.close()
 
-        if not row or not row.email:
-            logger.warning("[Notify] No user/email found in equitycase DB for user_id %s (strategy %s) — skipping notification", strategy.user_id, strategy.id)
+        user_email = row.email if row else None
+        # Only message numbers the user proved they own (OTP-verified)
+        user_phone = row.phone if row and row.is_phone_verified else None
+
+        if not user_email and not user_phone:
+            logger.warning("[Notify] No email or verified phone in equitycase DB for user_id %s (strategy %s) — skipping notification", strategy.user_id, strategy.id)
             return
 
-        user_email = row.email
-        user_name = "Investor"  # Fallback since we only pull email now
+        user_name = "Investor"  # No name stored in the equitycase user table
 
         # Sells = stocks being REMOVED in this rebalance
         sells = db.query(LiveSellStock).filter(
@@ -1531,6 +1535,7 @@ def _gather_and_notify_rebalance(db: Session, strategy: LiveStrategy, TODAY: dat
         notify_all(
             "send_rebalance_ready",
             user_email=user_email,
+            user_phone=user_phone,
             user_name=user_name,
             strategy_name=strategy.strategy_name or "Unnamed Strategy",
             strategy_id=str(strategy.id),
@@ -1836,6 +1841,71 @@ def _process_basket_orders(
 
     # Platform 'Invest Now': materialise the user's own screener on first activation.
     adopt_platform_clone_on_activation(db, strategy)
+
+
+def _apply_late_postback_upgrades(db: Session, tags: set, source: str) -> int:
+    """Raise order rows to the fill their stored terminal postback reports.
+
+    Covers a postback that lands AFTER its basket was settled — e.g. a LIMIT order
+    on an illiquid BE stock filling minutes after the in-day verifier gave up and
+    stamped it CANCELLED/0. Without a broker token the orderbook can't correct it,
+    but the postback itself is already sitting in broker_raw_postback.
+
+    Deliberately narrow:
+    - only a TERMINAL postback (COMPLETE, or CANCELLED carrying a partial fill);
+    - only UPWARD (postback filled_quantity > row actual_qty) — it never reduces;
+    - only rows the tradelog has not consumed yet. update_tradelog_buy_df inserts a
+      fresh tradelog row with the FULL quantity, not the delta, so reopening a
+      consumed row would double-count it. Those are logged for a manual fix instead.
+    - rows only: basket and strategy status are left alone. Re-running the status
+      chain here can drag a strategy backwards (a late SELL fill while the BUY leg
+      is in flight would reset it to REBALANCE_SELL_COMPLETE).
+
+    Commits if anything changed. Returns the number of rows upgraded.
+    """
+    if not tags:
+        return 0
+
+    upgraded = 0
+    for model in (LiveBuyStock, LiveSellStock, LiveCircuitStock):
+        rows = db.query(model).filter(model.publisher_tag.in_(tags)).all()
+        for row in rows:
+            pb = row.broker_raw_postback or {}
+            pb_status = (pb.get("status") or "").upper()
+            if pb_status == "CANCEL":
+                pb_status = "CANCELLED"
+            if pb_status not in ("COMPLETE", "CANCELLED"):
+                continue
+
+            pb_filled = int(pb.get("filled_quantity") or 0)
+            prev_qty = int(row.actual_qty or 0)
+            if pb_filled <= prev_qty:
+                continue
+
+            if row.updated_in_tradelog and prev_qty > 0:
+                logger.error("[LateUpgrade] tag=%s symbol=%s postback shows %d filled but row (%d) is ALREADY IN "
+                             "TRADELOG — not reopened (would double-count). MANUAL FIX NEEDED | source=%s",
+                             row.publisher_tag, row.tradingsymbol, pb_filled, prev_qty, source)
+                continue
+
+            avg_price = float(pb.get("average_price") or 0)
+            if pb.get("order_id"):
+                row.order_id = str(pb.get("order_id"))
+            row.broker_status = pb_status
+            row.broker_status_message = (
+                f"Late postback applied ({source}) — filled {pb_filled} (was {prev_qty})"
+            )
+            row.actual_qty = pb_filled
+            row.actual_price = avg_price
+            row.actual_amount = round(pb_filled * avg_price, 2)
+            row.updated_in_tradelog = False
+            upgraded += 1
+            logger.warning("[LateUpgrade] tag=%s symbol=%s qty %d → %d @ %.2f from stored %s postback | source=%s",
+                           row.publisher_tag, row.tradingsymbol, prev_qty, pb_filled, avg_price, pb_status, source)
+
+    if upgraded:
+        db.commit()
+    return upgraded
 
 
 def adopt_platform_clone_on_activation(db: Session, strategy: LiveStrategy) -> None:
@@ -2649,6 +2719,30 @@ class LiveInvestmentService:
     _redis_client = redis.from_url(settings.REDIS_URL, decode_responses=True)
 
     @staticmethod
+    def _is_stale_postback(stored: Optional[dict], incoming: dict) -> bool:
+        """True if `incoming` would move an order BACKWARDS relative to `stored`.
+
+        Stale = a terminal order regressing to non-terminal, or filled quantity
+        going down. Only compared within the same order: if both carry an order_id
+        and they differ, this is a different order and nothing is stale.
+        """
+        if not stored:
+            return False
+        TERMINAL_STATUSES = {"COMPLETE", "REJECTED", "CANCELLED"}
+
+        stored_oid = str(stored.get("order_id") or "")
+        incoming_oid = str(incoming.get("order_id") or "")
+        if stored_oid and incoming_oid and stored_oid != incoming_oid:
+            return False
+
+        stored_status = (stored.get("status") or "").upper()
+        incoming_status = (incoming.get("status") or "").upper()
+        if stored_status in TERMINAL_STATUSES and incoming_status not in TERMINAL_STATUSES:
+            return True
+
+        return int(incoming.get("filled_quantity") or 0) < int(stored.get("filled_quantity") or 0)
+
+    @staticmethod
     def update_from_postback(db: Session, payload: Dict[str, Any], TODAY: Optional[date] = None) -> dict:
         """Process a single broker postback.
 
@@ -2724,6 +2818,20 @@ class LiveInvestmentService:
         # Broker-specific normalization after strategy is known.
         adapter = get_publisher_adapter(strategy.broker)
         normalized = adapter.normalize_postback(payload)
+
+        # ── Step 3b: Never let a stale postback move an order backwards ──
+        # Kite does not guarantee postback ORDER. A partial-fill UPDATE can land after
+        # the COMPLETE it preceded (seen live: COMPLETE 28/28, then UPDATE 10/28), and
+        # blindly storing it made the order look non-terminal with 10 shares — which
+        # is then what got settled. An order's lifecycle only moves forward: once
+        # terminal it stays terminal, and filled quantity never decreases.
+        if LiveInvestmentService._is_stale_postback(row_obj.broker_raw_postback, normalized):
+            prev = row_obj.broker_raw_postback or {}
+            logger.warning("[Postback] STALE postback ignored | tag=%s symbol=%s stored=%s/%s incoming=%s/%s",
+                           raw_tag, postback_symbol,
+                           prev.get("status"), prev.get("filled_quantity"),
+                           normalized.get("status"), normalized.get("filled_quantity"))
+            return {"status": "ok", "detail": "stale_postback_ignored"}
 
         # ── Step 4: Store raw postback + order_id on order row ──
         if kite_order_id:
@@ -2824,7 +2932,13 @@ class LiveInvestmentService:
 
         force=True switches this into EOD reconcile mode (see eod_reconcile_baskets):
         no retries, no postback fallback, and the already-processed guards are
-        bypassed so the broker's final state overwrites the in-day guess.
+        bypassed so the broker's final state overwrites the in-day guess. If the
+        orderbook is unavailable, only upward corrections from stored TERMINAL
+        postbacks are applied (_apply_late_postback_upgrades) — never a guess.
+
+        A basket that is already settled (force=False) still gets late terminal
+        postbacks applied the same way, so a fill arriving after the in-day settle
+        is recorded within seconds instead of being skipped.
 
         Returns dict with processing result.
         """
@@ -2842,6 +2956,21 @@ class LiveInvestmentService:
         # Early guard: skip already-processed baskets (saves a wasted kite.orders() call).
         # EOD reconcile must look anyway — "processed" may mean "processed from a guess".
         if basket.status in ("COMPLETE", "ALL_REJECTED") and not force:
+            # Already settled — but a postback arriving now can still carry a real
+            # fill the settle missed (it gave up before this postback existed). Apply
+            # it from the stored postback: no orderbook or token needed.
+            settled_tags = {
+                o.get("tag") for o in ((basket.publisher_payload or {}).get("basket") or [])
+                if o.get("tag")
+            }
+            upgraded = _apply_late_postback_upgrades(db, settled_tags, source="late_postback")
+            # Clear the debounce key: this early return used to leave it set for its
+            # full 300s TTL, silently swallowing any further late postback.
+            LiveInvestmentService._redis_client.delete(f"orderbook_verify:{basket_id}")
+            if upgraded:
+                logger.warning("[OrderbookVerify] Basket %s already %s — applied %d late postback fill(s)",
+                               basket_id, basket.status, upgraded)
+                return {"status": "ok", "detail": "already_processed_late_upgrade", "upgraded": upgraded}
             logger.info("[OrderbookVerify] Basket %s already %s — skipping", basket_id, basket.status)
             return {"status": "ok", "detail": "already_processed"}
 
@@ -2896,12 +3025,33 @@ class LiveInvestmentService:
             LiveBrokerAccount.id == strategy.broker_account_id,
         ).first()
 
-        if broker_account and broker_account.access_token_encrypted and broker_account.token_date == TODAY:
+        has_token_today = bool(
+            broker_account and broker_account.access_token_encrypted and broker_account.token_date == TODAY
+        )
+        # Say WHY there's no orderbook. The token is only refreshed when the user comes
+        # back through the Kite redirect; if they close the tab it silently goes stale,
+        # and every verification degrades to postbacks with no visible cause. Logged
+        # once per verification (first attempt / EOD), not on every retry.
+        if not has_token_today and (retry_count == 0 or force):
+            logger.warning("[OrderbookVerify] NO BROKER TOKEN FOR TODAY — orderbook unavailable, postbacks only | "
+                           "basket=%s strategy=%s broker_account=%s auth_status=%s token_date=%s last_authorised_at=%s",
+                           basket_id, strategy.id,
+                           getattr(broker_account, "id", None),
+                           getattr(broker_account, "auth_status", None),
+                           getattr(broker_account, "token_date", None),
+                           getattr(broker_account, "last_authorised_at", None))
+
+        if has_token_today:
             try:
                 access_token = decrypt_token(broker_account.access_token_encrypted)
                 if access_token:
                     adapter = get_publisher_adapter(strategy.broker)
                     full_orderbook = adapter.fetch_orderbook(access_token)
+                    if full_orderbook is None:
+                        # A FAILED fetch must stay None. Read as an empty orderbook it
+                        # would put every tag in missing_tags, and EOD would then stamp
+                        # the whole basket CANCELLED with zero fills.
+                        raise RuntimeError("broker orderbook fetch failed")
 
                     # Claim every orderbook entry that is ours — by intent OR by a
                     # publisher_tag we persisted. Asking "which of these are mine?"
@@ -2929,7 +3079,15 @@ class LiveInvestmentService:
         # A failed read tells us nothing about what filled. Writing zeros from it is
         # exactly the mistake that loses real fills, so leave every row untouched and
         # make the failure loud instead. Tomorrow's run picks it up.
+        # The one safe exception: a terminal postback the broker itself sent. It can
+        # only RAISE a quantity (see _apply_late_postback_upgrades), so it recovers a
+        # fill the in-day path missed without ever inventing or erasing one.
         if force and orderbook_orders is None:
+            upgraded = _apply_late_postback_upgrades(db, intent_tags | owned_tags, source="eod_postback")
+            if upgraded:
+                logger.warning("[EODReconcile] Orderbook unavailable for basket %s — applied %d fill(s) from stored "
+                               "terminal postbacks; all other rows UNTOUCHED.", basket_id, upgraded)
+                return {"status": "ok", "detail": "processed_from_postback_upgrade", "upgraded": upgraded}
             logger.error("[EODReconcile] Could not fetch orderbook for basket %s (token missing/expired or API down) "
                          "— leaving all order rows UNTOUCHED. Fills for this basket are unverified.", basket_id)
             return {"status": "error", "detail": "orderbook_unavailable_rows_untouched"}
@@ -3502,6 +3660,10 @@ class LiveInvestmentService:
                 strategy = account_strategy_map[ba_id]
                 adapter = get_publisher_adapter(strategy.broker)
                 full_orderbook = adapter.fetch_orderbook(access_token)
+                if full_orderbook is None:
+                    # Failed fetch — don't upsert an empty backup over a good one.
+                    logger.error("[OrderbookBackup] Orderbook fetch failed for broker_account %s — backup NOT stored", ba_id)
+                    continue
 
                 # Filter to only our tagged orders
                 filtered = [

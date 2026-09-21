@@ -8,7 +8,7 @@
   <link rel="preload" as="image" href="https://www.equitycase.com/logo.png" />
   <meta content="text/html; charset=UTF-8" http-equiv="Content-Type" />
   <meta name="x-apple-disable-message-reformatting" />
-  <title>Rebalance Ready — {{ strategy_name }}</title>
+  <title>{% if changes %}Rebalance Ready{% else %}No Action Needed{% endif %} — {{ strategy_name }}</title>
   <style>
     @import url('https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700&display=swap');
 
@@ -57,7 +57,8 @@
 
 <body style="background-color:rgb(243,244,246);margin:0;padding:0"><!--$--><!--html--><!--head-->
   <div style="display:none;overflow:hidden;line-height:1px;opacity:0;max-height:0;max-width:0" data-skip-in-text="true">
-    Strategy &quot;{{ strategy_name }}&quot; has been rebalanced and is ready for execution.<div>
+    {% if changes %}Strategy &quot;{{ strategy_name }}&quot; has been rebalanced and is ready for
+    execution.{% else %}No rebalance changes are required for your portfolio today.{% endif %}<div>
       ‌​‍‎‏﻿ ‌​‍‎‏﻿ ‌​‍‎‏﻿ ‌​‍‎‏﻿ ‌​‍‎‏﻿ ‌​‍‎‏﻿ ‌​‍‎‏﻿ ‌​‍‎‏﻿ ‌​‍‎‏﻿ ‌​‍‎‏﻿ ‌​‍‎‏﻿ ‌​‍‎‏﻿ ‌​‍‎‏﻿ ‌​‍‎‏﻿ ‌​‍‎‏﻿ ‌​‍‎‏﻿
       ‌​‍‎‏﻿ ‌​‍‎‏﻿ ‌​‍‎‏﻿ ‌​‍‎‏﻿ ‌​‍‎‏﻿ ‌​‍‎‏﻿ ‌​‍‎‏﻿ ‌​‍‎‏﻿ ‌​‍‎‏﻿ ‌​‍‎‏﻿ ‌​‍‎‏﻿ ‌​‍‎‏﻿ ‌​‍‎‏﻿ ‌​‍‎‏﻿ ‌​‍‎‏﻿ ‌​‍‎‏﻿
       ‌​‍‎‏﻿ ‌​‍‎‏﻿ ‌​‍‎‏﻿ ‌​‍‎‏﻿ ‌​‍‎‏﻿ ‌​‍‎‏﻿ ‌​‍‎‏﻿ ‌​‍‎‏﻿ ‌​‍‎‏﻿ ‌​‍‎‏﻿ ‌​‍‎‏﻿ ‌​‍‎‏﻿ ‌​‍‎‏﻿ ‌​‍‎‏﻿ ‌​‍‎‏﻿ ‌​‍‎‏﻿
@@ -114,10 +115,14 @@
                                   <p
                                     style="font-size:13px;line-height:1.5;margin:0;color:#6b7280;margin-top:0;margin-bottom:0;margin-left:0;margin-right:0">
                                     Your strategy <!-- --> <strong style="color:#111827">&quot;<!-- -->{{ strategy_name
-                                      }}<!-- -->&quot;</strong> <!-- --> is due for rebalance.{% if rebalance_date %}
+                                      }}<!-- -->&quot;</strong> <!-- --> {% if changes %}is due for rebalance.{% if
+                                    rebalance_date %}
                                     You can execute it on <strong style="color:#111827">{{ rebalance_date }}</strong>
                                     between <strong style="color:#111827">9:15 AM – 3:20 PM IST</strong> (market
-                                    hours).{% endif %}
+                                    hours).{% endif %}{% else %}was reviewed today and no changes are required.{% if
+                                    rebalance_date %}
+                                    Your next rebalance is scheduled for <strong style="color:#111827">{{
+                                      rebalance_date }}</strong>.{% endif %}{% endif %}
                                   </p>
                                 </td>
                               </tr>

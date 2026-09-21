@@ -10,11 +10,13 @@ import logging
 from typing import Any, Dict
 from .base import BaseNotificationChannel
 from .email_channel import EmailNotificationChannel
+from .whatsapp_channel import WhatsAppNotificationChannel
 
 logger = logging.getLogger("notifications")
 
 _CHANNELS: Dict[str, BaseNotificationChannel] = {
     EmailNotificationChannel.channel: EmailNotificationChannel(),
+    WhatsAppNotificationChannel.channel: WhatsAppNotificationChannel(),
 }
 
 
