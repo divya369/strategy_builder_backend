@@ -52,6 +52,7 @@ from app.core.config import settings
 from app.core.backtest_metric_formatter import format_metric_value
 from app.core.filter_registry import get_filter_label, get_sort_label
 from app.core.performance_metrics import compute_summary_from_nav
+from app.schemas.live_investment import EquityCurvePointResponse
 # Shared equitycase-style machinery — imported, NEVER modified.
 from app.services.live_investment_service import (
     _get_benchmark_index_name,
@@ -460,6 +461,37 @@ class PlatformPaperService:
             "weightage": round((t.current_value or 0) / float(portfolio.final_aum) * 100, 2) if portfolio.final_aum else None,
         } for t in trades]
 
+        # Latest paper equity-curve snapshot — same shape as the live-investment
+        # dashboard's `latest_equity_curve` so the frontend reuses one component.
+        latest_eq = db.query(PaperEquityCurve).filter(
+            PaperEquityCurve.automate_equity_ra_id == portfolio.id,
+        ).order_by(PaperEquityCurve.date.desc(), PaperEquityCurve.total_days.desc()).first()
+        latest_equity_curve = None
+        if latest_eq:
+            latest_equity_curve = EquityCurvePointResponse(
+                date=latest_eq.date,
+                cash=latest_eq.cash,
+                stocks_value=latest_eq.stocks_value,
+                aum=latest_eq.aum,
+                strategy_roc=latest_eq.strategy_roc,
+                strategy_daily_return=latest_eq.strategy_daily_return,
+                strategy_daily_performance=latest_eq.strategy_daily_performance,
+                equitycurve_percent=latest_eq.equitycurve_percent,
+                max_dd_percent=latest_eq.max_dd_percent,
+                total_pnl=latest_eq.total_pnl,
+                sharpe=latest_eq.sharpe,
+                cagr_percent=latest_eq.cagr_percent,
+                total_trades=latest_eq.total_trades,
+                winning_trades=latest_eq.winning_trades,
+                losing_trades=latest_eq.losing_trades,
+                winning_percent=latest_eq.winning_percent,
+                losing_percent=latest_eq.losing_percent,
+                avg_win=latest_eq.avg_win,
+                avg_loss=latest_eq.avg_loss,
+                total_charges=latest_eq.total_charges,
+                monthly_return=latest_eq.monthly_return,
+            )
+
         return {
             "run_name": portfolio.strategy_name,
             "strategy": strategy_block,
@@ -477,6 +509,7 @@ class PlatformPaperService:
             "monthly_returns": monthly_returns,
             "drawdown_history": drawdown_history,
             "current_portfolio": current_portfolio,
+            "latest_equity_curve": latest_equity_curve,
         }
 
     @staticmethod

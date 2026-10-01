@@ -60,6 +60,7 @@ class LandingStatsResponse(BaseModel):
     total_backtests: int
     total_live_strategies: int
     total_ready_to_use_strategies: int
+    total_pnl: float
 
 
 def _compute_landing_stats(db: Session) -> LandingStatsResponse:
@@ -91,6 +92,17 @@ def _compute_landing_stats(db: Session) -> LandingStatsResponse:
         LiveStrategy.status.in_(RUNNING_STATUSES),
     ).scalar()
 
+    # P&L (₹) on the capital currently deployed — same running filter as the AUM
+    # sum, so both numbers describe the same strategies. LiveStrategy.pnl is
+    # synced from the latest equity-curve total_pnl (unrealised + realised −
+    # charges) on every daily MTM. May be negative.
+    total_pnl = db.query(
+        func.coalesce(func.sum(LiveStrategy.pnl), 0.0)
+    ).filter(
+        LiveStrategy.subscription_active == True,  # noqa: E712 — SQL comparison
+        LiveStrategy.status.in_(RUNNING_STATUSES),
+    ).scalar()
+
     # Ready-to-use (platform) strategies visible to users. Mirrors the filter in
     # GET /screeners/platform-screeners: inactive platform screeners are admin
     # drafts with no paper-trading data behind them.
@@ -104,6 +116,7 @@ def _compute_landing_stats(db: Session) -> LandingStatsResponse:
         total_backtests=int(total_backtests or 0),
         total_live_strategies=int(total_live_strategies or 0),
         total_ready_to_use_strategies=int(total_ready_to_use_strategies or 0),
+        total_pnl=round(float(total_pnl or 0.0), 2),
     )
 
 
@@ -115,6 +128,7 @@ def get_landing_stats(refresh: bool = False, db: Session = Depends(get_db)):
     - `total_backtests`               — COMPLETED backtest runs
     - `total_live_strategies`         — strategies currently running
     - `total_ready_to_use_strategies` — active platform strategies
+    - `total_pnl`                     — SUM(pnl) of running strategies (₹, may be negative)
 
     Pass `?refresh=true` to bypass the 5-minute cache (admin/debug).
     """
@@ -128,8 +142,8 @@ def get_landing_stats(refresh: bool = False, db: Session = Depends(get_db)):
     _cached_stats = stats
     _cached_at = now
     logger.info(
-        "[Stats] Landing stats refreshed | aum=%.2f backtests=%d live=%d ready=%d",
-        stats.total_aum_deployed, stats.total_backtests,
+        "[Stats] Landing stats refreshed | aum=%.2f pnl=%.2f backtests=%d live=%d ready=%d",
+        stats.total_aum_deployed, stats.total_pnl, stats.total_backtests,
         stats.total_live_strategies, stats.total_ready_to_use_strategies,
     )
     return stats

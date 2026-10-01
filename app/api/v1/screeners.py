@@ -126,6 +126,14 @@ def get_platform_strategies(role: str = None, db: Session = Depends(get_db)):
         # paper equity-curve row — cheap single-row fetch, like live investment.
         item["live"] = PlatformPaperService.card_metrics(p, row) if (p and row) else None
         result.append(item)
+
+    # Highest CAGR first; strategies without a CAGR yet go last (stable sort
+    # keeps them newest-first).
+    result.sort(
+        key=lambda it: (it["live"] is not None and it["live"]["cagr"] is not None,
+                        it["live"]["cagr"] if it["live"] and it["live"]["cagr"] is not None else 0),
+        reverse=True,
+    )
     return result
 
 @router.post("", response_model=ScreenerVersionResponse)
