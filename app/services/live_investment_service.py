@@ -1464,16 +1464,23 @@ def _gather_and_notify_rebalance(db: Session, strategy: LiveStrategy, TODAY: dat
     Gather rebalance details from buy/sell tables and fire notification.
     This is fire-and-forget — failures are logged but never raised.
 
-    User email/phone are fetched from the equitycase DB (separate from screener_backtest_db)
-    because on the server the users table lives there. Email goes out if the user has an
-    email, WhatsApp if they have a verified phone — each channel skips on its own.
+    User email/phone/name are fetched from the equitycase DB (separate from
+    screener_backtest_db) because on the server the users table lives there. Email goes out
+    if the user has an email, WhatsApp if they have a verified phone — each channel skips
+    on its own.
     """
     try:
-        # Fetch user contact details from equitycase DB (separate database)
+        # Fetch user contact details from equitycase DB (separate database).
+        # The display name lives in user_auth.username, one row per user.
         ec_db = EquitycaseSessionLocal()
         try:
             row = ec_db.execute(
-                text('SELECT email, phone, is_phone_verified FROM "user" WHERE id = :user_id LIMIT 1'),
+                text(
+                    'SELECT u.email, u.phone, u.is_phone_verified, a.username '
+                    'FROM "user" u '
+                    'LEFT JOIN user_auth a ON a.user_id = u.id '
+                    'WHERE u.id = :user_id LIMIT 1'
+                ),
                 {"user_id": str(strategy.user_id)},
             ).fetchone()
         finally:
@@ -1487,7 +1494,9 @@ def _gather_and_notify_rebalance(db: Session, strategy: LiveStrategy, TODAY: dat
             logger.warning("[Notify] No email or verified phone in equitycase DB for user_id %s (strategy %s) — skipping notification", strategy.user_id, strategy.id)
             return
 
-        user_name = "Investor"  # No name stored in the equitycase user table
+        # Stored shouting and underscored ("PRIYANSHI_BATRA") — greet them as "Priyanshi Batra"
+        user_name = (row.username or "").replace("_", " ").strip().title() if row else ""
+        user_name = user_name or "Investor"
 
         # Sells = stocks being REMOVED in this rebalance
         sells = db.query(LiveSellStock).filter(

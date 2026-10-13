@@ -48,6 +48,16 @@ def send_template(to: str, template_name: str, values: Dict[str, str]) -> Dict[s
         raise WhatsAppError(f"Missing values for {template_name}: {', '.join(missing)}")
 
     components = []
+    if template.get("header_image"):
+        # Templates approved with an IMAGE header must carry the image on every send.
+        # A public link is used instead of an uploaded media id, which WhatsApp deletes
+        # after 30 days and would need re-uploading.
+        if not settings.WHATSAPP_HEADER_IMAGE_URL:
+            raise WhatsAppError(f"{template_name} needs a header image but WHATSAPP_HEADER_IMAGE_URL is not configured")
+        components.append({
+            "type": "header",
+            "parameters": [{"type": "image", "image": {"link": settings.WHATSAPP_HEADER_IMAGE_URL}}],
+        })
     if template["params"]:
         components.append({
             "type": "body",

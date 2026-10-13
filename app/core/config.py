@@ -113,6 +113,9 @@ class Settings:
     WHATSAPP_TOKEN: str = os.getenv("WHATSAPP_TOKEN", "")
     WHATSAPP_PHONE_NUMBER_ID: str = os.getenv("WHATSAPP_PHONE_NUMBER_ID", "1245147385342997")
     WHATSAPP_GRAPH_API_VERSION: str = os.getenv("WHATSAPP_GRAPH_API_VERSION", "v23.0")
+    # Logo shown in the IMAGE header of approved templates. Meta downloads it on every
+    # send, so this URL must stay public (PNG/JPEG).
+    WHATSAPP_HEADER_IMAGE_URL: str = os.getenv("WHATSAPP_HEADER_IMAGE_URL", "https://www.equitycase.com/logo.png")
 
     @property
     def sqlalchemy_database_uri(self) -> str:

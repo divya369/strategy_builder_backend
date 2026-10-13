@@ -25,7 +25,11 @@ TEMPLATES: Dict[str, Dict[str, Any]] = {
     "ec_portfolio_created": {"language": "en_IN", "params": ["user_name", "portfolio_name"]},
     "ec_broker_order_review": {"language": "en_IN", "params": ["user_name", "strategy_name"]},
     "ec_orders_placed_broker": {"language": "en_IN", "params": ["user_name", "strategy_name"]},
-    "ec_rebalance_review_require": {"language": "en_IN", "params": ["user_name", "strategy_name"]},
+    # header_image: the approved template starts with the Equity Case logo. Meta rejects
+    # the send (#132012, "expected IMAGE, received UNKNOWN") unless every message carries
+    # it, so the sender attaches settings.WHATSAPP_HEADER_IMAGE_URL as the header.
+    # Its "Review Rebalance" button is a fixed URL and needs no parameters.
+    "ec_rebalance_review_require": {"language": "en_IN", "params": ["user_name", "strategy_name"], "header_image": True},
     "ec_rebalance_completed": {"language": "en_IN", "params": ["user_name", "strategy_name"]},
     # Note the name does NOT carry the ec_ prefix — it is "rebalance_no_action" in
     # WhatsApp Manager (template id 1067566969374367) and must match exactly.
@@ -34,7 +38,8 @@ TEMPLATES: Dict[str, Dict[str, Any]] = {
     # action is needed from you." — two variables only. Sending a third (the old
     # next_rebalance_date) makes Meta reject the send on parameter count. Its URL
     # button is static, so it needs no parameters of its own.
-    "rebalance_no_action": {"language": "en_IN", "params": ["user_name", "strategy_name"]},
+    # Also starts with the logo — see header_image on ec_rebalance_review_require above.
+    "rebalance_no_action": {"language": "en_IN", "params": ["user_name", "strategy_name"], "header_image": True},
 
     # ---- Broker ----
     "ec_broker_connected": {"language": "en_IN", "params": ["user_name", "broker_name"]},
