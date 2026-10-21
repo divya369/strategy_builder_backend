@@ -26,6 +26,7 @@ from sqlalchemy import (
     Text, func
 )
 from sqlalchemy.dialects.postgresql import UUID, JSONB
+from sqlalchemy.orm import deferred
 from app.models.base import Base
 
 
@@ -72,6 +73,13 @@ class PaperPortfolio(Base):
     filters_json = Column(JSONB, nullable=True)
     universe_json = Column(JSONB, nullable=True)
     ranking_json = Column(JSONB, nullable=True)
+
+    # Precomputed detail-page payload (metrics, curves, monthly returns,
+    # drawdowns) — written once per daily update / at start, read as-is by
+    # GET /paper-trading/{screener_id}. Same idea as backtest_summary.metrics_json.
+    # Deferred: ~300 KB per row, so it loads only when accessed — the list page,
+    # cron and admin checks query portfolios without ever reading it.
+    detail_json = deferred(Column(JSONB, nullable=True))
 
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)

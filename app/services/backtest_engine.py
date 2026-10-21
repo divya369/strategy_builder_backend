@@ -28,6 +28,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 from app.core.config import settings
 from app.core.database import SessionLocal, EquitySessionLocal
+from app.core.performance_metrics import annualised_return, official_capture
 from app.models.backtest import BacktestHoldingPeriod, BacktestRun
 from app.models.result import BacktestSummary
 from app.core.symbol_registry import resolve_stock_symbol
@@ -288,6 +289,16 @@ class BacktestEngineService:
             prev_bm_close = bm_c
 
         return bm_nav_by_date, bm_ret_by_date
+
+    @staticmethod
+    def _next_market_date(bm_sym: str, after: date, equity_db: Session) -> Optional[date]:
+        """First index trading date after `after` (looks 15 days ahead), or None
+        when no later data exists yet — then the NSE calendar decides."""
+        try:
+            df = equity_data_service.get_benchmark_ohlc(bm_sym, after + timedelta(days=1), after + timedelta(days=15), equity_db)
+            return min(df["date"]) if not df.empty else None
+        except Exception:
+            return None
 
     # ── Drawdown episodes ─────────────────────────────────────────────────────
 
@@ -599,12 +610,13 @@ class BacktestEngineService:
                 cost_nav_impact = eob_sell_cost_total / initial_capital * 100.0
                 daily_nav_list[-1]["portfolio_nav_net"] -= cost_nav_impact
 
-                if len(daily_nav_list) >= 2:
-                    prev_nav = daily_nav_list[-2]["portfolio_nav_net"]
-                    curr_nav = daily_nav_list[-1]["portfolio_nav_net"]
-                    daily_nav_list[-1]["portfolio_return_net"] = (
-                        curr_nav / prev_nav - 1.0
-                        if prev_nav > 0 else 0.0)
+                # A one-day backtest has no previous row: its return is vs the
+                # 100.0 inception base, else the stored return stays pre-cost.
+                prev_nav = daily_nav_list[-2]["portfolio_nav_net"] if len(daily_nav_list) >= 2 else 100.0
+                curr_nav = daily_nav_list[-1]["portfolio_nav_net"]
+                daily_nav_list[-1]["portfolio_return_net"] = (
+                    curr_nav / prev_nav - 1.0
+                    if prev_nav > 0 else 0.0)
 
                 all_navs = [row["portfolio_nav_net"] for row in daily_nav_list]
                 running_peaks = pd.Series(all_navs).cummax().tolist()
@@ -630,8 +642,10 @@ class BacktestEngineService:
             nav_gross = nav_df["portfolio_nav_gross"].astype(float); drawdown_series = nav_df["drawdown"].astype(float)
             total_return       = float(nav_net.iloc[-1] / 100.0 - 1.0)
             gross_total_return = float(nav_gross.iloc[-1] / 100.0 - 1.0)
-            elapsed_days = max(1, (nav_df.index[-1] - nav_df.index[0]).days)
-            cagr      = float((nav_net.iloc[-1] / nav_net.iloc[0]) ** (365.25 / elapsed_days) - 1.0) if nav_net.iloc[0] > 0 else 0.0
+            # Same base as total_return (100 = capital at the start of day 1);
+            # None under 1 year — see performance_metrics.annualised_return.
+            elapsed_days = (nav_df.index[-1] - nav_df.index[0]).days + 1
+            cagr      = annualised_return(nav_net.iloc[-1] / 100.0, elapsed_days)
             # annual_vol = float(ret_net.std(ddof=1) * np.sqrt(252)) if len(ret_net) > 1 else 0.0
             # sharpe    = float((cagr - settings.RISK_FREE_RATE) / annual_vol) if annual_vol > 0 else 0.0
             # downside  = ret_net[ret_net < 0]; downside_dev = float(downside.std(ddof=1) * np.sqrt(252)) if len(downside) > 0 else 0.0
@@ -655,7 +669,7 @@ class BacktestEngineService:
             )
             
             max_dd    = float(drawdown_series.min()) if not drawdown_series.empty else 0.0
-            calmar    = float(cagr / abs(max_dd)) if max_dd != 0 else 0.0
+            calmar    = (float(cagr / abs(max_dd)) if max_dd != 0 else 0.0) if cagr is not None else None
             monthly_nav = nav_net.resample("ME").last()
             # monthly_nav_padded = pd.concat([pd.Series([100.0], index=[monthly_nav.index[0] - pd.offsets.MonthEnd(1)]), monthly_nav])
             if not monthly_nav.empty:
@@ -693,7 +707,9 @@ class BacktestEngineService:
             #     excess_mret = (float(mret) - bm_mret) if bm_mret is not None else float(mret)
             #     monthly_returns_list.append({"year": dt.year, "month": dt.month, "monthly_return": float(mret), "benchmark_monthly_return": bm_mret, "excess_monthly_return": excess_mret})
             for dt, mret in monthly_rets.items():
-                bm_mret = float(bm_monthly_rets.get(dt, 0.0)) if bm_monthly_rets is not None else None
+                # A month with no benchmark data is shown as None, never as 0%.
+                bm_val = bm_monthly_rets.get(dt) if bm_monthly_rets is not None else None
+                bm_mret = float(bm_val) if bm_val is not None else None
                 excess_mret = (float(mret) - bm_mret) if bm_mret is not None else float(mret)
                 monthly_returns_list.append({
                     "year": dt.year,
@@ -722,39 +738,20 @@ class BacktestEngineService:
                 bm_nav_arr = pd.Series({pd.Timestamp(d): v for d, v in bm_nav_by_date.items()}).sort_index().astype(float)
                 if not bm_nav_arr.empty and bm_nav_arr.iloc[0] > 0:
                     benchmark_total_return = float(bm_nav_arr.iloc[-1] / 100.0 - 1.0)
-                    bm_elapsed = max(1, (bm_nav_arr.index[-1] - bm_nav_arr.index[0]).days)
-                    benchmark_cagr_val = float((bm_nav_arr.iloc[-1] / bm_nav_arr.iloc[0]) ** (365.25 / bm_elapsed) - 1.0)
-                    excess_cagr_val = cagr - benchmark_cagr_val
+                    bm_elapsed = (bm_nav_arr.index[-1] - bm_nav_arr.index[0]).days
+                    benchmark_cagr_val = annualised_return(bm_nav_arr.iloc[-1] / bm_nav_arr.iloc[0], bm_elapsed)
+                    excess_cagr_val = cagr - benchmark_cagr_val if cagr is not None and benchmark_cagr_val is not None else None
                     bm_ret_arr = bm_nav_arr.pct_change().fillna(0.0)
                     port_ret_arr = nav_df["portfolio_return_net"].reindex(bm_ret_arr.index).fillna(0.0)
                     both_nonzero = (port_ret_arr != 0) | (bm_ret_arr != 0)
                     if both_nonzero.sum() > 0:
                         hit_ratio_val = float((port_ret_arr[both_nonzero] > bm_ret_arr[both_nonzero]).mean())
-                    # up_days = bm_ret_arr > 0
-                    # if up_days.sum() > 0: upside_cap_val = float(port_ret_arr[up_days].mean() / bm_ret_arr[up_days].mean())
-                    # down_days = bm_ret_arr < 0
-                    # if down_days.sum() > 0: downside_cap_val = float(port_ret_arr[down_days].mean() / bm_ret_arr[down_days].mean())
-
-                    up_days = bm_ret_arr > 0
-                    if up_days.sum() > 0:
-                        port_up_compounded = float((1 + port_ret_arr[up_days]).prod() - 1)
-                        bm_up_compounded = float((1 + bm_ret_arr[up_days]).prod() - 1)
-
-                        upside_cap_val = (
-                            port_up_compounded / bm_up_compounded
-                            if bm_up_compounded != 0 else None
-                        )
-
-                    down_days = bm_ret_arr < 0
-                    if down_days.sum() > 0:
-                        port_down_compounded = float((1 + port_ret_arr[down_days]).prod() - 1)
-                        bm_down_compounded = float((1 + bm_ret_arr[down_days]).prod() - 1)
-
-                        downside_cap_val = (
-                            port_down_compounded / bm_down_compounded
-                            if bm_down_compounded != 0
-                            else None
-                        )
+                    # Upside/downside capture on COMPLETE months only (Morningstar
+                    # geometric-mean method) — see performance_metrics.official_capture.
+                    # The next real market date (from index data) decides whether
+                    # the to_date month is complete, for any historical year.
+                    next_mkt = self._next_market_date(bm_sym, nav_net.index[-1].date(), equity_db)
+                    upside_cap_val, downside_cap_val = official_capture(nav_net, bm_nav_arr, next_mkt)
 
             # ── Drawdowns (JSONB only) ────────────────────────────────────
             dd_episodes = self._make_drawdown_episodes(nav_net)

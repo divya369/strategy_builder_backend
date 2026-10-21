@@ -105,16 +105,20 @@ def get_platform_strategies(role: str = None, db: Session = Depends(get_db)):
         PaperPortfolio.status == "ACTIVE",
     ).all() if screener_ids else []
     port_by_screener = {p.screener_id: p for p in ports}
-    # Latest curve row per portfolio (few active portfolios → cheap).
-    latest_by_port = {
-        p.id: (
-            db.query(PaperEquityCurve)
-            .filter(PaperEquityCurve.automate_equity_ra_id == p.id)
-            .order_by(PaperEquityCurve.date.desc(), PaperEquityCurve.total_days.desc())
-            .first()
+    # Latest curve row per portfolio — ONE query for all portfolios
+    # (PostgreSQL DISTINCT ON keeps the first row per portfolio in this order).
+    latest_rows = (
+        db.query(PaperEquityCurve)
+        .filter(PaperEquityCurve.automate_equity_ra_id.in_([p.id for p in ports]))
+        .distinct(PaperEquityCurve.automate_equity_ra_id)
+        .order_by(
+            PaperEquityCurve.automate_equity_ra_id,
+            PaperEquityCurve.date.desc(),
+            PaperEquityCurve.total_days.desc(),
         )
-        for p in ports
-    }
+        .all()
+    ) if ports else []
+    latest_by_port = {r.automate_equity_ra_id: r for r in latest_rows}
 
     from app.services.platform_paper_service import PlatformPaperService
     result = []

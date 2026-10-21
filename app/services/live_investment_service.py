@@ -49,6 +49,7 @@ from app.services.screener_execution_service import screener_execution_service
 from app.core.trading_calendar import next_trading_day, should_prepare_rebalance, next_rebalance_prepare_date
 from app.services.broker_publishers import get_publisher_adapter
 from app.core.config import settings
+from app.core.performance_metrics import annualised_return
 from app.services.notifications import notify_all
 
 logger = logging.getLogger(__name__)
@@ -586,12 +587,18 @@ def assign_publisher_tags(db: Session, strategy: LiveStrategy, basket_type: str,
 #  postback handling in update_from_postback and daily celery job.)
 
 
+LIVE_BUY_CHARGE_RATE = 0.0011
+LIVE_SELL_CHARGE_RATE = 0.0021
+
+
 def update_tradelog_circuit_df(
     TODAY: date,
     unique_user: str,
     tradelog_df: pd.DataFrame,
     circuit_df: pd.DataFrame,
     today_cash: float,
+    buy_charge_rate: float = LIVE_BUY_CHARGE_RATE,
+    sell_charge_rate: float = LIVE_SELL_CHARGE_RATE,
 ) -> tuple[pd.DataFrame, float]:
     """Strategy Builder equivalent of equitycase_logic update_tradelog_circuit_df().
 
@@ -613,7 +620,7 @@ def update_tradelog_circuit_df(
             actual_qty = int(row.get("actual_qty") or 0)
             actual_price = float(row.get("actual_price") or 0)
             actual_amount = round(float(row.get("actual_amount") or actual_qty * actual_price), 2)
-            buy_charges = round(actual_amount * 0.0011, 2)
+            buy_charges = round(actual_amount * buy_charge_rate, 2)
             today_cash -= actual_amount
 
             ltp = actual_price
@@ -659,7 +666,7 @@ def update_tradelog_circuit_df(
             actual_qty = int(row.get("actual_qty") or 0)
             actual_price = float(row.get("actual_price") or 0)
             actual_amount = round(float(row.get("actual_amount") or actual_qty * actual_price), 2)
-            sell_charges = round(actual_amount * 0.0021, 2)
+            sell_charges = round(actual_amount * sell_charge_rate, 2)
             today_cash += actual_amount
 
             active_idx = tradelog_df.loc[
@@ -683,6 +690,7 @@ def update_tradelog_buy_df(
     tradelog_df: pd.DataFrame,
     buy_df: pd.DataFrame,
     today_cash: float,
+    buy_charge_rate: float = LIVE_BUY_CHARGE_RATE,
 ) -> tuple[pd.DataFrame, float]:
     """Same buy-row treatment as equitycase_logic update_tradelog_buy_df()."""
     if buy_df is None or buy_df.empty:
@@ -699,7 +707,7 @@ def update_tradelog_buy_df(
         actual_qty = int(row.get("actual_qty") or 0)
         actual_price = float(row.get("actual_price") or 0)
         actual_amount = round(float(row.get("actual_amount") or actual_qty * actual_price), 2)
-        buy_charges = round(actual_amount * 0.0011, 2)
+        buy_charges = round(actual_amount * buy_charge_rate, 2)
         cash_out += actual_amount
 
         ltp = actual_price
@@ -828,6 +836,7 @@ def update_tradelog_sell_df(
     tradelog_df: pd.DataFrame,
     sell_df: pd.DataFrame,
     today_cash: float,
+    sell_charge_rate: float = LIVE_SELL_CHARGE_RATE,
 ) -> tuple[pd.DataFrame, float]:
     """Same sell-row treatment as equitycase_logic update_tradelog_sell_df()."""
     if sell_df is None or sell_df.empty:
@@ -843,7 +852,7 @@ def update_tradelog_sell_df(
         actual_qty = int(row.get("actual_qty") or 0)
         actual_price = float(row.get("actual_price") or 0)
         actual_amount = round(float(row.get("actual_amount") or actual_qty * actual_price), 2)
-        sell_charges = round(actual_amount * 0.0021, 2)
+        sell_charges = round(actual_amount * sell_charge_rate, 2)
         cash_in += actual_amount
 
         active_idx = tradelog_df.loc[
@@ -921,21 +930,24 @@ def update_tradelog(
     sell_df: pd.DataFrame,
     circuit_df: pd.DataFrame,
     today_cash: float = 0.0,
+    buy_charge_rate: float = LIVE_BUY_CHARGE_RATE,
+    sell_charge_rate: float = LIVE_SELL_CHARGE_RATE,
 ) -> tuple[pd.DataFrame, float]:
     """Equitycase-compatible call chain for Strategy Builder live investment.
 
     The returned today_cash is the day's cash delta only, exactly like
     equitycase_logic. update_equitycurve() adds it to yesterday's cash.
+    Charge rates default to the live estimates; paper passes the backtest rate.
     """
     if tradelog_df is None or tradelog_df.empty:
         tradelog_df = pd.DataFrame(columns=[c.name for c in LiveTradelog.__table__.columns])
 
     today_cash = 0.0 if today_cash is None else float(today_cash)
-    tradelog_df, today_cash = update_tradelog_circuit_df(TODAY, unique_user, tradelog_df, circuit_df, today_cash)
-    tradelog_df, today_cash = update_tradelog_buy_df(TODAY, unique_user, tradelog_df, buy_df, today_cash)
+    tradelog_df, today_cash = update_tradelog_circuit_df(TODAY, unique_user, tradelog_df, circuit_df, today_cash, buy_charge_rate, sell_charge_rate)
+    tradelog_df, today_cash = update_tradelog_buy_df(TODAY, unique_user, tradelog_df, buy_df, today_cash, buy_charge_rate)
     tradelog_df, today_cash = update_tradelog_pyramiding_df(TODAY, unique_user, tradelog_df, None, today_cash)
     tradelog_df, today_cash = update_tradelog_profit_booking_df(TODAY, unique_user, tradelog_df, None, today_cash)
-    tradelog_df, today_cash = update_tradelog_sell_df(TODAY, unique_user, tradelog_df, sell_df, today_cash)
+    tradelog_df, today_cash = update_tradelog_sell_df(TODAY, unique_user, tradelog_df, sell_df, today_cash, sell_charge_rate)
     tradelog_df = update_tradelog_ltp(TODAY, unique_user, tradelog_df)
     return tradelog_df, round(today_cash, 2)
 
@@ -1061,6 +1073,40 @@ def _safe_benchmark_price(TODAY: date, index_name: str) -> float:
         return 0.0
 
 
+def trade_stats(pnl: pd.Series) -> dict:
+    """Equitycase trade statistics over a series of per-trade P&L (₹).
+    Shared by update_equitycurve and the paper backfill so both rows agree."""
+    winning_trades = int((pnl > 0.0).sum())
+    losing_trades = int((pnl <= 0.0).sum()) if not pnl.empty else 0
+    total_trades = winning_trades + losing_trades
+
+    win_percent = round((winning_trades / total_trades) * 100, 2) if total_trades > 0 else 0.0
+    loss_percent = round((losing_trades / total_trades) * 100, 2) if total_trades > 0 else 0.0
+
+    pos_series = pnl[pnl > 0.0]
+    avg_win = round(float(pos_series.mean()), 2) if not pos_series.empty else 0.0
+
+    neg_series = pnl[pnl <= 0.0]
+    avg_loss = round(float(neg_series.mean()), 2) if not neg_series.empty else 0.0
+
+    rr = round(((avg_win / avg_loss) * -1), 2) if avg_loss != 0 else 0.0
+    profit_factor = round(((winning_trades * avg_win) / (losing_trades * avg_loss) * -1), 2) if avg_loss != 0 and losing_trades != 0 else 0.0
+
+    biggest_winning_trade = round(float(pos_series.max()), 2) if not pos_series.empty else 0.0
+    biggest_losing_trade = round(float(neg_series.min()), 2) if not neg_series.empty else 0.0
+
+    # NOTE: win/loss percent are 0-100, so this is 100x the textbook value —
+    # kept as-is by product decision.
+    expectancy = round((avg_win * win_percent) - (abs(avg_loss) * loss_percent), 2)
+    return {
+        "winning_trades": winning_trades, "losing_trades": losing_trades, "total_trades": total_trades,
+        "winning_percent": win_percent, "losing_percent": loss_percent,
+        "avg_win": avg_win, "avg_loss": avg_loss, "rr": rr, "profit_factor": profit_factor,
+        "biggest_winning_trade": biggest_winning_trade, "biggest_losing_trade": biggest_losing_trade,
+        "expectancy": expectancy,
+    }
+
+
 def update_equitycurve(
     TODAY: date,
     user: LiveStrategy,
@@ -1110,7 +1156,10 @@ def update_equitycurve(
     first_index_price = float(equitycurve_df["index_price"].iloc[0] or 0.0) if "index_price" in equitycurve_df.columns else 0.0
     previous_index_price = float(equitycurve_df["index_price"].iloc[-1] or 0.0) if "index_price" in equitycurve_df.columns else 0.0
 
-    strategy_roc = round((aum - initial_aum) / initial_aum * 100, 2) if initial_aum else 0.0
+    # Return on the capital actually invested. Same as the first row's AUM for a
+    # live strategy; a paper portfolio's first row is already backtest day 1.
+    capital_base = float(user.initial_aum or initial_aum or 0.0)
+    strategy_roc = round((aum - capital_base) / capital_base * 100, 2) if capital_base else 0.0
     index_roc = round((index_price - first_index_price) / first_index_price * 100, 2) if first_index_price else 0.0
 
     strategy_daily_return = round(aum - yesterday_aum, 2)
@@ -1133,33 +1182,18 @@ def update_equitycurve(
     total_realised_pnl = round(float(tradelog_df["realised_pnl"].sum()), 2) if not tradelog_df.empty and "realised_pnl" in tradelog_df.columns else 0.0
     total_pnl = round(total_unrealised_pnl + total_realised_pnl - today_total_charges, 2)
 
-    if not tradelog_df.empty:
-        unrealised = tradelog_df["unrealised_pnl"] if "unrealised_pnl" in tradelog_df.columns else 0.0
-        realised = tradelog_df["realised_pnl"] if "realised_pnl" in tradelog_df.columns else 0.0
-        combined_pnl = unrealised + realised
+    # Trade statistics count CLOSED trades only — an open position is not a
+    # win or a loss yet.
+    if not tradelog_df.empty and "realised_pnl" in tradelog_df.columns:
+        closed_pnl = tradelog_df.loc[tradelog_df["active"] == False, "realised_pnl"].astype(float)
     else:
-        combined_pnl = pd.Series(dtype="float64")
-
-    winning_trades = int((combined_pnl > 0.0).sum())
-    losing_trades = int((combined_pnl <= 0.0).sum()) if not combined_pnl.empty else 0
-    total_trades = winning_trades + losing_trades
-
-    win_percent = round((winning_trades / total_trades) * 100, 2) if total_trades > 0 else 0.0
-    loss_percent = round((losing_trades / total_trades) * 100, 2) if total_trades > 0 else 0.0
-
-    pos_series = combined_pnl[combined_pnl > 0.0]
-    avg_win = round(float(pos_series.mean()), 2) if not pos_series.empty else 0.0
-
-    neg_series = combined_pnl[combined_pnl <= 0.0]
-    avg_loss = round(float(neg_series.mean()), 2) if not neg_series.empty else 0.0
-
-    rr = round(((avg_win / avg_loss) * -1), 2) if avg_loss != 0 else 0.0
-    profit_factor = round(((winning_trades * avg_win) / (losing_trades * avg_loss) * -1), 2) if avg_loss != 0 and losing_trades != 0 else 0.0
-
-    biggest_winning_trade = round(float(pos_series.max()), 2) if not pos_series.empty else 0.0
-    biggest_losing_trade = round(float(neg_series.min()), 2) if not neg_series.empty else 0.0
-
-    expectancy = round((avg_win * win_percent) - (abs(avg_loss) * loss_percent), 2)
+        closed_pnl = pd.Series(dtype="float64")
+    stats = trade_stats(closed_pnl)
+    winning_trades, losing_trades, total_trades = stats["winning_trades"], stats["losing_trades"], stats["total_trades"]
+    win_percent, loss_percent = stats["winning_percent"], stats["losing_percent"]
+    avg_win, avg_loss, rr, profit_factor = stats["avg_win"], stats["avg_loss"], stats["rr"], stats["profit_factor"]
+    biggest_winning_trade, biggest_losing_trade = stats["biggest_winning_trade"], stats["biggest_losing_trade"]
+    expectancy = stats["expectancy"]
     avg_profit_per_day = round((total_pnl / total_days), 2) if total_days != 0 else 0.0
 
     base_equitycurve_percent = float(equitycurve_df["equitycurve_percent"].iloc[0] or 100.0)
@@ -1167,7 +1201,9 @@ def update_equitycurve(
 
     first_date = pd.to_datetime(equitycurve_df["date"].iloc[0]).date()
     total_calender_day = (TODAY - first_date).days + 1
-    cagr_percent = round(((((equitycurve_percent / base_equitycurve_percent) ** (1 / (total_calender_day / 365))) - 1) * 100), 2) if total_calender_day > 0 and base_equitycurve_percent else 0.0
+    # Base 100 (= initial capital), not the first row's NAV; None under 1 year.
+    cagr = annualised_return(equitycurve_percent / 100.0, total_calender_day)
+    cagr_percent = round(cagr * 100, 2) if cagr is not None else None
 
     equity_list = equitycurve_df["equitycurve_percent"].fillna(base_equitycurve_percent).tolist()
     equity_list.append(equitycurve_percent)
@@ -1192,7 +1228,7 @@ def update_equitycurve(
 
     equity_series_std = float(np.std(equity_series)) if len(equity_series) else 0.0
     sharpe = round((equitycurve_percent - 100) / equity_series_std, 2) if equity_series_std != 0 else 0.0
-    calmar = round(cagr_percent / abs(max_dd_percent), 2) if max_dd_percent != 0 else 0.0
+    calmar = (round(cagr_percent / abs(max_dd_percent), 2) if max_dd_percent != 0 else 0.0) if cagr_percent is not None else None
     average_trade = round((total_pnl / total_trades), 2) if total_trades != 0 else 0.0
 
     downside_deviation = equitycurve_df[equitycurve_df["strategy_daily_return"] < 0]["strategy_daily_return"].std() if "strategy_daily_return" in equitycurve_df.columns else 0.0
