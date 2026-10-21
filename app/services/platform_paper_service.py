@@ -84,6 +84,7 @@ def _paper_order_id() -> str:
 
 
 PAPER_DEFAULT_COST_RATE = 0.003  # 0.30%/side, used only if the source backtest is gone
+PAPER_MAX_START_GAP_TRADING_DAYS = 5  # a backtest older than this must be re-run before paper starts
 
 # Bump when the stored detail payload's formulas or shape change: stored
 # payloads with another version are recomputed on their next page open.
@@ -169,6 +170,18 @@ class PlatformPaperService:
         if not summary or not summary.daily_nav_json:
             raise HTTPException(status_code=400, detail="Backtest has no daily NAV data")
 
+        # Paper continues the backtest from its last NAV day and catches up the
+        # gap. A long gap would be simulated in hindsight yet stored as paper
+        # tracking (and could be cherry-picked), so it must be re-backtested.
+        today = date.today()
+        last_nav_day = pd.to_datetime(summary.daily_nav_json[-1]["trade_date"]).date()
+        gap = _trading_days_after(last_nav_day, today)
+        if gap > PAPER_MAX_START_GAP_TRADING_DAYS:
+            raise HTTPException(status_code=400, detail=(
+                f"Backtest ends on {last_nav_day:%d-%m-%Y}, {gap} trading days ago. Paper trading can continue "
+                f"a backtest at most {PAPER_MAX_START_GAP_TRADING_DAYS} trading days old — re-run the backtest "
+                f"up to the latest date, then start paper trading."))
+
         version = db.query(ScreenerVersion).filter(ScreenerVersion.id == run.screener_version_id).first()
 
         initial_capital = float(run.initial_capital)
@@ -193,9 +206,17 @@ class PlatformPaperService:
 
         n_curve, n_trades = PlatformPaperService._bootstrap_from_backtest(db, portfolio, run, summary)
         db.commit()
-        db.refresh(portfolio)
         logger.info("[Paper] Started portfolio %s for screener %s — %d curve rows, %d trades backfilled",
                     portfolio.id, screener_id, n_curve, n_trades)
+
+        # Fill the gap since the backtest's last day right away (days whose EOD
+        # data is loaded); anything not ready yet is picked up by the 23:15 cron.
+        try:
+            PlatformPaperService.catch_up(db, portfolio, today)
+        except Exception:
+            db.rollback()
+            logger.exception("[Paper] Immediate catch-up failed for %s — the daily cron will retry", portfolio.id)
+        db.refresh(portfolio)
         return portfolio
 
     @staticmethod
@@ -934,12 +955,23 @@ class PlatformPaperService:
                 if d not in data_ready:
                     data_ready[d] = _market_data_ready(d)
                 if not data_ready[d]:
+                    if _index_has_data_after(d):
+                        # Later days have data, this one never will: an exchange
+                        # holiday missing from holidays.json.
+                        logger.warning("[Paper] %s has no market data but later days do — treated as a holiday "
+                                       "(add it to holidays.json)", d)
+                        d += timedelta(days=1)
+                        continue
                     logger.warning("[Paper] EOD market data for %s not loaded yet — portfolio %s waits (retried next run)", d, pid)
                     break
                 try:
                     if PlatformPaperService._update_one(db, portfolio, d):
                         updated = True
                     db.commit()
+                except _DataNotReady as exc:
+                    db.rollback()
+                    logger.warning("[Paper] Portfolio %s, %s: %s — waits (retried next run)", pid, d, exc)
+                    break
                 except Exception:
                     logger.exception("[Paper] Error updating portfolio %s for %s — later days wait for it", pid, d)
                     db.rollback()
@@ -953,6 +985,13 @@ class PlatformPaperService:
         if portfolio.last_updated_date and portfolio.last_updated_date >= TODAY:
             logger.info("[Paper] Portfolio %s already updated for %s — skipping", portfolio.id, TODAY)
             return False
+
+        # Every holding must have TODAY's OHLC before the day is booked (the index
+        # row alone does not prove the stock tables finished loading).
+        held = [s for (s,) in db.query(PaperTradelog.tradingsymbol).filter(
+            PaperTradelog.automate_equity_ra_id == portfolio.id, PaperTradelog.active == True,  # noqa: E712
+        ).distinct()]
+        _require_day_prices(_prices_on(held, TODAY), held, TODAY)
 
         cost_rate = PlatformPaperService._portfolio_cost_rate(db, portfolio)
         rebalance_due = bool(portfolio.next_rebalance_date and TODAY >= portfolio.next_rebalance_date)
@@ -1088,12 +1127,9 @@ class PlatformPaperService:
         sold = sorted(set(held) - set(new_basket))
         to_buy = [s for s in new_basket if s not in held]
 
-        prices = _prices_on(sorted(set(sold) | set(to_buy)), TODAY)
-        stale = sorted(s for s, (_, _, d) in prices.items() if d != TODAY)
-        missing = sorted(s for s in set(sold) | set(to_buy) if s not in prices)
-        if stale or missing:
-            logger.warning("[Paper] %s %s: no %s OHLC for %s — using last available price (as the backtest does); no price at all: %s",
-                           pid, TODAY, TODAY, stale, missing)
+        traded = sorted(set(sold) | set(to_buy))
+        prices = _prices_on(traded, TODAY)
+        _require_day_prices(prices, traded, TODAY)
 
         cash_before_sells = float(portfolio.cash or 0.0)
         net_cash = cash_before_sells
@@ -1183,6 +1219,47 @@ def _prices_on(symbols: list, TODAY: date) -> dict:
             g["date"].iloc[-1],
         )
     return out
+
+
+class _DataNotReady(Exception):
+    """The day's EOD data is not fully loaded yet — the day is retried next run."""
+
+
+def _require_day_prices(prices: dict, symbols: list, d: date) -> None:
+    """Every symbol must have an OHLC row dated `d`. While no later day has
+    index data, a gap means the import is still running -> _DataNotReady. Once
+    later data exists the gap is permanent (suspension, no table), so continue
+    with the last available price — the backtest's forward-fill rule."""
+    lacking = sorted(s for s in symbols if s not in prices or prices[s][2] != d)
+    if not lacking:
+        return
+    if not _index_has_data_after(d):
+        raise _DataNotReady(f"no {d} OHLC yet for {lacking}")
+    logger.warning("[Paper] %s: still no OHLC for %s although later days are loaded — using the last available "
+                   "price, as the backtest does", d, lacking)
+
+
+def _index_has_data_after(d: date) -> bool:
+    """True if NIFTY 50 already has an EOD row for a date after `d`."""
+    try:
+        with equity_engine.connect() as conn:
+            row = conn.execute(
+                text(f'SELECT 1 FROM public."NIFTY 50" WHERE "{settings.EQUITY_TABLE_DATE_COL}" > :d LIMIT 1'),
+                {"d": d},
+            ).first()
+        return row is not None
+    except Exception:
+        logger.exception("[Paper] Could not check market data after %s", d)
+        return False
+
+
+def _trading_days_after(start: date, end: date) -> int:
+    """Number of trading days d with start < d <= end."""
+    n, d = 0, start + timedelta(days=1)
+    while d <= end:
+        n += 1 if is_trading_day(d) else 0
+        d += timedelta(days=1)
+    return n
 
 
 def _market_data_ready(d: date) -> bool:
