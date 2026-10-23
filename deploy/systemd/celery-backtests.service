@@ -1,0 +1,53 @@
+# Celery worker for backtests only (Celery queue "backtests").
+#
+# Install on the Linux server:
+#   sudo cp deploy/systemd/celery-backtests.service /etc/systemd/system/
+#   (set User= below first)
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now celery-backtests
+#
+# Watch it:
+#   systemctl status celery-backtests     # "Memory:" = main process + all children
+#   journalctl -u celery-backtests -f
+#
+# The existing general Celery worker keeps running as it is: a worker started
+# without -Q consumes only the default "celery" queue, so it never takes backtests.
+#
+# Memory budget (measured, heaviest screener: 10y weekly, 1,142 stocks):
+#   main process ~130 MB + up to 4 children x ~250 MB peak  ≈ 1.1 GB worst case,
+#   less in practice because children share the imported libraries with the main
+#   process. A typical backtest peaks well below 250 MB.
+
+[Unit]
+Description=Strategy Builder - Celery backtest worker
+After=network.target redis-server.service postgresql.service
+
+[Service]
+Type=simple
+# User=<owner of /home/strategy_builder_bkd>
+WorkingDirectory=/home/strategy_builder_bkd
+
+# Fewer glibc malloc arenas → less memory kept by each process
+Environment=MALLOC_ARENA_MAX=2
+
+# --concurrency=4          4 backtests at the same time; the rest wait in Redis (no RAM)
+# --max-tasks-per-child=1  each child exits after one backtest → Linux frees all its memory
+# %%h                      systemd escape; Celery receives "%h" (the hostname)
+ExecStart=/home/strategy_builder_bkd/.venv/bin/celery -A app.core.celery_app.celery_app worker \
+    -Q backtests -n backtests@%%h --loglevel=info \
+    --pool=prefork --concurrency=4 --max-tasks-per-child=1
+
+# Hard cap for this worker only. If it is reached, the kernel kills one backtest
+# child (that run is marked FAILED, not retried); FastAPI and Postgres are untouched.
+MemoryMax=1200M
+# Keep the other running backtests alive when one child is OOM-killed
+OOMPolicy=continue
+
+Restart=always
+RestartSec=10
+# On restart/deploy, let running backtests finish (warm shutdown) for up to 10 min
+KillMode=mixed
+TimeoutStopSec=600
+
+[Install]
+WantedBy=multi-user.target
