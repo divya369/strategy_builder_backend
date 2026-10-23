@@ -8,7 +8,7 @@ All other services call this module — they never read CSV files directly.
 """
 import logging
 from datetime import date
-from typing import List, Optional
+from typing import Iterable, List, Optional
 from app.core.config import settings
 from app.services.data_access_layer import CsvScreenerReader, CsvIndexConstituentReader
 
@@ -35,6 +35,14 @@ def get_screener_data(target_date: date):
     Returns an empty DataFrame if no data is available.
     """
     return _screener_reader.read(target_date)
+
+
+def get_screener_columns(target_date: date, columns: Iterable[str]):
+    """
+    Like get_screener_data(), but loads only tradingsymbol + `columns` and does
+    not cache. For backtests, which read hundreds of dates in one run.
+    """
+    return _screener_reader.read_columns(target_date, columns)
 
 
 def get_available_screener_dates() -> List[date]:

@@ -18,13 +18,18 @@ USAGE:
 """
 import logging
 import os
+import threading
 from abc import ABC, abstractmethod
+from collections import OrderedDict
 from datetime import date
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, Iterable, List, Optional, Tuple
 import pandas as pd
 
 logger = logging.getLogger(__name__)
+
+# Alternate names accepted for the symbol column (see _normalize_symbol_col)
+_SYMBOL_ALIASES = {"symbol", "ticker", "tradingsymbol"}
 
 
 # ── Abstract interface ────────────────────────────────────────────────────────
@@ -43,6 +48,14 @@ class ScreenerDataReader(ABC):
         Return screener data for `target_date` (or the closest available date before it).
         Returns an empty DataFrame if no data is found.
         Columns must include: tradingsymbol + all indicator columns.
+        """
+        ...
+
+    @abstractmethod
+    def read_columns(self, target_date: date, columns: Iterable[str]) -> pd.DataFrame:
+        """
+        Same as read(), restricted to tradingsymbol + `columns`, and uncached.
+        Used by date sweeps (backtests) to keep memory flat.
         """
         ...
 
@@ -79,12 +92,20 @@ class CsvScreenerReader(ScreenerDataReader):
 
     Auto-reload: re-scans directory when new files appear and invalidates
     cached DataFrames when underlying files are modified.
+
+    Memory: read() keeps at most `max_cached` full files (LRU). Live paths only
+    ever touch the latest one or two dates, so a small cap costs nothing there.
+    A backtest sweeps hundreds of dates — it must use read_columns(), which
+    parses only the columns a screener needs and caches nothing.
     """
 
-    def __init__(self, directory: str):
+    def __init__(self, directory: str, max_cached: int = 3):
         self._dir = Path(directory)
         self._date_map: Dict[date, Path] = {}         # date → filepath
-        self._df_cache: Dict[date, Tuple[float, pd.DataFrame]] = {}  # date → (mtime, DataFrame)
+        # date → (mtime, DataFrame), least recently used first
+        self._df_cache: "OrderedDict[date, Tuple[float, pd.DataFrame]]" = OrderedDict()
+        self._max_cached = max_cached
+        self._cache_lock = threading.Lock()           # FastAPI reads from a thread pool
         self._dir_mtime: float = 0.0                  # last known directory mtime
         self._scan()
 
@@ -137,8 +158,12 @@ class CsvScreenerReader(ScreenerDataReader):
         path = self._date_map[closest]
 
         # Check if cached data is still fresh (file not modified)
-        if closest in self._df_cache:
-            cached_mtime, cached_df = self._df_cache[closest]
+        with self._cache_lock:
+            cached = self._df_cache.get(closest)
+            if cached is not None:
+                self._df_cache.move_to_end(closest)
+        if cached is not None:
+            cached_mtime, cached_df = cached
             try:
                 current_mtime = os.path.getmtime(path)
             except OSError:
@@ -156,15 +181,51 @@ class CsvScreenerReader(ScreenerDataReader):
                 logger.error("Screener CSV %s has no 'tradingsymbol' column", path.name)
                 return pd.DataFrame()
             file_mtime = os.path.getmtime(path)
-            self._df_cache[closest] = (file_mtime, df)
+            with self._cache_lock:
+                self._df_cache[closest] = (file_mtime, df)
+                self._df_cache.move_to_end(closest)
+                while len(self._df_cache) > self._max_cached:
+                    self._df_cache.popitem(last=False)
             logger.debug("Loaded screener CSV: %s (%d rows)", path.name, len(df))
             return df
         except Exception as exc:
             logger.error("Failed to read screener CSV %s: %s", path, exc)
             # Return stale cache if available, otherwise empty
-            if closest in self._df_cache:
+            if cached is not None:
                 logger.warning("Returning stale cache for %s", path.name)
-                return self._df_cache[closest][1]
+                return cached[1]
+            return pd.DataFrame()
+
+    def read_columns(self, target_date: date, columns: Iterable[str]) -> pd.DataFrame:
+        """
+        Like read(), but parses only `columns` (plus the symbol column) and
+        never caches. Columns absent from the file are simply left out, which
+        is how read() presents them too.
+
+        Values are identical to read(): pandas infers each column's dtype from
+        that column alone, so dropping the other columns changes nothing.
+        """
+        self._rescan_if_needed()
+        closest = self._find_closest_date(target_date)
+        if closest is None:
+            logger.warning("No screener CSV found on or before %s", target_date)
+            return pd.DataFrame()
+
+        path = self._date_map[closest]
+        wanted = set(columns)
+        try:
+            df = pd.read_csv(
+                path,
+                low_memory=False,
+                usecols=lambda c: c in wanted or c.lower().strip() in _SYMBOL_ALIASES,
+            )
+            df = _normalize_symbol_col(df)
+            if df.empty or "tradingsymbol" not in df.columns:
+                logger.error("Screener CSV %s has no 'tradingsymbol' column", path.name)
+                return pd.DataFrame()
+            return df
+        except Exception as exc:
+            logger.error("Failed to read screener CSV %s: %s", path, exc)
             return pd.DataFrame()
 
     @property
@@ -276,9 +337,8 @@ def _normalize_symbol_col(df: pd.DataFrame) -> pd.DataFrame:
     Ensure the symbol column is named 'tradingsymbol'.
     Handles common alternate names: symbol, Symbol, ticker, Ticker, TradingSymbol.
     """
-    aliases = {"symbol", "ticker", "tradingsymbol"}
     for col in df.columns:
-        if col.lower().strip() in aliases:
+        if col.lower().strip() in _SYMBOL_ALIASES:
             df = df.rename(columns={col: "tradingsymbol"})
             return df
     return df

@@ -10,6 +10,7 @@ All methods are stateless and take an explicit DB session.
 """
 import logging
 from datetime import datetime, timedelta
+from sqlalchemy import and_, or_
 from sqlalchemy.orm import Session
 from app.models.backtest import BacktestRun
 from app.core.config import settings
@@ -76,23 +77,35 @@ class BacktestJobService:
         db.commit()
 
     @staticmethod
+    def stale_before(status: str) -> datetime:
+        """
+        Heartbeat cutoff for a RUNNING/QUEUED run: older than this → presumed lost.
+        RUNNING runs beat every BACKTEST_HEARTBEAT_SECONDS. QUEUED runs do not
+        beat while they wait for a worker slot, so they get the longer window.
+        """
+        minutes = (
+            settings.BACKTEST_QUEUED_STALE_MINUTES if status == "QUEUED"
+            else settings.BACKTEST_STALE_MINUTES
+        )
+        return datetime.utcnow() - timedelta(minutes=minutes)
+
+    @staticmethod
     def recover_stale_running_jobs(db: Session) -> int:
         """
-        Find RUNNING/QUEUED jobs whose heartbeat is older than
-        BACKTEST_STALE_MINUTES and mark them FAILED.
+        Find RUNNING/QUEUED jobs whose heartbeat is older than their stale
+        window (see stale_before) and mark them FAILED.
 
         Called on FastAPI startup and can also be called on-demand.
         Returns the number of jobs recovered.
         """
-        stale_before = datetime.utcnow() - timedelta(
-            minutes=settings.BACKTEST_STALE_MINUTES
-        )
-
         # Jobs with a stale heartbeat
         stale_runs = db.query(BacktestRun).filter(
-            BacktestRun.status.in_(["RUNNING", "QUEUED"]),
-            BacktestRun.last_heartbeat_at.isnot(None),
-            BacktestRun.last_heartbeat_at < stale_before,
+            or_(
+                and_(BacktestRun.status == "RUNNING",
+                     BacktestRun.last_heartbeat_at < BacktestJobService.stale_before("RUNNING")),
+                and_(BacktestRun.status == "QUEUED",
+                     BacktestRun.last_heartbeat_at < BacktestJobService.stale_before("QUEUED")),
+            ),
         ).all()
 
         # Jobs with NO heartbeat at all (old records from before this feature)

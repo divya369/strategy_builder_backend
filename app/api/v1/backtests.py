@@ -54,11 +54,19 @@ def run_custom_backtest(req: CustomBacktestRequest, db: Session = Depends(get_db
         }
 
     if run_record.status in ("QUEUED", "RUNNING"):
-        # Only submit to Celery if no task is already assigned
+        # Only submit to Celery if no task is already assigned.
+        # The task id is stored BEFORE sending, so any older queued message for
+        # this run (e.g. from before a stale reset) sees a different id and skips.
         if not run_record.celery_task_id:
-            task = run_backtest_task.delay(str(run_record.id))
-            run_record.celery_task_id = task.id
+            task_id = str(uuid.uuid4())
+            run_record.celery_task_id = task_id
             db.commit()
+            try:
+                run_backtest_task.apply_async(args=[str(run_record.id)], task_id=task_id)
+            except Exception:
+                run_record.celery_task_id = None  # let the next submit enqueue again
+                db.commit()
+                raise
 
         return {
             "status": "success",

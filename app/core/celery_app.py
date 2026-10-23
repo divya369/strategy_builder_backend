@@ -5,13 +5,24 @@ Connects to Redis as broker and result backend.
 All backtest tasks run in a separate worker process,
 isolating heavy computation from the FastAPI server.
 
-Start the worker:
-    celery -A app.core.celery_app.celery_app worker --loglevel=info --concurrency=1
+Backtests go to their own queue (settings.BACKTEST_QUEUE, default "backtests");
+everything else stays on the default "celery" queue. Run one worker per queue:
+
+    # general tasks (order book sync etc.)
+    celery -A app.core.celery_app.celery_app worker -Q celery -n general@%h --loglevel=info --concurrency=1
+
+    # backtests — Linux server (see deploy/systemd/celery-backtests.service)
+    celery -A app.core.celery_app.celery_app worker -Q backtests -n backtests@%h --loglevel=info \
+        --pool=prefork --concurrency=4 --max-tasks-per-child=1
+
+--max-tasks-per-child=1 replaces each child process after one backtest, so
+Linux reclaims all of its memory (glibc keeps freed memory inside a running
+process). It only works with the prefork pool — `--pool=solo` ignores it.
 """
 from celery import Celery
 from celery.schedules import crontab
 from app.core.config import settings
-from celery.signals import after_setup_logger 
+from celery.signals import after_setup_logger, worker_process_init
 
 celery_app = Celery(
     "strategy_builder",
@@ -34,7 +45,12 @@ celery_app.conf.update(
     worker_prefetch_multiplier=1,       # fetch one task at a time
 
     task_acks_late=True,                # ack AFTER task finishes (crash-safe)
-    task_reject_on_worker_lost=True,    # re-queue if worker is killed
+    task_reject_on_worker_lost=True,    # re-queue if worker is killed (backtests opt out)
+
+    # ── Routing ───────────────────────────────────────────────────────────
+    task_routes={
+        "backtests.run_backtest": {"queue": settings.BACKTEST_QUEUE},
+    },
 
     # ── Serialization ─────────────────────────────────────────────────────
     task_serializer="json",
@@ -77,4 +93,16 @@ celery_app.conf.update(
 def _on_after_setup_logger(**kwargs):
     from app.core.logging_config import setup_logging
     setup_logging()
+
+
+@worker_process_init.connect
+def _on_worker_process_init(**kwargs):
+    """
+    A prefork child inherits the parent's connection pools; the parent opens DB
+    connections too (e.g. backtest_tasks._on_task_failure). Drop the inherited
+    connections without closing them so parent and child never share a socket.
+    """
+    from app.core.database import engine, equity_engine, equitycase_engine
+    for eng in (engine, equity_engine, equitycase_engine):
+        eng.dispose(close=False)
 

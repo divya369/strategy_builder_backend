@@ -9,7 +9,7 @@ All queries here use raw SQL via SQLAlchemy's text() to handle dynamic table nam
 """
 import logging
 from datetime import date
-from typing import List, Optional
+from typing import List, Optional, Tuple
 import pandas as pd
 from sqlalchemy import text
 from sqlalchemy.orm import Session
@@ -23,6 +23,9 @@ logger = logging.getLogger(__name__)
 _DATE_COL  = settings.EQUITY_TABLE_DATE_COL
 _OPEN_COL  = settings.EQUITY_TABLE_OPEN_COL
 _CLOSE_COL = settings.EQUITY_TABLE_CLOSE_COL
+
+# Symbols per query in get_multi_stock_price_frames — bounds the rows held at once
+_OHLC_CHUNK_SIZE = 50
 
 
 def _quote(name: str) -> str:
@@ -175,6 +178,89 @@ def get_multi_stock_ohlc(
     except Exception as exc:
         logger.warning("Batch OHLC query failed, falling back to per-symbol loop: %s", exc)
         return _get_multi_stock_ohlc_loop(symbols, from_date, to_date, db)
+
+
+def get_multi_stock_price_frames(
+    symbols: List[str],
+    from_date: date,
+    to_date: date,
+    db: Session,
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Wide open/close price frames (index = date as Timestamp, one column per
+    symbol) for a long date range — the backtest's price load.
+
+    Same values as pivoting get_multi_stock_ohlc(), with a bounded memory peak:
+      - prices are cast to float8 in SQL, so psycopg2 returns plain floats
+        instead of ~100-byte Decimal objects (numeric→float8 rounds exactly
+        like Decimal→float, so the numbers are identical);
+      - symbols are fetched _OHLC_CHUNK_SIZE at a time and each chunk is
+        pivoted before the next is fetched, so the long row-per-price
+        format never exists for all symbols at once.
+    Index dates are the union of every symbol's dates (unsorted); rows are
+    not forward-filled. Symbols with no table are skipped.
+    """
+    existing_tables = set(list_available_symbols(db))
+    sym_table_pairs = []
+    for sym in symbols:
+        table_sym = resolve_stock_symbol(sym)
+        if table_sym in existing_tables:
+            sym_table_pairs.append((sym, table_sym))
+        else:
+            logger.debug("No OHLC table for symbol '%s' (resolved: '%s') — skipping", sym, table_sym)
+
+    open_parts, close_parts = [], []
+    for start in range(0, len(sym_table_pairs), _OHLC_CHUNK_SIZE):
+        chunk = _fetch_ohlc_chunk(sym_table_pairs[start:start + _OHLC_CHUNK_SIZE], from_date, to_date, db)
+        if chunk.empty:
+            continue
+        chunk = chunk.drop_duplicates(subset=["date", "symbol"], keep="last")
+        chunk["date"] = pd.to_datetime(chunk["date"])
+        open_parts.append(chunk.pivot(index="date", columns="symbol", values="open"))
+        close_parts.append(chunk.pivot(index="date", columns="symbol", values="close"))
+        del chunk
+
+    if not open_parts:
+        return pd.DataFrame(), pd.DataFrame()
+    return pd.concat(open_parts, axis=1), pd.concat(close_parts, axis=1)
+
+
+def _fetch_ohlc_chunk(
+    sym_table_pairs: List[Tuple[str, str]],
+    from_date: date,
+    to_date: date,
+    db: Session,
+) -> pd.DataFrame:
+    """One UNION ALL query for a few symbols, prices as float8. Columns: date,
+    symbol, open, close. Falls back to per-symbol queries on failure."""
+    date_col = _quote(_DATE_COL)
+    open_col = _quote(_OPEN_COL)
+    close_col = _quote(_CLOSE_COL)
+
+    parts = []
+    for sym, table_sym in sym_table_pairs:
+        safe_sym = sym.replace("'", "''")
+        parts.append(
+            f"SELECT '{safe_sym}' AS symbol, "
+            f"{date_col} AS date, {open_col}::float8 AS open, {close_col}::float8 AS close "
+            f"FROM public.{_quote(table_sym)} "
+            f"WHERE {date_col} BETWEEN :from_date AND :to_date"
+        )
+
+    try:
+        rows = db.execute(text(" UNION ALL ".join(parts)), {"from_date": from_date, "to_date": to_date}).fetchall()
+    except Exception as exc:
+        logger.warning("Chunk OHLC query failed, falling back to per-symbol loop: %s", exc)
+        db.rollback()
+        return _get_multi_stock_ohlc_loop([sym for sym, _ in sym_table_pairs], from_date, to_date, db)
+
+    if not rows:
+        return pd.DataFrame(columns=["date", "symbol", "open", "close"])
+    df = pd.DataFrame(rows, columns=["symbol", "date", "open", "close"])
+    df["date"]  = pd.to_datetime(df["date"]).dt.date
+    df["open"]  = pd.to_numeric(df["open"],  errors="coerce")
+    df["close"] = pd.to_numeric(df["close"], errors="coerce")
+    return df[["date", "symbol", "open", "close"]]
 
 
 def _get_multi_stock_ohlc_loop(

@@ -259,6 +259,24 @@ class ScreenerExecutionService:
 
         return columns
 
+    def _required_columns(self, filters_json: List[dict], ranking_json: dict) -> Set[str]:
+        """
+        Every CSV column the filter and ranking steps can read, plus the core
+        columns. Resolved with the same translate_field() calls those steps
+        make, so a minimal_columns run sees exactly the data a full run uses.
+        """
+        cols = {"tradingsymbol", "close", "volume"}  # close: relative_level filters
+        for f in filters_json or []:
+            try:
+                cols.update(c["key"] for c in self._extract_filter_columns([f]))
+            except Exception:
+                pass  # malformed filter — _apply_filters skips it as well
+        if ranking_json:
+            cols.add(self.translate_field(
+                (ranking_json.get("field") or "").lower().strip(), ranking_json.get("period")
+            ))
+        return cols
+
     def _execute_with_params(
         self,
         universe_json: dict,
@@ -268,6 +286,7 @@ class ScreenerExecutionService:
         offset: int = 0,
         target_date: date = None,
         universe_date: date = None,
+        minimal_columns: bool = False,
     ) -> Tuple[List[dict], int, Optional[date]]:
         """
         Core execution logic — pure pandas, no DB queries.
@@ -278,6 +297,10 @@ class ScreenerExecutionService:
                            target_date when None (live/adhoc screeners). For
                            backtesting, this is the rebalance date while
                            target_date is the previous trading day.
+            minimal_columns: Load only the columns the filters/ranking read,
+                           uncached. Same symbols and order as a full run, but
+                           each result's `indicators` holds only those columns.
+                           For backtests, which read hundreds of dates.
 
         Returns: (results_list, total_matches, effective_date)
         """
@@ -295,7 +318,12 @@ class ScreenerExecutionService:
             universe_date = target_date
 
         # 2. Load screener DataFrame for target date
-        df = csv_data_service.get_screener_data(target_date)
+        if minimal_columns:
+            df = csv_data_service.get_screener_columns(
+                target_date, self._required_columns(filters_json, ranking_json)
+            )
+        else:
+            df = csv_data_service.get_screener_data(target_date)
         if df.empty:
             logger.warning("Screener data empty for date %s", target_date)
             return [], 0, target_date

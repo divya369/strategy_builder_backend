@@ -53,10 +53,7 @@ class BacktestEngineService:
         """Check if a RUNNING/QUEUED run's heartbeat is stale (worker likely dead)."""
         if not run.last_heartbeat_at:
             return True  # no heartbeat ever recorded → treat as stale
-        stale_before = datetime.utcnow() - timedelta(
-            minutes=settings.BACKTEST_STALE_MINUTES
-        )
-        return run.last_heartbeat_at < stale_before
+        return run.last_heartbeat_at < BacktestJobService.stale_before(run.status)
 
     def submit_backtest(self, db: Session, request_data: dict, user_id, screener_id, screener_version_id) -> BacktestRun:
         """
@@ -210,20 +207,14 @@ class BacktestEngineService:
         self, symbols: List[str], from_date: date, to_date: date, equity_db: Session
     ) -> Tuple[pd.DataFrame, pd.DataFrame, List[date]]:
         """Loads open/close price frames for all symbols from equity_ohlc DB."""
-        combined = equity_data_service.get_multi_stock_ohlc(symbols, from_date, to_date, equity_db)
-        if combined.empty:
+        # Fetched and pivoted in symbol chunks — see get_multi_stock_price_frames
+        open_px, close_px = equity_data_service.get_multi_stock_price_frames(symbols, from_date, to_date, equity_db)
+        if open_px.empty:
             return pd.DataFrame(), pd.DataFrame(), []
 
-        combined = combined.drop_duplicates(subset=["date", "symbol"], keep="last")
-        trading_dates = sorted(combined["date"].unique().tolist())
-        idx = pd.DatetimeIndex(pd.to_datetime(trading_dates))
+        idx = open_px.index.sort_values().rename(None)
+        trading_dates = [ts.date() for ts in idx]
 
-        open_px  = combined.pivot(index="date", columns="symbol", values="open")
-        close_px = combined.pivot(index="date", columns="symbol", values="close")
-        del combined  # free the long-format copy immediately
-
-        open_px.index  = pd.to_datetime(open_px.index)
-        close_px.index = pd.to_datetime(close_px.index)
         open_px  = open_px.reindex(idx)
         close_px = close_px.reindex(idx)
         open_px.ffill(inplace=True)
@@ -388,7 +379,8 @@ class BacktestEngineService:
                 results, _, _ = screener_execution_service._execute_with_params(
                     universe_json=universe_json, filters_json=filters_json,
                     ranking_json=ranking_json, limit=fetch_limit, offset=0,
-                    target_date=prev_date, universe_date=b_date
+                    target_date=prev_date, universe_date=b_date,
+                    minimal_columns=True,  # only symbols are used below
                 )
                 # ── Normalize symbols to canonical (current) names ────────
                 raw_eligible = [r["symbol"] for r in results]

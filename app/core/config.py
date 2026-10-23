@@ -56,7 +56,13 @@ class Settings:
     REDIS_URL: str = os.getenv("REDIS_URL", "redis://localhost:6379/2")
     CELERY_RESULT_BACKEND: str = os.getenv("CELERY_RESULT_BACKEND", "redis://localhost:6379/3")
     BACKTEST_STALE_MINUTES: int = int(os.getenv("BACKTEST_STALE_MINUTES", "30"))
+    # A QUEUED run has no heartbeat while it waits for a free worker slot, so it
+    # gets a longer window before it counts as lost (3h = the task hard time limit).
+    BACKTEST_QUEUED_STALE_MINUTES: int = int(os.getenv("BACKTEST_QUEUED_STALE_MINUTES", "180"))
     BACKTEST_HEARTBEAT_SECONDS: int = int(os.getenv("BACKTEST_HEARTBEAT_SECONDS", "30"))
+    # Celery queue for backtests. A dedicated worker must consume it
+    # (-Q backtests) — see deploy/systemd/celery-backtests.service.
+    BACKTEST_QUEUE: str = os.getenv("BACKTEST_QUEUE", "backtests")
     RISK_FREE_RATE: float = float(os.getenv("RISK_FREE_RATE", "0.065"))  # 6.5% default (India 91-day T-bill)
 
     # ── Equity DB column config ───────────────────────────────────────────────
